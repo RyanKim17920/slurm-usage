@@ -48,7 +48,7 @@ jobs:
           uv venv /tmp/wheel-env
           uv pip install --python /tmp/wheel-env/bin/python dist/*.whl
           /tmp/wheel-env/bin/slurm-usage --version
-          /tmp/wheel-env/bin/slurm-usage --once --no-history
+          /tmp/wheel-env/bin/slurm-usage --once --history off
       - name: Run from the sdist's tests
         run: |
           mkdir /tmp/sdist && tar -xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
@@ -57,7 +57,7 @@ jobs:
         run: |
           python scripts/build_zipapp.py -o dist/slurm-usage.pyz
           python dist/slurm-usage.pyz --version
-          python dist/slurm-usage.pyz --once --no-history
+          python dist/slurm-usage.pyz --once --history off
       - uses: actions/upload-artifact@v4
         with:
           name: dist
