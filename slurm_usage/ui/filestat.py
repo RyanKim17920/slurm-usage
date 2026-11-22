@@ -1,4 +1,4 @@
-"""Does a path Slurm recorded still exist, and did it change after the job started?
+"""Does a path Slurm recorded still exist, and did it change after the job?
 
 Slurm records paths (working directory, stdout, stderr, the script named on
 the submit line), never their contents. This only calls ``os.stat`` with the
@@ -16,14 +16,21 @@ from ..sanitize import clean
 _PSEUDO = ("/proc", "/sys", "/dev")
 
 
+GRACE = 120  # seconds: a log is flushed and closed a little after the job's end time
+
+
 class PathState(NamedTuple):
     exists: Optional[bool]  # None = could not tell
-    changed: Optional[bool]  # modified after the job started
+    changed: Optional[bool]  # modified after ``since`` (plus GRACE)
     note: str
     style: str  # canvas style name
 
 
-def check(raw: Optional[str], started: Optional[float], directory: bool = False) -> PathState:
+def check(raw: Optional[str], since: Optional[float], directory: bool = False,
+          running: bool = False, what: str = "the job ended") -> PathState:
+    """``since``: when the file should have stopped changing: a log, the job's end (a
+    running job's log is simply being written); a script, the job's start. A change
+    within GRACE seconds after it is the job's own last write, not a later one."""
     if not raw or "\0" in raw or not os.path.isabs(raw):
         return PathState(None, None, "not an absolute path", "dim")
     if any(raw == root or raw.startswith(root + "/") for root in _PSEUDO):
@@ -43,11 +50,13 @@ def check(raw: Optional[str], started: Optional[float], directory: bool = False)
                                                             else "regular file"), "warn")
     if directory:
         return PathState(True, None, "exists", "good")
-    if started is not None and info.st_mtime > started:
-        return PathState(True, True, "exists · changed since job ran", "warn")
-    if started is None:
+    if running:
+        return PathState(True, None, "exists · being written", "good")
+    if since is None:
         return PathState(True, None, "exists", "good")
-    return PathState(True, False, "exists · unchanged since job started", "good")
+    if info.st_mtime > since + GRACE:
+        return PathState(True, True, "exists · changed after %s" % what, "warn")
+    return PathState(True, False, "exists · unchanged since %s" % what, "good")
 
 
 def script_from_submit_line(line: str, workdir: Optional[str]) -> Optional[str]:

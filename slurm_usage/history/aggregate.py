@@ -53,8 +53,11 @@ class _Pass:
 
     def __init__(self, specs: List[Tuple[str, ...]], gpu_tracked: Optional[bool],
                  edges: List[int], series_by: Optional[str], series_metric: str,
-                 lanes_by: Optional[str], resolution: int) -> None:
+                 lanes_by: Optional[str], resolution: int,
+                 lanes_metric: Optional[str] = None) -> None:
         self.gpu_tracked = gpu_tracked
+        # lanes from attempts holding this resource only (None: any allocation)
+        self.lanes_at = None if lanes_metric is None else METRICS.index(lanes_metric)
         self.total = Stats(gpu_tracked)
         self.groups = {spec: {} for spec in specs}  # type: Dict[tuple, Dict[tuple, Stats]]
         self.node_specs = [s for s in specs if "node" in s]
@@ -167,7 +170,7 @@ class _Pass:
                         self.keyed[key] = Series(edges)
                     draw_one(self.keyed[key], rate)
         by = self.lanes_by
-        if by is not None:
+        if by is not None and (self.lanes_at is None or amounts[self.lanes_at]):
             keys = ([s[0] for s in part.shares or ()] if by == "node"
                     else [_value(by, part.roles, part.outcome, NONE)])
             for key in keys:
@@ -190,8 +193,11 @@ def build_report(store: Any, as_of: int, window: Optional[Window] = None,
                  series_by: Optional[str] = None, series_metric: str = "gpu",
                  lanes_by: Optional[str] = None, lane_resolution: Optional[int] = None,
                  efficiency: bool = False, gpu_tracked: Optional[bool] = None,
-                 progress: ProgressFn = None, cancel: Any = None) -> Report:
+                 progress: ProgressFn = None, cancel: Any = None,
+                 lanes_metric: Optional[str] = None) -> Report:
     specs = _group_specs(group_by)
+    if lanes_metric is not None and lanes_metric not in METRICS:
+        raise ValueError("unknown metric: %s" % lanes_metric)
     for role in (series_by, lanes_by):
         if role is not None and role not in ROLES:
             raise ValueError("unknown role: %s" % role)
@@ -207,7 +213,7 @@ def build_report(store: Any, as_of: int, window: Optional[Window] = None,
         resolution = (max(1, (span.end - span.start) // 1000) if lane_resolution is None
                       else lane_resolution)
         state = _Pass(specs, gpu_tracked, hour_edges(span.start, span.end), series_by,
-                      series_metric, lanes_by, resolution)
+                      series_metric, lanes_by, resolution, lanes_metric)
         repeated = store.repeated_jobs()  # type: Set[int]
         unchecked = 0
 

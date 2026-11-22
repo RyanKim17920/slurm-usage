@@ -15,6 +15,7 @@ _KEYS = {
     curses.KEY_HOME: "HOME", curses.KEY_END: "END", curses.KEY_ENTER: "ENTER",
     curses.KEY_BTAB: "BTAB", curses.KEY_BACKSPACE: "BACKSPACE", curses.KEY_RESIZE: "RESIZE",
     10: "ENTER", 13: "ENTER", 27: "ESC", 9: "TAB", 127: "BACKSPACE", 8: "BACKSPACE",
+    21: "CTRL_U",
 }
 
 
@@ -63,12 +64,13 @@ def _blit(screen: Any, canvas: Canvas, attrs: Dict[str, int]) -> None:
     curses.doupdate()
 
 
-def _main(screen: Any, app: App, use_color: bool) -> None:
+def _main(screen: Any, app: App) -> None:
     try:
         curses.curs_set(0)
     except curses.error:
         pass
-    attrs = _attrs(use_color)
+    colored = app.color
+    attrs = _attrs(colored)
     screen.keypad(True)
     screen.timeout(250)
     try:
@@ -80,6 +82,10 @@ def _main(screen: Any, app: App, use_color: bool) -> None:
     dirty, last_draw = True, 0.0
     while True:
         app.poll()
+        if app.color != colored:  # C switched colors
+            colored = app.color
+            attrs = _attrs(colored)
+            dirty = True
         now = time.time()
         if dirty or now - last_draw > 1.0 or app.loader.busy:
             height, width = screen.getmaxyx()
@@ -124,16 +130,42 @@ def _decode(code: Any) -> Optional[str]:
             return "TAB"
         if code in ("\x7f", "\b"):
             return "BACKSPACE"
+        if code == "\x15":
+            return "CTRL_U"
         return code if code.isprintable() else None
     if code == curses.KEY_MOUSE:
         return "MOUSE"
     return _KEYS.get(code)
 
 
-def run(app: App, use_color: bool = True) -> None:
-    """Run until the user quits."""
+def run(app: App, use_color: Optional[bool] = None) -> None:
+    """Run until the user quits.
+
+    Not curses.wrapper: it calls start_color() whenever the terminal has colors, which
+    makes ncurses paint every cell white on black (ESC[37m ESC[40m) even with NO_COLOR.
+    Without colors start_color() is never called, so the terminal's own colors stay."""
     os.environ.setdefault("ESCDELAY", "25")
+    if use_color is not None:
+        app.color = use_color
+    screen = None
     try:
-        curses.wrapper(_main, app, use_color)
+        screen = curses.initscr()
+        curses.noecho()
+        curses.cbreak()
+        screen.keypad(True)
+        if app.color:
+            try:
+                curses.start_color()
+            except curses.error:
+                pass
+        _main(screen, app)
     finally:
+        if screen is not None:
+            try:
+                screen.keypad(False)
+                curses.echo()
+                curses.nocbreak()
+            except curses.error:
+                pass
+            curses.endwin()
         app.stop()

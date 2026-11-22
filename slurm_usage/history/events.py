@@ -153,7 +153,8 @@ def find_events(store: Any, as_of: int, window: Optional[Window], where: Optiona
     if top is not None and (top[0][0] or top[0][1]):
         (gpus, cpus), begun, label, roles = top
         record = has_prior and (gpus > prior_max_gpus if gpus else cpus > prior_max_cpus)
-        what = "%d GPUs" % gpus if gpus else "%d CPUs" % cpus
+        what = ("%d GPU%s" % (gpus, "" if gpus == 1 else "s") if gpus
+                else "%d CPU%s" % (cpus, "" if cpus == 1 else "s"))
         events.append(Event("largest_allocation", begun, None,
                             "Largest allocation: %s (job %s)%s" % (
                                 what, label, ", the most ever" if record else ""),
@@ -171,25 +172,33 @@ def find_events(store: Any, as_of: int, window: Optional[Window], where: Optiona
     prior_runs = [sum(1 for c in chain if c[2] in ("preempted", "requeued"))
                   for chain in chains.values() if chain[0][0] < low]
     usual_run = _quantile(prior_runs, 0.9) or 1
+    # Counted and dated by what happened inside the window: a long chain that began
+    # weeks ago shows only its preemptions here, from where the window starts.
     runs = []
     for (job, uid), chain in chains.items():
         if chain[-1][1] < low or chain[0][0] >= high:
             continue
-        preempted = [c for c in chain if c[2] in ("preempted", "requeued")]
+        preempted = [c for c in chain if c[2] in ("preempted", "requeued")
+                     and c[1] >= low and c[0] < high]
         if len(preempted) < 2 or len(preempted) <= usual_run:
             continue
         runs.append((job, chain, preempted))
     runs.sort(key=lambda item: -sum(c[3] for c in item[2]))
     for job, chain, preempted in runs[:PER_KIND]:
         finished = chain[-1][2] if chain[-1][2] not in ("preempted", "requeued") else None
-        events.append(Event("preemption_run", chain[0][0], chain[-1][1],
-                            "Job %d was preempted or requeued %d times%s" % (
+        every = sum(1 for c in chain if c[2] in ("preempted", "requeued"))
+        begun = max(low, preempted[0][0])
+        events.append(Event("preemption_run", begun, chain[-1][1],
+                            "Job %d was preempted or requeued %d times%s%s" % (
                                 job, len(preempted),
+                                " (%d since it was submitted)" % every
+                                if every > len(preempted) else "",
                                 ", then %s" % finished if finished else ", still unfinished"),
                             {"attempts": len(chain), "preempted": len(preempted),
+                             "preempted_all": every,
                              "gpu_seconds": sum(c[3] for c in preempted),
                              "usual": usual_run, "others": max(0, len(runs) - PER_KIND)},
-                            where, Window(chain[0][0], chain[-1][1]), str(job)))
+                            where, Window(begun, chain[-1][1]), str(job)))
 
     daily = list(prior_fail_days.values())
     usual = max(2.0, 2 * (_quantile(daily, 0.9) or 0))

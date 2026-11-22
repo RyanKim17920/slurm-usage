@@ -17,7 +17,7 @@ substitute 0. They do not sanitize: callers do that when storing display text.
 """
 
 from .hostlist import compress_ranges, expand_hostlist, parse_ranges, split_outside
-from .records import SCRIPT_NOT_STORED, SCRIPT_NOT_VISIBLE, Frame, batch_script_body, key_values
+from .records import SCRIPT_NOT_STORED, SCRIPT_NOT_STORED_BATCH, SCRIPT_NOT_VISIBLE, Frame, batch_script_body, key_values
 from .tres import (Gres, gpu_indices, gpus_from_gres, gpus_from_tres, parse_gres, parse_tres,
                    parse_usage_tres, split_tres)
 from .units import (is_unlimited, memory_basis, optional_text, parse_count, parse_duration,
@@ -25,7 +25,7 @@ from .units import (is_unlimited, memory_basis, optional_text, parse_count, pars
                     parse_time)
 
 __all__ = [
-    "SCRIPT_NOT_STORED", "SCRIPT_NOT_VISIBLE",
+    "SCRIPT_NOT_STORED", "SCRIPT_NOT_STORED_BATCH", "SCRIPT_NOT_VISIBLE",
     "Frame", "Gres", "batch_script_body", "compress_ranges", "expand_hostlist", "gpu_indices", "gpus_from_gres",
     "gpus_from_tres", "is_unlimited", "key_values", "memory_basis", "optional_text",
     "parse_count", "parse_duration", "parse_exit_code", "parse_float", "parse_gres",

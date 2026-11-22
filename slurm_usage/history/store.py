@@ -22,7 +22,7 @@ try:
 except ImportError:  # some Python builds have no sqlite3
     sqlite3 = None  # type: ignore
 
-SCHEMA = 3
+SCHEMA = 4  # 4: 64 KiB pages
 OPEN_STOP = 2 ** 40  # "stop" of a row with no end; later than any real time
 
 # jobs.flag, only meaningful while a row has no end
@@ -81,6 +81,8 @@ CREATE TABLE IF NOT EXISTS rollup(
 _COLUMNS = ("j.k,j.job,j.dim,j.nodes,j.submit,j.eligible,j.start,"
             "NULLIF(j.stop,%d),j.susp,j.cpus,j.gpus,j.mem,j.lim,j.flag" % OPEN_STOP)
 _MAX_SQL_IDS = 5000
+PAGE_SIZE = 65536
+CACHE_KIB = 32768  # SQLite's page cache per connection
 _MIB_MASK = (1 << 20) - 1
 
 
@@ -120,13 +122,32 @@ class SqliteStore(_Base):
         self.persistent = self.path is not None
         self._db = sqlite3.connect(path, timeout=15, check_same_thread=False)
         try:
-            self._db.execute("PRAGMA cache_size=-16000")
+            self._tune()
             self._db.executescript(_TABLES)
             self._db.commit()
             self._db.execute("SELECT count(*) FROM meta").fetchone()
         except sqlite3.Error:
             self._db.close()
             raise
+
+    def _tune(self) -> None:
+        """Fewer, larger writes: what costs on a network home directory is the number of
+        calls, not the bytes (measured on virtiofs: 64 KiB pages and no fsync made a cold
+        write about 8x faster). The cache is disposable, so it does without fsync: a crash
+        of this process loses nothing (the journal stays), a crash of the machine may cost
+        the cache, which is then rebuilt. Each setting is best effort."""
+        pragmas = ["cache_size=-%d" % CACHE_KIB]
+        if self.persistent:
+            # page_size only takes effect on a new, empty file; TRUNCATE spares the
+            # create and delete of a journal file per transaction. Not WAL: caches on
+            # network filesystems may be shared by login nodes, where WAL is unsafe.
+            pragmas = ["page_size=%d" % PAGE_SIZE] + pragmas + ["journal_mode=TRUNCATE",
+                                                               "synchronous=OFF"]
+        for pragma in pragmas:
+            try:
+                self._db.execute("PRAGMA " + pragma).fetchall()
+            except sqlite3.OperationalError:  # e.g. another process holds a lock just now
+                pass
 
     def close(self) -> None:
         with self.lock:
@@ -142,6 +163,10 @@ class SqliteStore(_Base):
     def _write(self, work) -> None:
         with self.lock:
             try:
+                # One transaction from the first read on: otherwise each SELECT takes and
+                # drops its own lock, a round trip apiece on a network filesystem.
+                if not self._db.in_transaction:
+                    self._db.execute("BEGIN IMMEDIATE")
                 work(self._db)
                 self._db.commit()
             except sqlite3.Error as error:
@@ -338,6 +363,16 @@ class SqliteStore(_Base):
     def _find_repeated(self) -> Set[int]:
         return {r[0] for r in self._select(
             "SELECT job FROM jobs GROUP BY job HAVING count(*)>1")}
+
+    def repeated_among(self, jobs: Iterable[int]) -> Set[int]:
+        """Those of ``jobs`` with more than one row; cheaper than repeated_jobs() for a few."""
+        jobs, found = sorted(set(jobs)), set()  # type: List[int], Set[int]
+        for i in range(0, len(jobs), 500):
+            part = jobs[i:i + 500]
+            found.update(r[0] for r in self._select(
+                "SELECT job FROM jobs WHERE job IN (%s) GROUP BY job HAVING count(*)>1"
+                % ",".join("?" * len(part)), part))
+        return found
 
     def info(self, keys: Sequence[str]) -> Dict[str, Info]:
         out = {}
@@ -573,6 +608,9 @@ class MemoryStore(_Base):
             (repeated if r[1] in seen else seen).add(r[1])
         return repeated
 
+    def repeated_among(self, jobs: Iterable[int]) -> Set[int]:
+        return self.repeated_jobs().intersection(jobs)
+
     def info(self, keys: Sequence[str]) -> Dict[str, Info]:
         with self.lock:
             return {k: Info(*self._rows[k][14:17]) for k in keys if k in self._rows}
@@ -642,11 +680,86 @@ class MemoryStore(_Base):
             self.version += 1
 
 
-def default_cache_dir() -> str:
+# Where a home directory on one of these makes the cache slow (measured on virtiofs: 6 MB/s
+# of writes and a round trip per page read, so a cold load spent most of its time there).
+NETWORK_FILESYSTEMS = frozenset((
+    "nfs", "nfs4", "cifs", "smb3", "smbfs", "virtiofs", "9p", "lustre", "gpfs", "beegfs",
+    "ceph", "glusterfs", "afs", "panfs", "pvfs2", "orangefs", "wekafs", "davfs", "sshfs"))
+LOCAL_BASE = "/var/tmp"  # node-local disk by convention, unlike /tmp (often RAM)
+BASE_OWNERS = (0,)  # who may own LOCAL_BASE
+
+
+def _unescape(text: str) -> str:
+    return text.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n") \
+        .replace("\\134", "\\")
+
+
+def filesystem_type(path: str, mountinfo: str = "/proc/self/mountinfo") -> Optional[str]:
+    """The type of the filesystem holding ``path`` (Linux), or None if it cannot be told."""
+    path = os.path.realpath(path)
+    best, found = -1, None  # type: int, Optional[str]
+    try:
+        with open(mountinfo, encoding="utf-8", errors="replace") as lines:
+            for line in lines:
+                left, _, right = line.partition(" - ")
+                fields, kinds = left.split(), right.split()
+                if len(fields) < 5 or not kinds:
+                    continue
+                point = _unescape(fields[4])
+                inside = path == point or path.startswith(point.rstrip("/") + "/")
+                if inside and len(point) >= best:  # later lines mount over earlier ones
+                    best, found = len(point), kinds[0]
+    except OSError:
+        return None
+    return found
+
+
+def is_network(kind: Optional[str]) -> bool:
+    return kind is not None and (kind in NETWORK_FILESYSTEMS or kind.startswith("fuse."))
+
+
+def _local_cache_dir(base: Optional[str] = None) -> Optional[str]:
+    """An owner-only ``slurm-usage-<uid>`` directory on node-local disk, or None.
+
+    Only under a root-owned sticky (or not world-writable) base on a local filesystem,
+    so no one else can pre-create, rename or replace it; never a subdirectory of
+    something another user made."""
+    base = base or LOCAL_BASE
+    try:
+        found = os.lstat(base)
+        if (not stat.S_ISDIR(found.st_mode) or found.st_uid not in BASE_OWNERS
+                or (found.st_mode & 0o002 and not found.st_mode & stat.S_ISVTX)
+                or is_network(filesystem_type(base)) or filesystem_type(base) is None):
+            return None
+        directory = os.path.join(base, "slurm-usage-%d" % os.geteuid())
+        if not os.path.lexists(directory):
+            os.mkdir(directory, 0o700)
+            os.chmod(directory, 0o700)
+        return directory if _is_private_dir(directory) else None
+    except OSError:
+        return None
+
+
+def home_cache_dir() -> str:
     base = os.environ.get("XDG_CACHE_HOME", "")
     if not os.path.isabs(base):  # the XDG specification says to ignore relative values
         base = os.path.join(os.path.expanduser("~"), ".cache")
     return os.path.join(base, "slurm-usage")
+
+
+def default_cache_dir() -> str:
+    """``$XDG_CACHE_HOME/slurm-usage``, or ``~/.cache/slurm-usage``; but when XDG_CACHE_HOME
+    is not set and that would be on a network filesystem, a private directory on
+    node-local disk (``/var/tmp/slurm-usage-<uid>``), if one can be had safely. Each node
+    then keeps its own cache, which is disposable anyway."""
+    chosen = home_cache_dir()
+    if not os.path.isabs(os.environ.get("XDG_CACHE_HOME", "")):
+        probe = chosen
+        while not os.path.exists(probe) and os.path.dirname(probe) != probe:
+            probe = os.path.dirname(probe)
+        if is_network(filesystem_type(probe)):
+            return _local_cache_dir() or chosen
+    return chosen
 
 
 def cache_name(*identity: object) -> str:
@@ -711,6 +824,17 @@ def _remove_old_versions(directory: str, name: str) -> None:
                 pass
 
 
+def _remove_home_copies(name: str) -> None:
+    """The cache moved to node-local disk: drop this identity's files from home."""
+    home = home_cache_dir()
+    try:
+        if _is_private_dir(home):
+            _remove_old_versions(home, name)
+            os.unlink(os.path.join(home, name))
+    except OSError:
+        pass
+
+
 def open_store(directory: Optional[str], name: str, persist: bool = True) -> _Base:
     """The best store available. ``notes`` says what had to be given up."""
     if sqlite3 is None:
@@ -723,6 +847,8 @@ def open_store(directory: Optional[str], name: str, persist: bool = True) -> _Ba
         try:
             path = _private_file(directory or default_cache_dir(), name)
             _remove_old_versions(os.path.dirname(path), name)
+            if directory is None and not path.startswith(home_cache_dir() + os.sep):
+                _remove_home_copies(name)
             try:
                 return SqliteStore(path)
             except sqlite3.OperationalError as error:  # locked or unwritable: not ours to delete

@@ -39,8 +39,24 @@ MEMORY_RANGES = ("day", "week", "month")
 _SECONDS = dict(RANGES)
 OUTCOME_ORDER = ("running", "completed", "preempted", "timeout", "failed", "node_fail",
                  "cancelled", "requeued", "other")
-FAILED = ("failed", "node_fail")
+FAILED = ("failed", "node_fail")  # failure bursts in the events feed
+# The "fail" column of run types, everywhere (here and in history.runtypes): attempts
+# that failed, lost their node or hit their time limit, among attempts that ended.
+FAIL_OUTCOMES = ("failed", "node_fail", "timeout")
 ATTEMPT_LIMIT = 20000  # per person page
+JOB_PAGE = 500  # rows of a jobs pane loaded at once; more load as the cursor reaches the end
+
+
+def in_range(event: Any, win: Any) -> bool:
+    """Whether a history event has activity inside the window: it ends (or, without an
+    end, happens) at or after the window's start."""
+    start = getattr(win, "start", None)
+    if start is None:
+        return True
+    last = getattr(event, "end", None)
+    if last is None:
+        last = getattr(event, "time", None)
+    return last is None or last >= start
 
 
 def window(name: str, now: Optional[float] = None) -> Any:
@@ -101,7 +117,7 @@ class RunType(NamedTuple):
     gpu_cover: Optional[float]
     cpu_eff: Optional[float]
     cpu_cover: Optional[float]
-    failure: Optional[float]  # failed, node_fail (or timeout, from history) among finished
+    failure: Optional[float]  # failed, node_fail or timeout among finished (FAIL_OUTCOMES)
     rows: Optional[List[Any]]  # attempts, when computed here; None = drill by ``key``
     key: str = ""  # the history layer's key, for jobs(run_type=(dimension, key))
     complete: bool = True  # False: some sizes unknown, hours are a lower bound
@@ -246,7 +262,8 @@ def run_types(rows: Sequence[Any], dimension: str) -> List[RunType]:
             fmt.median([m.elapsed for m in members if m.elapsed is not None]),
             fmt.median([m.wait for m in members if m.wait is not None]),
             fmt.median(limits), gpu_eff, gpu_cover, cpu_eff, cpu_cover,
-            sum(m.outcome in FAILED for m in finished) / len(finished) if finished else None,
+            sum(m.outcome in FAIL_OUTCOMES for m in finished) / len(finished) if finished
+            else None,
             members, key, len(gpu) == len(members)))
     return sort_types(out, dimension)
 
@@ -457,6 +474,7 @@ class HistoryData:
         self.history = history
         self.clock = clock
         self.full_history = full_history  # load all of history in the background
+        self.paused = False  # history switched off in the app: no load runs
         self._persistent = None  # type: Optional[bool]
         self.generation = 0  # bumps when more history has been loaded
         self.progress = ""  # what the loader is doing, for the header
@@ -490,7 +508,10 @@ class HistoryData:
         """Whether loaded history survives this run (a cache file, not memory)."""
         if self._persistent is None:
             try:
-                self._persistent = bool(getattr(self.history.info(), "cache_path", None))
+                info = self.history.info()
+                known = getattr(info, "persistent", None)  # set even when the path is hidden
+                self._persistent = bool(getattr(info, "cache_path", None)
+                                        if known is None else known)
             except Exception:
                 return True  # unknown yet; decided once history answers
         return self._persistent
@@ -508,15 +529,29 @@ class HistoryData:
             return ("no history cache file: only up to a month is loaded in the background; "
                     "pick a longer range to load it")
         if not self.full_history:
-            return "--no-full-history: all-time history is loaded only when you pick it"
+            return "recent history only: all of history is loaded only when you pick it (H)"
         return ""
+
+    # One bar per load: reading records fills most of it, summarizing the rest.
+    _PHASES = {"rollup": (0.85, 1.0), "aggregate": (0.85, 1.0)}
 
     def _progress(self, event: Any) -> None:
         total = getattr(event, "total", None)
         done = getattr(event, "done", 0)
         phase = getattr(event, "phase", "loading")
-        self.fraction = min(1.0, done / float(total)) if total else None
-        self.progress = "%s %s" % (phase, fmt.pct(self.fraction) if total else fmt.num(done))
+        if phase == "efficiency":
+            self.fraction = min(1.0, done / float(total)) if total else None
+            self.progress = "efficiency %s" % (fmt.pct(self.fraction) if total
+                                               else fmt.num(done))
+        else:
+            low, high = self._PHASES.get(phase, (0.0, 0.85))
+            if total:
+                at = low + (high - low) * min(1.0, done / float(total))
+                # never backwards within one load, whichever phase reports
+                self.fraction = max(self.fraction or 0.0, at)
+            label = self._loading or "history"
+            self.progress = "%s %s" % (label, fmt.pct(self.fraction)
+                                       if self.fraction is not None else fmt.num(done))
         if time.time() - self._bumped > 20:  # show what is loaded so far, marked partial
             self._bumped = time.time()
             with self._lock:
@@ -528,21 +563,23 @@ class HistoryData:
         Returns False if prioritize() stopped it for a shorter range; what it had
         already committed stays in the cache and the next load continues from there.
         """
-        self.progress = "loading %s" % range_name
+        if self.paused:
+            return False
+        self.progress = "%s …" % range_name
+        self.fraction = None
         self._preempt.clear()
         self._loading = range_name
 
         def cancelled() -> bool:
-            return self._cancel.is_set() or self._preempt.is_set()
+            return self._cancel.is_set() or self._preempt.is_set() or self.paused
         try:
             self.history.refresh(None if _SECONDS[range_name] is None
                                  else window(range_name, self.clock()),
                                  progress=self._progress, cancel=cancelled, update=update)
             if self.has("build_rollup"):
-                self.progress = "summarizing %s" % range_name
                 self.history.build_rollup(progress=self._progress, cancel=cancelled)
         except Exception as error:  # HistoryError, Cancelled, or a bug: shown, not raised
-            if self._preempt.is_set() and not self._cancel.is_set():
+            if (self._preempt.is_set() or self.paused) and not self._cancel.is_set():
                 return False
             self.failure = (status_of(error), str(getattr(error, "message", error)))
             raise
@@ -588,16 +625,36 @@ class HistoryData:
     def stop(self) -> None:
         self._cancel.set()
 
+    def pause(self, paused: bool) -> None:
+        """Stop (and keep stopped) or allow background loading; loaded data stays."""
+        self.paused = paused
+        if paused:
+            self._preempt.set()
+
+    def stop_current(self) -> None:
+        """Stop the load in progress; the next one may start."""
+        if self._loading is not None:
+            self._preempt.set()
+
+    def forget(self) -> None:
+        """The cache was emptied: nothing counts as loaded any more."""
+        with self._lock:
+            self.loaded = set()
+            self.failure = None
+            self._persistent = None
+            self.generation += 1
+
     # -- queries ---------------------------------------------------------------
 
     def report(self, range_name: str, filt: Any = None, group_by: Sequence[Any] = (),
                series_by: Optional[str] = None, lanes_by: Optional[str] = None,
                lane_resolution: Optional[int] = None, efficiency: bool = True,
-               win: Any = None) -> Any:
+               win: Any = None, lanes_metric: Optional[str] = None) -> Any:
+        extra = {"lanes_metric": lanes_metric} if lanes_metric else {}
         return self.history.query(win or window(range_name, self.clock()), filt,
                                   group_by=group_by, series_by=series_by, lanes_by=lanes_by,
                                   lane_resolution=lane_resolution, efficiency=efficiency,
-                                  cancel=self._cancel)
+                                  cancel=self._cancel, **extra)
 
     def previous(self, range_name: str, filt: Any = None,
                  group_by: Sequence[Any] = ()) -> Any:
@@ -663,8 +720,9 @@ class HistoryData:
 
     def events(self, range_name: str, filt: Any) -> List[Event]:
         if self.has("events"):
-            found = self.history.events(window(range_name, self.clock()), filt,
-                                        cancel=self._cancel)
+            win = window(range_name, self.clock())
+            found = [e for e in self.history.events(win, filt, cancel=self._cancel)
+                     if in_range(e, win)]
             return sorted((from_history_event(e) for e in found), key=lambda e: e.at or 0,
                           reverse=True)
         page = self.attempts(range_name, filt)
@@ -683,9 +741,15 @@ class HistoryData:
         return self.history.jobs(win or window(range_name, self.clock()), filt, by="attempt",
                                  sort=sort, descending=True, limit=limit, cancel=self._cancel)
 
-    def jobs(self, range_name: str, filt: Any = None, sort: str = "gpu", limit: int = 500,
-             win: Any = None, run_type: Optional[Tuple[str, str]] = None) -> Any:
-        extra = {"run_type": run_type} if run_type is not None else {}
+    def jobs(self, range_name: str, filt: Any = None, sort: str = "gpu", limit: int = 0,
+             win: Any = None, run_type: Optional[Tuple[str, str]] = None,
+             match: str = "") -> Any:
+        """``match``: keep jobs whose id, name or user contains it (searched by history,
+        not only in the rows already shown)."""
+        limit = limit or JOB_PAGE
+        extra = {"run_type": run_type} if run_type is not None else {}  # type: Dict[str, Any]
+        if match:
+            extra["match"] = match
         return self.history.jobs(win or window(range_name, self.clock()), filt, by="job",
                                  sort=sort, descending=True, limit=limit, cancel=self._cancel,
                                  **extra)
@@ -703,12 +767,18 @@ class HistoryData:
         return self.history.batch_script(job_id)
 
     def load_efficiency(self, range_name: str, filt: Any = None) -> int:
+        """Read step usage for the range, then bring the rollup up to date: the usage
+        written marks its hours for rebuilding, and until they are rebuilt the overview
+        and every rollup-backed figure would read as partly loaded."""
         self.progress = "efficiency %s" % range_name
         try:
             count = self.history.load_efficiency(window(range_name, self.clock()), filt,
                                                  progress=self._progress, cancel=self._cancel)
+            if self.has("build_rollup"):  # a no-op when nothing changed
+                self.fraction = None
+                self.history.build_rollup(progress=self._progress, cancel=self._cancel)
         finally:
-            self.progress = ""
+            self.progress, self.fraction = "", None
         with self._lock:
             self.generation += 1
         return count

@@ -60,6 +60,8 @@ class Frame(NamedTuple):
 
 SCRIPT_NOT_STORED = ("Slurm keeps no copy of this script: not a batch job (srun/salloc), or "
                      "this cluster does not store scripts (AccountingStoreFlags=job_script)")
+SCRIPT_NOT_STORED_BATCH = ("Slurm keeps no copy of this batch script: this cluster does not "
+                           "store scripts (AccountingStoreFlags=job_script is not set)")
 SCRIPT_NOT_VISIBLE = ("Slurm returned no record: scripts are shown only to the job's owner "
                       "and Slurm operators, or the job is no longer in accounting")
 _SCRIPT_HEADER = re.compile(r"Batch Script for \S+")

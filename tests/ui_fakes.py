@@ -243,7 +243,8 @@ class FakeHistory:
     def query(self, window: Any = None, where: Any = None, group_by: Any = (),
               series_by: Optional[str] = None, series_metric: str = "gpu",
               lanes_by: Optional[str] = None, lane_resolution: Optional[int] = None,
-              efficiency: bool = False, progress: Any = None, cancel: Any = None) -> Report:
+              efficiency: bool = False, progress: Any = None, cancel: Any = None,
+              lanes_metric: Optional[str] = None) -> Report:
         start, end = self._span(window)
         specs = [("outcome",)] + [tuple((g,) if isinstance(g, str) else g) for g in group_by]
         groups = {spec: {} for spec in specs}  # type: Dict[tuple, Dict[tuple, Stats]]
@@ -300,7 +301,7 @@ class FakeHistory:
                     if series_by:
                         series = keyed.setdefault(getattr(row, series_by), [0] * (len(edges) - 1))
                         series[i] += (getattr(row, series_metric + "s") or 0) * (b - a)
-            if lanes_by:
+            if lanes_by and (lanes_metric is None or getattr(row, lanes_metric + "s")):
                 lane = lanes.setdefault(getattr(row, lanes_by), [])
                 if lane and p <= lane[-1][1] + resolution:
                     lane[-1][1] = max(lane[-1][1], q)
@@ -322,12 +323,16 @@ class FakeHistory:
 
     def jobs(self, window: Any = None, where: Any = None, by: str = "job", sort: str = "gpu",
              descending: bool = True, limit: int = 200, offset: int = 0,
-             cancel: Any = None) -> JobPage:
+             cancel: Any = None, match: Optional[str] = None) -> JobPage:
         import dataclasses
         start, end = self._span(window)
         found = {}  # type: Dict[str, JobRow]
+        needle = (match or "").lower()
         for row in self.rows:
             if not self._match(row, where):
+                continue
+            if needle and not (needle in row.job_id or needle in row.name.lower()
+                               or needle in row.user.lower()):
                 continue
             clipped = self._clip(row, start, end)
             if clipped is None:

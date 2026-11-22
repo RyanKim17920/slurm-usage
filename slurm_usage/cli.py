@@ -1,6 +1,7 @@
 """Command line: ``slurm-usage`` (TUI), ``--once`` (text), ``--json``."""
 
 import argparse
+import locale
 import os
 import sys
 from typing import Any, List, Optional
@@ -8,44 +9,101 @@ from typing import Any, List, Optional
 from . import __version__
 from .model import Status
 
+HISTORY_MODES = ("full", "recent", "off")
+CACHE_ENV = "SLURM_USAGE_CACHE"
+# Options that were removed, and what replaced each.
+REMOVED = {
+    "--no-history": "use --history off (or press H in the app)",
+    "--no-full-history": "use --history recent (or press H in the app)",
+    "--no-color": "set NO_COLOR=1 (or press C in the app)",
+    "--ascii": "ASCII is chosen from the terminal's encoding; press U in the app to switch",
+    "--cache-dir": "set %s=<dir> instead" % CACHE_ENV,
+}
+_LEGACY_TERMS = ("vt52", "vt100", "vt102", "vt220", "ansi", "cons25")
+
+EPILOG = """\
+environment:
+  NO_COLOR=1               start without colors
+  %s=<dir>  history cache directory (must be private to you)
+
+keys in the app: ? help, O settings, A anonymize, C colors, U Unicode/ASCII,
+H history full/recent/off
+""" % CACHE_ENV
+
+
+def _removed(argv: List[str]) -> Optional[str]:
+    for arg in argv:
+        if arg == "--":
+            return None
+        name = arg.split("=", 1)[0]
+        if name in REMOVED:
+            return "%s was removed: %s" % (name, REMOVED[name])
+    return None
+
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
-        prog="slurm-usage",
+        prog="slurm-usage", allow_abbrev=False,
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=EPILOG,
         description="Read-only Slurm monitor and usage explorer. Nothing it does changes "
                     "anything in Slurm.")
-    parser.add_argument("--once", action="store_true",
-                        help="print a plain-text summary and exit (default when not a terminal)")
-    parser.add_argument("--json", action="store_true", help="print the summary as JSON and exit")
-    parser.add_argument("--range", choices=("day", "week", "month", "year", "all"),
-                        default="week", help="usage window (default: week)")
-    parser.add_argument("--user", help="open on this person (with --once: add their page)")
-    parser.add_argument("--account", help="open on this account's people (with --once: only it)")
-    parser.add_argument("--no-history", action="store_true",
-                        help="live view only; do not read Slurm accounting")
-    parser.add_argument("--no-full-history", action="store_true",
-                        help="do not load all-time history in the background (it is still "
-                             "loaded if you pick the 'all' range)")
-    parser.add_argument("--anonymize", action="store_true",
-                        help="stable pseudonyms for users, accounts, nodes and job names; "
-                             "hide paths, scripts, submit lines and logs")
-    parser.add_argument("--no-color", action="store_true", help="no colors (also: NO_COLOR)")
-    parser.add_argument("--ascii", action="store_true", help="ASCII-only charts")
-    parser.add_argument("--cache-dir", help="where history is cached (default: per-user cache)")
+    out = parser.add_argument_group("output (default: the full-screen app on a terminal)")
+    out.add_argument("--once", action="store_true", help="print a text summary and exit")
+    out.add_argument("--json", action="store_true", help="print the summary as JSON and exit")
+    scope = parser.add_argument_group("what to show")
+    scope.add_argument("--range", choices=("day", "week", "month", "year", "all"),
+                       default="week", help="usage window (default: week)")
+    scope.add_argument("--user", help="open on this person")
+    scope.add_argument("--account", help="open on this account's people")
+    scope.add_argument("--history", choices=HISTORY_MODES, default="full",
+                       help="full: load all of history in the background (default); "
+                            "recent: only the chosen range and shorter; off: live view only")
+    scope.add_argument("--anonymize", action="store_true",
+                       help="pseudonyms for users, accounts, nodes and job names; "
+                            "no paths, scripts or logs (A toggles it in the app)")
     parser.add_argument("--version", action="version", version="slurm-usage " + __version__)
+    problem = _removed(argv)
+    if problem:
+        parser.print_usage(sys.stderr)
+        parser.exit(2, "slurm-usage: %s\n" % problem)
     return parser.parse_args(argv)
+
+
+def cache_dir() -> Optional[str]:
+    """The history cache directory from the environment, or None for the default."""
+    found = os.environ.get(CACHE_ENV, "").strip()
+    return os.path.abspath(os.path.expanduser(found)) if found else None
+
+
+def wants_color() -> bool:
+    return "NO_COLOR" not in os.environ and os.environ.get("TERM") not in ("dumb", "")
+
+
+def wants_ascii(stream: Any = None) -> bool:
+    """ASCII glyphs when the output (or the locale) cannot show the Unicode ones, or the
+    terminal is a legacy one that has none."""
+    from .ui import text
+    stream = stream if stream is not None else sys.stdout
+    encoding = getattr(stream, "encoding", None)
+    if encoding is None:
+        try:
+            encoding = locale.getpreferredencoding(False)
+        except Exception:
+            encoding = None
+    if encoding is not None and not text.can_encode(encoding):
+        return True
+    return os.environ.get("TERM", "").split("-")[0] in _LEGACY_TERMS
 
 
 def _history(args: argparse.Namespace) -> Any:
     from .ui import data as hd
-    if args.no_history:
-        return hd.HistoryData(hd.NoHistory(Status.UNAVAILABLE, "history is off (--no-history)"))
     try:
         from .history import History
-        history = History(cache_dir=args.cache_dir)  # type: Any
+        history = History(cache_dir=cache_dir())  # type: Any  # opens nothing until asked
     except Exception as error:  # the history layer failing must not take the live view down
         history = hd.NoHistory(Status.ERROR, "history unavailable: %s" % error)
-    return hd.HistoryData(history, full_history=not args.no_full_history)
+    return hd.HistoryData(history, full_history=args.history == "full")
 
 
 def build(args: argparse.Namespace) -> Any:
@@ -77,7 +135,8 @@ def run_once(args: argparse.Namespace, out: Any = None) -> int:
         user = anon.name("user", user) if user else None
         account = anon.name("account", account) if account else None
     info = None
-    if not args.no_history:
+    no_history = args.history == "off"
+    if not no_history:
         quiet = not sys.stderr.isatty()
 
         def progress(event: Any) -> None:
@@ -95,12 +154,13 @@ def run_once(args: argparse.Namespace, out: Any = None) -> int:
             info = data.info()
         except Exception:
             info = None
-    summary = text.collect(snap, None if args.no_history else data, args.range, user, account,
-                           info)
+    summary = text.collect(snap, None if no_history else data, args.range, user, account, info)
     if anon is not None:
         summary["anonymized"] = True
-    write(out, text.to_json(summary) + "\n" if args.json else text.render(summary),
-          ascii_only=args.ascii)
+    if args.json:
+        write(out, text.to_json(summary) + "\n")
+    else:
+        write(out, text.render(summary), ascii_only=wants_ascii(out))
     return 0
 
 
@@ -133,15 +193,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     account = args.account
     if anon is not None and account:
         account = anon.name("account", account)
-    color = not args.no_color and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
     start = "person" if user else "overview"
     app = App(collector, data, args.range, user=user, account=account,
-              ascii_only=args.ascii, anonymized=anon is not None, no_history=args.no_history,
-              start=start)
+              ascii_only=wants_ascii(), anonymized=anon is not None, history=args.history,
+              start=start, color=wants_color())
     if start == "person":
         app.stack[0].title = user
     try:
-        run(app, use_color=color)
+        run(app)
     except KeyboardInterrupt:
         pass
     return 0

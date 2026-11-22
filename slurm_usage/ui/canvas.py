@@ -4,7 +4,7 @@ Every string is passed through ``sanitize.clean`` on the way in, so nothing a
 user controls can reach the terminal as an escape sequence.
 """
 
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from ..sanitize import clean
 from .fmt import char_width
@@ -71,6 +71,12 @@ class Canvas:
             return
         for at in range(max(0, start), min(self.width, end)):
             self.cells[row][at] = (self.cells[row][at][0], style)
+
+    def map_cells(self, fn: Callable[[str], str]) -> None:
+        """Replace every cell's character (each result must be one cell wide)."""
+        for line in self.cells:
+            for at, (char, style) in enumerate(line):
+                line[at] = (fn(char), style)
 
     def text(self) -> str:
         """The screen as plain text, one line per row (trailing spaces kept)."""

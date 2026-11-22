@@ -17,14 +17,16 @@ class Target(NamedTuple):
 class Line:
     """One row of a pane. ``action`` makes it drillable; ``sort`` holds sort keys."""
 
-    __slots__ = ("parts", "action", "sort", "key", "search")
+    __slots__ = ("parts", "action", "sort", "key", "search", "pinned")
 
     def __init__(self, parts: Sequence[Segment], action: Optional[Target] = None,
-                 sort: Optional[Dict[str, Any]] = None, key: Optional[str] = None) -> None:
+                 sort: Optional[Dict[str, Any]] = None, key: Optional[str] = None,
+                 pinned: bool = False) -> None:
         self.parts = list(parts)
         self.action = action
         self.sort = sort or {}
         self.key = key
+        self.pinned = pinned  # stays first whatever the sort (the viewer's own row)
         self.search = "".join(text for text, _ in self.parts).lower()
 
     @property
@@ -40,21 +42,31 @@ class Pane:
     def __init__(self, pane_id: str, title: str, lines: Optional[List[Line]] = None,
                  header: Optional[Line] = None, sorts: Sequence[str] = (),
                  grow: bool = True, status: str = "", focusable: bool = True,
-                 min_lines: int = 1, max_lines: Optional[int] = None) -> None:
+                 min_lines: int = 1, max_lines: Optional[int] = None, natural: str = "",
+                 follow: bool = False, more: bool = False,
+                 select_width: Optional[int] = None) -> None:
         self.id = pane_id
         self.title = title
         self.lines = lines or []
         self.header = header
         self.sorts = tuple(sorts)
         self.grow = grow
-        self.status = status  # short note at the right of the title
+        # short note at the right of the title; a sequence is parts by priority, the
+        # last dropped first when the title row is short
+        self.status = status
         self.focusable = focusable
         self.min_lines = min_lines
         self.max_lines = max_lines
+        self.natural = natural  # the sort name the unsorted order already follows (▼ shown)
+        self.follow = follow  # opens at the last line and stays there until moved (a log tail)
+        self.more = more  # only the first rows are loaded; reaching the end loads more
+        # the selected row is marked over this many leading columns only (None = all), so
+        # what the rest of the row draws (a timeline lane's bars) stays visible
+        self.select_width = select_width
 
 
 class PaneState:
-    __slots__ = ("cursor", "scroll", "filter", "sort", "descending")
+    __slots__ = ("cursor", "scroll", "filter", "sort", "descending", "follow")
 
     def __init__(self) -> None:
         self.cursor = 0
@@ -62,6 +74,7 @@ class PaneState:
         self.filter = ""
         self.sort = -1  # index into Pane.sorts; -1 = natural order
         self.descending = True
+        self.follow = None  # type: Optional[bool]  # None until the pane is first drawn
 
 
 def visible_lines(pane: Pane, state: PaneState) -> List[Line]:
@@ -75,6 +88,8 @@ def visible_lines(pane: Pane, state: PaneState) -> List[Line]:
         unknown = [line for line in lines if line.sort.get(name) is None]
         known.sort(key=lambda line: line.sort[name], reverse=state.descending)
         lines = known + unknown
+    if any(line.pinned for line in lines):
+        lines = [line for line in lines if line.pinned] + [l for l in lines if not l.pinned]
     return lines
 
 
@@ -86,6 +101,7 @@ class Column(NamedTuple):
     align: str = "<"  # < or >
     priority: int = 0  # higher survives longer when space is short
     flex: bool = False  # takes the spare width
+    most: int = 0  # a flex column grows to at most this width (0 = no limit)
 
 
 Cell = Tuple[str, str]
@@ -103,12 +119,21 @@ def fit_columns(columns: Sequence[Column], space: int) -> List[Tuple[int, Column
         chosen.remove(drop)
     spare = max(0, space - needed(chosen))
     flex = [i for i in chosen if columns[i].flex]
+    extra = {i: 0 for i in flex}
+    # flex columns grow in order up to their limit; an unlimited one takes what is left,
+    # so one long name column cannot take the whole width from the others
+    for i in flex:
+        if columns[i].most:
+            extra[i] = min(spare, max(0, columns[i].most - columns[i].width))
+            spare -= extra[i]
+    unlimited = [i for i in flex if not columns[i].most]
+    for number, i in enumerate(unlimited):
+        give = spare // (len(unlimited) - number)
+        extra[i] += give
+        spare -= give
     out = []
     for i in chosen:
-        size = columns[i].width
-        if flex and i == flex[0]:
-            size += spare
-        out.append((i, columns[i], size))
+        out.append((i, columns[i], columns[i].width + extra.get(i, 0)))
     if out and needed(chosen) > space:  # a single column wider than the screen
         index, column, size = out[-1]
         out[-1] = (index, column, max(1, size - (needed(chosen) - space)))
@@ -197,14 +222,19 @@ def draw_pane(canvas: Canvas, top: int, height: int, pane: Pane, state: PaneStat
     if state.filter:
         info.append("/" + state.filter)
     if 0 <= state.sort < len(pane.sorts):
-        info.append("sort " + pane.sorts[state.sort] + ("↓" if state.descending else "↑"))
+        info.append("sort " + pane.sorts[state.sort] + ("▼" if state.descending else "▲"))
     if lines and height > _chrome(pane) and pane.focusable:
         info.append("%d/%d" % (min(state.cursor + 1, len(lines)), len(lines)))
-    if pane.status:
-        info.append(pane.status)
-    right = "  ".join(info)
+    status = [pane.status] if isinstance(pane.status, str) else list(pane.status or ())
+    status = [part for part in status if part]
     col = canvas.put(top, 0, mark, title_style if focused else DIM)
     col = canvas.put(top, col, pane.title + " ", title_style)
+    room = width - col - 2  # one rule cell before the note, one cell spare at the end
+    while len(status) > 1 and fmt.width("  ".join(info + status)) > room:
+        status.pop()  # the least important part goes first
+    right = "  ".join(info + status)
+    if fmt.width(right) > room:
+        right = fmt.fit(right, max(0, room)).rstrip() if room > 1 else ""
     rule_end = width - fmt.width(right) - (2 if right else 0)
     for at in range(col, max(col, rule_end)):
         canvas.put(top, at, "─", DIM)
@@ -212,7 +242,7 @@ def draw_pane(canvas: Canvas, top: int, height: int, pane: Pane, state: PaneStat
         canvas.put(top, max(col, rule_end) + 1, right, DIM)
     row = top + 1
     if pane.header is not None and height > 1:
-        canvas.segments(row, 1, pane.header.parts, width - 1)
+        canvas.segments(row, 1, sort_marked(pane, state), width - 1)
         row += 1
     body = top + height - row
     hits = []
@@ -221,6 +251,10 @@ def draw_pane(canvas: Canvas, top: int, height: int, pane: Pane, state: PaneStat
     if not lines:
         canvas.put(row, 1, "(nothing to show)" if not state.filter else "(no match)", DIM)
         return hits
+    if state.follow is None:
+        state.follow = pane.follow
+    if state.follow:
+        state.cursor = len(lines) - 1
     state.cursor = max(0, min(state.cursor, len(lines) - 1))
     if state.cursor < state.scroll:
         state.scroll = state.cursor
@@ -235,7 +269,8 @@ def draw_pane(canvas: Canvas, top: int, height: int, pane: Pane, state: PaneStat
         selected = focused and pane.focusable and index == state.cursor
         canvas.segments(row + offset, 1, line.parts, width - 1)
         if selected:
-            canvas.restyle(row + offset, 0, width, SELECTED)
+            canvas.restyle(row + offset, 0, width if pane.select_width is None
+                           else min(width, pane.select_width), SELECTED)
             canvas.put(row + offset, 0, "›" if line.action else " ", SELECTED)
         hits.append((row + offset, index))
     if len(lines) > body:  # a scroll hint at the right edge
@@ -243,6 +278,37 @@ def draw_pane(canvas: Canvas, top: int, height: int, pane: Pane, state: PaneStat
         canvas.put(row + body - 1, width - 1,
                    "▼" if state.scroll + body < len(lines) else " ", DIM)
     return hits
+
+
+# sort names that label a column with another header
+_SORT_ALIASES = {"name": ("account", "node", "user", "run type", "job"),
+                 "attempts": ("att",), "gpus free": ("gpu",), "cpus free": ("cpu",),
+                 "time": ("start",), "gpu-h": ("gpu-h in bin",)}
+
+
+def sort_marked(pane: Pane, state: PaneState) -> List[Segment]:
+    """The header with ▼/▲ in the column the rows are sorted by (or the natural order's)."""
+    parts = list(pane.header.parts) if pane.header is not None else []
+    if 0 <= state.sort < len(pane.sorts):
+        name, arrow = pane.sorts[state.sort], "▼" if state.descending else "▲"
+    elif pane.natural:
+        name, arrow = pane.natural, "▼"
+    else:
+        return parts
+    wanted = (name.lower(),) + _SORT_ALIASES.get(name.lower(), ())
+    for number, (text, style) in enumerate(parts):
+        core = text.strip()
+        if not core or core.lower() not in wanted:
+            continue
+        size = fmt.width(text)
+        marked = core + arrow
+        if fmt.width(marked) > size:
+            marked = core[:max(0, size - 1)] + arrow
+        right = text.startswith(" ") and not text.endswith(" ")
+        pad = " " * max(0, size - fmt.width(marked))
+        parts[number] = (pad + marked if right else marked + pad, style)
+        break
+    return parts
 
 
 def wrap(text: str, size: int, indent: Optional[int] = None) -> List[str]:

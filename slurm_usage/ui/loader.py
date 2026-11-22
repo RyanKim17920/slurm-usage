@@ -48,6 +48,12 @@ class Loader:
     def invalidate(self) -> None:
         self.generation += 1
 
+    def clear(self) -> None:
+        """Drop every entry. Work still running finishes into entries nobody reads."""
+        with self._lock:
+            self._entries = {}
+        self.generation += 1
+
     def forget(self, key: Hashable) -> None:
         with self._lock:
             self._entries.pop(key, None)

@@ -7,6 +7,7 @@ Key names: single characters, or UP DOWN LEFT RIGHT PGUP PGDN HOME END ENTER
 ESC TAB BTAB BACKSPACE RESIZE.
 """
 
+import copy
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -14,7 +15,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from ..model import Status
 from . import data as hd
 from . import fmt
-from .canvas import BAD, DIM, GOOD, HEAD, PLAIN, RESOURCE, TAB, WARN, Canvas
+from . import text as textmod
+from .anonymize import AnonCollector, AnonHistory, Anonymizer
+from .canvas import BAD, DIM, GOOD, HEAD, PLAIN, RESOURCE, SELECTED, TAB, WARN, Canvas
 from .filestat import check as stat_path
 from .filestat import script_from_submit_line
 from .loader import Loader
@@ -25,23 +28,54 @@ ACTIVE_REFRESH = 30.0
 MAX_REFRESH = 300.0
 IDLE_AFTER = 120.0
 HISTORY_UPDATE = 300.0
+MESSAGE_SECONDS = 8.0  # how long a completion message stays in the footer
 TAB_KINDS = tuple(kind for kind, _, _, _ in TABS)
 TAB_KEYS = {key: kind for kind, _, _, key in TABS}
 FETCH_KEYS = {"l": "stdout", "e": "stderr", "b": "script", "u": "submit"}
+HISTORY_MODES = ("full", "recent", "off")
+# Settings, the same on every screen: key -> what it switches
+TOGGLE_KEYS = {"A": "anonymize", "C": "colors", "U": "glyphs", "H": "history"}
+SETTINGS_KEY = "O"
+CLEAR_CACHE_KEY = "X"
+_PERSON_PARAMS = {"user": "user", "account": "account", "node": "node"}
+_VOCAB_PARAMS = ("qos", "partition")
 
 
 class App:
     def __init__(self, collector: Any, data: hd.HistoryData, range_name: str = "week",
                  user: Optional[str] = None, account: Optional[str] = None,
                  ascii_only: bool = False, background: bool = True, anonymized: bool = False,
-                 no_history: bool = False, start: str = "overview") -> None:
-        self.collector = collector
+                 no_history: bool = False, start: str = "overview",
+                 history: Optional[str] = None, color: bool = True) -> None:
+        # Anonymizing is switchable: keep the real collector and history, and one
+        # Anonymizer for the whole run so a pseudonym never changes.
+        raw_collector, anon = collector, None
+        if isinstance(collector, AnonCollector):
+            raw_collector, anon = collector._collector, collector._anon
+        raw_history = data.history
+        if isinstance(raw_history, AnonHistory):
+            anon = anon or raw_history._anon
+            raw_history = raw_history._history
+        self.anon = anon or Anonymizer()
+        self._raw_collector, self._raw_history = raw_collector, raw_history
+        self._anon_collector = AnonCollector(raw_collector, self.anon)
+        self._raw_snapshot = None  # type: Any
+        self.anonymized = bool(anonymized)
+        self.collector = self._anon_collector if self.anonymized else raw_collector
         self.data = data
+        data.history = AnonHistory(raw_history, self.anon) if self.anonymized else raw_history
         self.range = range_name
         self.user = user
         self.ascii = ascii_only
-        self.anonymized = anonymized
-        self.no_history = no_history
+        self.color = color
+        self.history_mode = history or ("off" if no_history else
+                                        "full" if getattr(data, "full_history", True) else
+                                        "recent")
+        data.full_history = self.history_mode == "full"
+        if hasattr(data, "pause"):
+            data.pause(self.history_mode == "off")
+        self.overlay = None  # type: Optional[str]  # "settings" while the box is open
+        self.confirm = None  # type: Optional[str]  # an action waiting for y
         self.background = background
         self.loader = Loader(workers=3 if background else 0)
         self.snapshot = None  # type: Any
@@ -51,6 +85,7 @@ class App:
         self.history_info = None  # type: Any
         self.last_input = time.time()
         self.message = ""
+        self._flash = None  # type: Optional[Tuple[str, float]]  # message that expires
         self.input = None  # type: Optional[List[str]]  # filter being typed
         self.hits = []  # type: List[Tuple[int, int, int]]  # (row, pane index, line index)
         self.tab_hits = []  # type: List[Tuple[int, int, str]]
@@ -73,8 +108,12 @@ class App:
             return ACTIVE_REFRESH
         return min(MAX_REFRESH, ACTIVE_REFRESH * 2 ** int(idle / IDLE_AFTER))
 
+    @property
+    def no_history(self) -> bool:
+        return self.history_mode == "off"
+
     def start(self) -> None:
-        if self.background and not self.no_history:
+        if self.background:  # also when off: H can switch history on later
             self._history_thread = threading.Thread(target=self._history_loop, daemon=True,
                                                     name="history")
             self._history_thread.start()
@@ -84,6 +123,10 @@ class App:
     def _history_loop(self) -> None:
         last_update = time.time()
         while not self._stop.is_set():
+            if self.no_history:  # switched off: wait to be switched on (or stopped)
+                self._wake.wait()
+                self._wake.clear()
+                continue
             auto = self.data.auto_ranges() if hasattr(self.data, "auto_ranges") else hd.RANGE_NAMES
             pending = [n for n in [self.range] + list(auto) if n not in self.data.loaded]
             if pending:
@@ -116,12 +159,24 @@ class App:
 
     def poll(self) -> None:
         """Ask for whatever is due. Never blocks when running in the background."""
-        entry = self.loader.get(("snap",), self.collector.snapshot, max_age=self.interval(),
-                                generation=self.refreshes)
+        # always the real snapshot: the pseudonymous one is derived from it, so switching
+        # anonymizing on or off needs no new query
+        entry = self.loader.get(("snap",), self._raw_collector.snapshot,
+                                max_age=self.interval(), generation=self.refreshes)
         self.snapshot_entry = entry
-        if entry.value is not None and entry.value is not self.snapshot:
-            self.snapshot = entry.value
-            self.snap_generation += 1
+        if entry.value is not None and entry.value is not self._raw_snapshot:
+            self._raw_snapshot = entry.value
+            self._derive_snapshot()
+
+    def _derive_snapshot(self) -> None:
+        raw = self._raw_snapshot
+        if raw is None:
+            self.snapshot = None
+        elif self.anonymized:
+            self.snapshot = self.anon.snapshot(copy.deepcopy(raw))
+        else:
+            self.snapshot = raw
+        self.snap_generation += 1
         if not self.no_history:
             self.history_info = self.loader.get(("info",), self.data.info, max_age=30,
                                                 generation=self.data.generation)
@@ -176,12 +231,17 @@ class App:
         self._header(canvas, ctx)
         view = self.view
         focusable = [i for i, p in enumerate(panes) if p.focusable] or [0]
+        wanted = view.extra.pop("focus_pane", None)  # e.g. a log tail just asked for
+        if wanted is not None:
+            view.focus = next((i for i, p in enumerate(panes) if p.id == wanted), view.focus)
         if view.focus not in focusable:
             view.focus = focusable[0] if view.focus >= len(panes) or view.focus < 0 else min(
                 focusable, key=lambda i: abs(i - view.focus))
         states = [view.panes.setdefault(p.id, PaneState()) for p in panes]
         shown = [visible_lines(p, s) for p, s in zip(panes, states)]
+        self._reselect(view, panes, states, shown)
         body = allocate(panes, [len(lines) for lines in shown], height - 2, view.focus)
+        self._page = max(1, body[view.focus] if 0 <= view.focus < len(body) else 10)
         row = 1
         self.hits = []
         for index, (pane, state, lines, size) in enumerate(zip(panes, states, shown, body)):
@@ -194,6 +254,10 @@ class App:
         self._footer(canvas)
         self._last = (panes, states, shown)
         self._last_view, self._width = view, width
+        if self.overlay == "settings":
+            self._settings_box(canvas)
+        if self.ascii:
+            canvas.map_cells(textmod.ascii_cell)
 
     def _header(self, canvas: Canvas, ctx: Context) -> None:
         width = canvas.width
@@ -216,7 +280,9 @@ class App:
         col = canvas.put(0, col, "│ ", DIM)
         col = canvas.put(0, col, "%s · %s" % (self.range, fmt.age(age) if age is not None
                                                else "?"), PLAIN)
-        if self.data.progress:
+        if self.history_mode != "full":
+            col = canvas.put(0, col, " · history " + self.history_mode, WARN)
+        if self.data.progress and not self.no_history:
             col = canvas.put(0, col, " · history ", DIM)
             if self.data.fraction is not None:
                 col = canvas.put(0, col, fmt.bar(self.data.fraction, 6, self.ascii), WARN)
@@ -236,12 +302,21 @@ class App:
         row = canvas.height - 1
         if self.input is not None:
             col = canvas.put(row, 0, "filter: ", HEAD)
-            col = canvas.put(row, col, "".join(self.input) + "▏", PLAIN)
-            canvas.put(row, col + 2, "Enter apply · Esc cancel", DIM)
+            text = "".join(self.input)
+            # the previous filter is selected: typing replaces it
+            col = canvas.put(row, col, text, SELECTED if self._replace and text else PLAIN)
+            col = canvas.put(row, col, "▏", PLAIN)
+            canvas.put(row, col + 1, "filters as you type · Enter keep · Esc cancel · "
+                                     "Ctrl-U clear", DIM)
             return
+        flash = self._flash
+        if flash is not None and (self.message != flash[0] or time.time() >= flash[1]):
+            if self.message == flash[0]:
+                self.message = ""
+            self._flash = None
         specific = FOOTERS.get(self.view.kind, "")
         items = ["↵ open", "esc back", "tab pane", "/ filter", "s sort", "[ ] range",
-                 "r refresh", "? help", "q quit"]
+                 "r refresh", "O settings", "? help", "q quit"]
         if specific and specific != "↵ open":
             items[3:3] = specific.split(" · ")
         must = {"? help", "q quit", "esc back"}
@@ -284,6 +359,25 @@ class App:
         if self.input is not None:
             return self._typing(key)
         self.message = ""
+        if self.confirm is not None:
+            action, self.confirm = self.confirm, None
+            if key in ("y", "Y") and action == "clear_cache":
+                self.clear_cache()
+            else:
+                self.message = "cache kept"
+            return True
+        if key in TOGGLE_KEYS:
+            self.toggle(TOGGLE_KEYS[key])
+            return True
+        if self.overlay is not None:
+            if key in (SETTINGS_KEY, "ESC", "BACKSPACE", "q", "Q", "ENTER"):
+                self.overlay = None
+            elif key in (CLEAR_CACHE_KEY, CLEAR_CACHE_KEY.lower()):
+                self.confirm = "clear_cache"
+            return True
+        if key == SETTINGS_KEY:
+            self.overlay = "settings"
+            return True
         view = self.view
         pane, state, lines = self._focused()
         if key in ("q", "Q"):
@@ -319,13 +413,22 @@ class App:
         elif key in ("TAB", "BTAB"):
             self._cycle_focus(1 if key == "TAB" else -1)
         elif key in ("UP", "DOWN", "PGUP", "PGDN", "HOME", "END", "k", "J"):
-            step = {"UP": -1, "k": -1, "DOWN": 1, "J": 1, "PGUP": -10, "PGDN": 10,
+            page = max(1, getattr(self, "_page", 11) - 1)  # a page, keeping one line
+            step = {"UP": -1, "k": -1, "DOWN": 1, "J": 1, "PGUP": -page, "PGDN": page,
                     "HOME": -10 ** 9, "END": 10 ** 9}[key]
             state.cursor = max(0, min(len(lines) - 1, state.cursor + step)) if lines else 0
+            # a log tail keeps following its end until moved away from it
+            state.follow = bool(pane is not None and pane.follow and key == "END")
+            if pane is not None and pane.more and lines and state.cursor >= len(lines) - 1 \
+                    and step > 0:
+                view.extra["jobs_limit"] = view.extra.get("jobs_limit", hd.JOB_PAGE) + hd.JOB_PAGE
+                self.message = "loading more jobs"
         elif key == "ENTER":
             self._enter(lines, state)
         elif key == "/":
             self.input = list(state.filter)
+            self._replace = True  # the old filter is selected: typing replaces it
+            self._before = state.filter
         elif key == "s" and pane is not None and pane.sorts:
             state.sort = state.sort + 1 if state.sort + 1 < len(pane.sorts) else -1
             state.cursor = 0
@@ -339,6 +442,10 @@ class App:
             else:
                 root = TAB_KINDS.index(self.stack[0].kind) if self.stack[0].kind in TAB_KINDS else 0
                 self.go_tab(TAB_KINDS[(root + (1 if key == "RIGHT" else -1)) % len(TAB_KINDS)])
+        elif key == "c" and view.kind == "timeline":
+            metric = view.extra.get("metric") or "gpu"
+            view.extra["metric"] = "cpu" if metric == "gpu" else "gpu"
+            view.panes.clear()
         elif key in ("+", "-", "=") and view.kind == "timeline":
             zoom = view.extra.get("zoom", 1)
             view.extra["zoom"] = max(1, min(256, zoom * 2 if key in ("+", "=") else zoom // 2))
@@ -351,19 +458,38 @@ class App:
             self._fetch(FETCH_KEYS[key])
         return True
 
+    _replace = False
+    _before = ""
+
     def _typing(self, key: str) -> bool:
+        """The filter applies as it is typed (rows are filtered in memory; a jobs list
+        also asks history). Esc puts the previous filter back."""
         _, state, _ = self._focused()
+        text = self.input if self.input is not None else []
         if key == "ENTER":
-            state.filter = "".join(self.input or [])
+            state.filter = "".join(text)
             state.cursor = 0
             self.input = None
-        elif key == "ESC":
+            return True
+        if key == "ESC":
+            state.filter = self._before
             self.input = None
+            return True
+        if key in ("CTRL_U",) or (key == "BACKSPACE" and self._replace):
+            del text[:]
         elif key == "BACKSPACE":
-            if self.input:
-                self.input.pop()
-        elif len(key) == 1 and key.isprintable() and len(self.input or []) < 60:
-            self.input.append(key)
+            if text:
+                text.pop()
+        elif len(key) == 1 and key.isprintable():
+            if self._replace:
+                del text[:]
+            if len(text) < 60:
+                text.append(key)
+        else:
+            return True
+        self._replace = False
+        state.filter = "".join(text)
+        state.cursor = 0
         return True
 
     def _cycle_focus(self, step: int) -> None:
@@ -407,8 +533,26 @@ class App:
         user = self.view.params.get("user") if self.view.kind in ("person", "me") else None
         name, data = self.range, self.data
         filt = hd.where(user=user) if user else None
-        self.message = "loading efficiency for %s%s" % (name, " · " + user if user else "")
-        self.loader.submit(lambda: data.load_efficiency(name, filt))
+        scope = "%s%s" % (name, " · " + user if user else "")
+        loading = "loading efficiency for " + scope
+        self.message = loading
+
+        def work() -> None:
+            try:
+                count = data.load_efficiency(name, filt)
+                done = ("efficiency loaded for %s: %s jobs read" % (scope, fmt.num(count))
+                        if count else "efficiency already loaded for " + scope)
+            except Exception as error:
+                done = "efficiency for %s: %s" % (scope, getattr(error, "message", None)
+                                                  or error)
+            if self.message == loading:  # not replaced by something newer meanwhile
+                self.flash(done)
+        self.loader.submit(work)
+
+    def flash(self, text: str, seconds: float = MESSAGE_SECONDS) -> None:
+        """A footer message that clears itself after ``seconds``."""
+        self.message = text
+        self._flash = (text, time.time() + seconds)
 
     # -- job detail: on-request text and file checks ----------------------------------
 
@@ -420,10 +564,26 @@ class App:
         paths = view.extra.get("paths")
         row = view.params.get("row")
         collector, data, anonymized = self.collector, self.data, self.anonymized
+        loader = self.loader
+
+        def is_batch() -> bool:
+            """Known to be an sbatch job: a batch step, or an sbatch submit line."""
+            for key in (("o", "detail", job_id), ("l", "steps", job_id)):
+                found = loader.peek(key)
+                got = found.value if found is not None else None
+                for att in getattr(got, "attempts", None) or [got]:
+                    if any(getattr(s, "step_id", None) == "batch"
+                           for s in getattr(att, "steps", None) or ()):
+                        return True
+            submit = loader.peek(("o", "fetch", job_id, "submit"))
+            if submit is not None and submit.value is not None:
+                lines = submit.value[1]
+                return bool(lines) and lines[0].lstrip().split(" ")[0].endswith("sbatch")
+            return False
 
         def run() -> Tuple[str, List[str], str]:
             if anonymized:
-                return Status.UNAVAILABLE, [], "hidden by --anonymize"
+                return Status.UNAVAILABLE, [], "hidden while anonymized"
             if kind in ("stdout", "stderr"):
                 raw = None
                 if paths:
@@ -447,6 +607,9 @@ class App:
                                     "differ)"] + text.split("\n"), detail
                 if status in Status.USABLE:
                     return status, [], detail or "Slurm returned an empty script"
+                if status == Status.NOT_STORED and is_batch():
+                    from ..parse import SCRIPT_NOT_STORED_BATCH
+                    detail = SCRIPT_NOT_STORED_BATCH  # never "not a batch job" for an sbatch job
                 return status, [], detail
             got = collector.submit_line(live) if live is not None else data.submit_line(job_id)
             text = got.text
@@ -461,22 +624,273 @@ class App:
             return got.status, [], detail
 
         self.loader.forget(("o", "fetch", job_id, kind))
+        view.panes.pop("output", None)  # a new text opens fresh (a tail at its end)
+        view.extra["focus_pane"] = "output"
         self.loader.get(("o", "fetch", job_id, kind), run, generation=self.refreshes)
 
-    def path_state(self, raw: Optional[str], started: Optional[float],
-                   directory: bool = False) -> Any:
+    def path_state(self, raw: Optional[str], since: Optional[float],
+                   directory: bool = False, running: bool = False,
+                   what: str = "the job ended") -> Any:
         """os.stat off the UI thread (a dead network mount must not freeze the screen)."""
         if self.anonymized:
             return None
-        entry = self.loader.get(("o", "stat", raw, started, directory),
-                                lambda: stat_path(raw, started, directory),
+        entry = self.loader.get(("o", "stat", raw, since, directory, running, what),
+                                lambda: stat_path(raw, since, directory, running, what),
                                 generation=self.refreshes)
         return entry.value
+
+    # -- settings: anonymize, colors, glyphs, history ------------------------------
+
+    def toggle(self, what: str) -> None:
+        if what == "anonymize":
+            self.set_anonymized(not self.anonymized)
+        elif what == "colors":
+            self.color = not self.color
+            self.message = "colors " + ("on" if self.color else "off")
+        elif what == "glyphs":
+            self.ascii = not self.ascii
+            self.message = "glyphs: " + ("ASCII" if self.ascii else "Unicode")
+        elif what == "history":
+            at = HISTORY_MODES.index(self.history_mode)
+            self.set_history(HISTORY_MODES[(at + 1) % len(HISTORY_MODES)])
+
+    def set_history(self, mode: str) -> None:
+        if mode not in HISTORY_MODES or mode == self.history_mode:
+            return
+        self.history_mode = mode
+        data = self.data
+        data.full_history = mode == "full"
+        if mode == "off":
+            data.pause(True)  # stops the load in progress; what it committed stays cached
+            self.message = "history off: live view only (H to switch on)"
+        else:
+            data.pause(False)
+            if mode == "recent" and getattr(data, "_loading", None) == "all" \
+                    and self.range != "all":
+                data.stop_current()  # all of history is no longer wanted in the background
+            self.message = "history: " + ("all of it in the background" if mode == "full"
+                                          else "the chosen range and shorter")
+            if not self.background:
+                data.load_in_order(self.range)
+        self.loader.invalidate()
+        self._wake.set()
+
+    def set_anonymized(self, on: bool) -> None:
+        """Switch pseudonyms on or off at once: every cached answer is dropped, open file
+        text is closed, and the breadcrumbs, filters and selections are mapped."""
+        if on == self.anonymized:
+            return
+        selected = self._selection()
+        self.anonymized = on
+        self.collector = self._anon_collector if on else self._raw_collector
+        self.data.history = (AnonHistory(self._raw_history, self.anon) if on
+                             else self._raw_history)
+        self.loader.clear()  # nothing computed in the other mode may be shown
+        self.history_info = None
+        with self.data._lock:
+            self.data.generation += 1
+        self._derive_snapshot()  # first: it makes every name on screen known
+        for view in self.stack:
+            self._remap_view(view, on)
+        if self.user:
+            self.user = (self.anon.name("user", self.user) if on
+                         else self.anon.real("user", self.user))
+        if selected is not None:
+            view, pane_id, params = selected
+            view.extra["reselect"] = (pane_id, self._map_params(params, on))
+        self._last_view = None
+        self.confirm = None
+        self.message = ("anonymize on: pseudonyms; paths, scripts and logs hidden" if on
+                        else "anonymize off")
+
+    def _map_params(self, params: Dict[str, Any], on: bool) -> Dict[str, Any]:
+        anon, out = self.anon, {}
+        for key, value in params.items():
+            if value is None:
+                pass
+            elif key in _PERSON_PARAMS and isinstance(value, str):
+                kind = _PERSON_PARAMS[key]
+                value = anon.name(kind, value) if on else anon.real(kind, value)
+            elif key in _VOCAB_PARAMS and isinstance(value, str):
+                value = anon.vocab(value) if on else anon.vocab_real(value)
+            elif key == "row":
+                value = anon.row(value) if on else anon.row_real(value)
+            elif key == "rows":
+                value = [anon.row(r) if on else anon.row_real(r) for r in value]
+            elif key == "run_type" and isinstance(value, tuple) and len(value) == 2:
+                value = (value[0], anon.run_type(value[0], value[1]) if on
+                         else anon.run_type_real(value[0], value[1]))
+            out[key] = value
+        return out
+
+    def _map_filter(self, text: str, on: bool) -> str:
+        """A typed filter: a whole name maps to its pseudonym (and back); a job id stays;
+        any other text typed against real names is dropped when anonymizing."""
+        if not text:
+            return text
+        word = text.strip()
+        anon = self.anon
+        if on:
+            for kind in ("user", "account", "node", "cluster", "reservation"):
+                if word in anon.forward[kind]:
+                    return anon.forward[kind][word]
+            if word.isdigit() or any(word in anon.backward[k] for k in anon.backward):
+                return text
+            family = hd.name_family(word)
+            if family in anon.forward["job"]:
+                return anon.forward["job"][family]
+            return ""
+        for kind in ("user", "account", "node", "cluster", "reservation"):
+            if word in anon.backward[kind]:
+                return anon.backward[kind][word]
+        return text
+
+    def _remap_view(self, view: View, on: bool) -> None:
+        for key in ("paths", "raw_workdir", "script_path", "show"):  # file text is closed
+            view.extra.pop(key, None)
+        view.panes.pop("output", None)
+        if on:
+            mapped = self._map_params(view.params, True)
+            filters = {}
+            for pane_id, state in view.panes.items():
+                new = self._map_filter(state.filter, True)
+                filters[pane_id] = (state.filter, new)
+                state.filter = new
+            view.extra["plain"] = (dict(view.params), view.title, filters)
+            view.params = mapped
+            view.title = self.anon.title(view.title) or view.title
+            return
+        plain = view.extra.pop("plain", None)
+        if plain is not None:
+            params, title, filters = plain
+            if view.kind in ("me",):
+                params = self._map_params(view.params, False)
+            view.params, view.title = params, title
+            for pane_id, state in view.panes.items():
+                old, new = filters.get(pane_id, (None, None))
+                state.filter = old if old is not None and state.filter == new \
+                    else self._map_filter(state.filter, False)
+        else:  # opened while anonymized
+            view.params = self._map_params(view.params, False)
+            view.title = self.anon.title_real(view.title) or view.title
+            for state in view.panes.values():
+                state.filter = self._map_filter(state.filter, False)
+
+    def _selection(self) -> Optional[Tuple[View, str, Dict[str, Any]]]:
+        """The focused row of the current screen, by what it opens (it survives a change
+        of names and order)."""
+        if self._last_view is not self.view:
+            return None
+        panes, states, shown = getattr(self, "_last", ([], [], []))
+        index = self.view.focus
+        if not 0 <= index < len(panes) or not shown[index]:
+            return None
+        line = shown[index][max(0, min(states[index].cursor, len(shown[index]) - 1))]
+        if line.action is None:
+            return None
+        return self.view, panes[index].id, dict(line.action.params, _kind=line.action.kind)
+
+    def _reselect(self, view: View, panes: List[Any], states: List[PaneState],
+                  shown: List[List[Any]]) -> None:
+        wanted = view.extra.get("reselect")
+        if wanted is None:
+            return
+        pane_id, params = wanted
+        for pane, state, lines in zip(panes, states, shown):
+            if pane.id != pane_id or not lines:
+                continue
+            for number, line in enumerate(lines):
+                action = line.action
+                if action is not None and dict(action.params, _kind=action.kind) == params:
+                    state.cursor = number
+                    break
+            view.extra.pop("reselect", None)
+
+    def cache_location(self) -> str:
+        if self.anonymized:
+            return "hidden while anonymized"
+        info = self.history_info.value if self.history_info is not None else None
+        if info is None:
+            return "not known yet" if not self.no_history else "not known (history is off)"
+        path = getattr(info, "cache_path", None)
+        return path or "none: history is kept in memory for this run"
+
+    def clear_cache(self) -> None:
+        """Empty the history cache (it is rebuilt from Slurm), off the UI thread."""
+        raw, data = self._raw_history, self.data
+        rebuild = getattr(raw, "rebuild", None)
+        if rebuild is None:
+            self.message = "there is no history cache to clear"
+            return
+        data.pause(True)  # a load in progress stops before the cache is emptied
+
+        def work() -> None:
+            try:
+                rebuild()
+                self.message = "history cache cleared; reloading"
+            except Exception as error:
+                self.message = "could not clear the cache: %s" % (
+                    getattr(error, "message", None) or error)
+            finally:
+                data.forget()
+                data.pause(self.no_history)
+                self.loader.clear()
+                self.history_info = None
+                self._wake.set()
+                if not self.background and not self.no_history:
+                    data.load_in_order(self.range)
+        self.message = "clearing the history cache"
+        self.loader.submit(work)
+
+    def settings_rows(self) -> List[Tuple[str, str, str]]:
+        """(key, setting, state) for every setting."""
+        return [
+            ("A", "anonymize", "on" if self.anonymized else "off"),
+            ("C", "colors", "on" if self.color else "off"),
+            ("U", "glyphs", "ASCII" if self.ascii else "Unicode"),
+            ("H", "history", {"full": "full (all of it, in the background)",
+                              "recent": "recent (the chosen range and shorter)",
+                              "off": "off (live view only)"}[self.history_mode]),
+        ]
+
+    def _settings_box(self, canvas: Canvas) -> None:
+        rows = [("Settings", HEAD)]
+        for key, name, state in self.settings_rows():
+            rows.append(("%s  %-10s %s" % (key, name, state), PLAIN))
+        rows.append(("", PLAIN))
+        where = self.cache_location()
+        room = max(10, canvas.width - 8 - 14)
+        if fmt.width(where) > room:  # the end of a long path says the most
+            where = "…" + where[-(room - 1):]
+        rows.append(("   cache      " + where, DIM))
+        rows.append(("   (moved with $SLURM_USAGE_CACHE)", DIM))
+        if self.confirm == "clear_cache":
+            rows.append(("X  clear cache? y = yes, any other key = no", WARN))
+        else:
+            rows.append(("X  clear cache (asks first)", PLAIN))
+        rows.append(("", PLAIN))
+        rows.append(("O or Esc closes", DIM))
+        inner = min(canvas.width - 4, max(fmt.width(t) for t, _ in rows) + 2)
+        height = min(canvas.height - 2, len(rows) + 2)
+        if inner < 10 or height < 4:
+            return
+        top = max(1, (canvas.height - height) // 2)
+        left = max(0, (canvas.width - inner - 2) // 2)
+        canvas.put(top, left, "┌" + "─" * inner + "┐", HEAD)
+        for number in range(height - 2):
+            row = top + 1 + number
+            text, style = rows[number] if number < len(rows) else ("", PLAIN)
+            canvas.put(row, left, "│" + " " * inner + "│", HEAD)
+            canvas.put(row, left + 2, text, style, limit=inner - 2)
+        canvas.put(top + height - 1, left, "└" + "─" * inner + "┘", HEAD)
 
     # -- mouse -------------------------------------------------------------------
 
     def click(self, x: int, y: int) -> None:
         self.last_input = time.time()
+        if self.overlay is not None:  # a click outside the box closes it
+            self.overlay = None
+            return
         if y == 0:
             for start, end, kind in self.tab_hits:
                 if start <= x < end:

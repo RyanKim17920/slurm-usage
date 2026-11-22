@@ -39,7 +39,7 @@ or tries to see more than Slurm shows.
 | `sacct --helpformat` | which fields this `sacct` supports |
 | `sacct -a -X -n -P -S now-1hours -E now -o UID`, read until the first other user | how much history is visible to you |
 | `sacctmgr -n -P show event event=cluster start=1970-01-02 format=start`, `sacctmgr -n -P show transaction "action=Add Clusters" format=time` | when accounting began, so the first load knows where to stop |
-| `sacct -a -D -X -n -P --delimiter=<random> -S <t1> -E <t2> -o <allocation fields>` | allocations, read newest first in adaptive time slices (a 1 s rest between background slices), then only new records; the last day again at most hourly |
+| `sacct -a -D -X -n -P --delimiter=<random> -S <t1> -E <t2> -o <allocation fields>` | allocations, read newest first in windows of about 30,000 rows (a `sacct` past 512 MB is stopped and the window split; background windows pause for half of slurmdbd's last answer time, at most 1 s), then only new records; the last day again at most hourly |
 | `sacct -a -D -X -n -P --delimiter=<random> -j <id,id,...> -o <allocation fields>` | re-reading jobs that had not finished, up to 400 ids per call |
 | `squeue -a -h -t all -o %A` | which unfinished records are really still running |
 

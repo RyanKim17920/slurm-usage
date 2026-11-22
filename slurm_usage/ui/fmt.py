@@ -180,6 +180,39 @@ def day(epoch: Optional[float]) -> str:
     return time.strftime("%a %b %d", time.localtime(epoch))
 
 
+def down_drain(states: dict) -> tuple:
+    """(down, draining) node counts from Health.node_states, whose keys are the base state
+    with its flags (IDLE+DRAIN, MIXED+NOT_RESPONDING). A node that does not respond counts
+    as down; a down node that is also drained counts as down only."""
+    down = drain = 0
+    for label, count in states.items():
+        words = set(str(label).upper().replace("*", "").split("+"))
+        if words & {"DOWN", "NOT_RESPONDING", "FAIL", "FAILING"} or "DOWN" in str(label).upper():
+            down += count
+        elif any("DRAIN" in word for word in words):
+            drain += count
+    return down, drain
+
+
+def plural(count: Optional[float], word: str) -> str:
+    """'1 GPU', '4 GPUs', 'n/a GPUs'."""
+    return "%s %s%s" % (num(count), word, "" if count == 1 else "s")
+
+
+_VENDORS = ("nvidia", "amd", "intel", "tesla", "geforce", "radeon", "instinct")
+
+
+def gpu_model(kind: str) -> str:
+    """'nvidia_h100_80gb_hbm3' -> 'h100': the first token with a digit, not the vendor."""
+    tokens = [t for t in kind.replace("-", "_").replace(":", "_").split("_") if t]
+    for token in tokens:
+        if token.lower() not in _VENDORS and any(c.isdigit() for c in token) \
+                and any(c.isalpha() for c in token):
+            return token
+    rest = [t for t in tokens if t.lower() not in _VENDORS]
+    return rest[0] if rest else kind
+
+
 def ratio(used: Optional[float], total: Optional[float]) -> str:
     if used is None or total is None:
         return NA

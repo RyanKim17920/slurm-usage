@@ -13,9 +13,12 @@ wrap the live collector and the history object, so every view and every output
 format sees only pseudonyms, and filters typed against pseudonyms are mapped
 back before Slurm or the cache is asked.
 
-QOS and partition names are scheduling vocabulary and are kept.
+QOS and partition names are scheduling vocabulary and are kept, unless one is
+also the name of an account or a user: then it gets that pseudonym. Job steps keep
+Slurm's own names (batch, extern, interactive) and numbers.
 """
 
+import copy
 import dataclasses
 import re
 from typing import Any, Dict, List, Optional
@@ -24,7 +27,7 @@ from ..model import Status
 from ..sanitize import clean
 from .data import name_family
 
-HIDDEN = "hidden by --anonymize"
+HIDDEN = "hidden while anonymized"
 _PREFIX = {"user": ("user-", 2), "account": ("acct-", 2), "node": ("node-", 3),
            "cluster": ("cluster-", 1), "host": ("host-", 1), "reservation": ("resv-", 2),
            "job": ("job-", 2)}
@@ -35,6 +38,8 @@ _SENSITIVE = re.compile(r"\S*[/@~]\S*")
 # TRES names such as gres/gpu are vocabulary, not paths
 _TRES_NAME = re.compile(r"(?:gres|license|fs|bb|ic)/[\w:.-]*[,.;:)]?", re.I)
 _NONE_VALUES = ("", "(none)", "(null)")
+_STEP_NAMES = ("batch", "extern", "interactive")
+_VOCAB_ROLES = ("qos", "partition")
 
 
 class Anonymizer:
@@ -59,6 +64,24 @@ class Anonymizer:
 
     def real(self, kind: str, pseudo: str) -> str:
         return self.backward[kind].get(pseudo, pseudo)
+
+    def vocab(self, value: Optional[str]) -> Optional[str]:
+        """A QOS or partition name (or a comma list of them): kept, unless it is also an
+        account's or a user's name, which it must not reveal."""
+        if not value:
+            return value
+        if "," in value:
+            return ",".join(self.vocab(part) or "" for part in value.split(","))
+        return self.forward["account"].get(value) or self.forward["user"].get(value) or value
+
+    def vocab_real(self, value: str) -> str:
+        return self.backward["account"].get(value) or self.backward["user"].get(value) or value
+
+    def step_name(self, name: Optional[str], step_id: str = "") -> Optional[str]:
+        """Slurm's own step names and numeric steps are kept; others are job names."""
+        if not name or name in _STEP_NAMES or name.isdigit() or name == step_id:
+            return name
+        return self.job_name(name)
 
     def names(self, kind: str, values: Optional[List[str]]) -> Optional[List[str]]:
         return None if values is None else [self.name(kind, v) for v in values]
@@ -92,6 +115,65 @@ class Anonymizer:
             return None
         return self.name("job", name_family(name))
 
+    def run_type(self, by: str, key: Any) -> Any:
+        """A run-type key (account, QOS, partition or job-name family) as a pseudonym."""
+        if not isinstance(key, str):
+            return key
+        if by == "account":
+            return self.name("account", key)
+        if by in _VOCAB_ROLES:
+            return self.vocab(key) or key
+        if by == "name_family":
+            return self.name("job", key) or key
+        return key
+
+    def run_type_real(self, by: str, key: Any) -> Any:
+        if not isinstance(key, str):
+            return key
+        if by == "account":
+            return self.real("account", key)
+        if by in _VOCAB_ROLES:
+            return self.vocab_real(key)
+        if by == "name_family":
+            return self.real("job", key)
+        return key
+
+    def row_real(self, row: Any) -> Any:
+        """A pseudonymous history row with the people, accounts and nodes it names put back
+        (job names stay pseudonyms: a family pseudonym cannot name one job)."""
+        if row is None or not dataclasses.is_dataclass(row):
+            return row
+        nodes = row.nodes
+        if nodes:
+            nodes = ",".join(self.real("node", n) for n in nodes.split(","))
+        return dataclasses.replace(row, user=self.real("user", row.user) if row.user else row.user,
+                                   account=(self.real("account", row.account) if row.account
+                                            else row.account),
+                                   qos=self.vocab_real(row.qos) if row.qos else row.qos,
+                                   partition=(self.vocab_real(row.partition) if row.partition
+                                              else row.partition), nodes=nodes)
+
+    def title(self, text: Optional[str]) -> Optional[str]:
+        """A breadcrumb title: free text scrubbed, and known job-name families replaced."""
+        text = self.scrub(text)
+        families = [(real, pseudo) for real, pseudo in self.forward["job"].items() if real.strip()]
+        if text and families:
+            families.sort(key=lambda p: -len(p[0]))
+            lookup = dict(families)
+            pattern = re.compile(r"(?<![\w.-])(?:%s)(?![\w.-])" % "|".join(
+                re.escape(r) for r, _ in families))
+            text = pattern.sub(lambda m: lookup[m.group(0)], text)
+        return text
+
+    def title_real(self, text: Optional[str]) -> Optional[str]:
+        """The reverse of title() for the pseudonyms it put in."""
+        if not text:
+            return text
+        pairs = {pseudo: real for kind in self.backward if kind != "job"
+                 for pseudo, real in self.backward[kind].items()}
+        return re.sub(r"(?<![\w.-])(?:user|acct|node|cluster|host|resv)-\d+(?![\w.-])",
+                      lambda m: pairs.get(m.group(0), m.group(0)), text)
+
     # -- live ------------------------------------------------------------------
 
     def snapshot(self, snap: Any) -> Any:
@@ -108,16 +190,22 @@ class Anonymizer:
             role.lineage = self.names("account", role.lineage) or []
             for limit in role.limits:
                 self._limit(limit)
+        for job in snap.jobs or ():  # every account and user known before QOS/partitions
+            self.name("user", job.user)
+            self.name("account", job.account)
         for qos in snap.qos or ():
+            qos.name = self.vocab(qos.name)
             for limit in qos.limits:
                 self._limit(limit)
         for limit in snap.limits or ():
             self._limit(limit)
         for node in snap.nodes or ():
             self._node(node)
+            node.partitions = [self.vocab(p) for p in node.partitions or ()]
         for node in snap.health.problem_nodes:
             self._node(node)
         for part in snap.partitions or ():
+            part.name = self.vocab(part.name)
             part.nodes = self.names("node", part.nodes) or []
             part.allow_accounts = self.names("account", part.allow_accounts)
             part.deny_accounts = self.names("account", part.deny_accounts)
@@ -125,6 +213,8 @@ class Anonymizer:
         for job in snap.jobs or ():
             job.user = self.name("user", job.user)
             job.account = self.name("account", job.account)
+            job.qos = self.vocab(job.qos)
+            job.partition = self.vocab(job.partition)
             job.name = self.job_name(job.name)
             job.raw_name = job.raw_workdir = job.workdir = job.command = None
             job.comment = job.wckey = None
@@ -182,8 +272,9 @@ class Anonymizer:
         if nodes:
             names = expand_hostlist(nodes, 4096) or [nodes]
             nodes = ",".join(self.name("node", n) for n in names[:64])
-        return dataclasses.replace(row, user=self.name("user", row.user),
-                                   account=self.name("account", row.account),
+        user, account = self.name("user", row.user), self.name("account", row.account)
+        return dataclasses.replace(row, user=user, account=account,
+                                   qos=self.vocab(row.qos), partition=self.vocab(row.partition),
                                    name=self.job_name(row.name) or "", nodes=nodes)
 
 
@@ -195,6 +286,8 @@ def _translate(anon: Anonymizer, where: Any) -> Any:
         kind = _ROLE_KIND.get(role)
         if kind:
             changes[role] = frozenset(anon.real(kind, v) for v in values)
+        elif role in _VOCAB_ROLES:
+            changes[role] = frozenset(anon.vocab_real(v) for v in values)
     return where.replace(**changes) if changes else where
 
 
@@ -206,8 +299,15 @@ class AnonHistory:
 
     def info(self) -> Any:
         info = self._history.info()
+        # the path is hidden, but whether there is a cache file is not: it decides how much
+        # history loads in the background
+        persistent = getattr(info, "persistent", None)
+        if persistent is None:
+            persistent = bool(info.cache_path)
         info = dataclasses.replace(info, cluster=self._anon.name("cluster", info.cluster),
                                    cache_path=None)
+        if hasattr(info, "persistent"):
+            info.persistent = persistent
         inv = dataclasses.replace(info.invoker)
         inv.user = self._anon.name("user", inv.user)
         inv.default_account = self._anon.name("account", inv.default_account)
@@ -223,18 +323,31 @@ class AnonHistory:
     def query(self, window: Any = None, where: Any = None, **kwargs: Any) -> Any:
         report = self._history.query(window, _translate(self._anon, where), **kwargs)
         anon = self._anon
+        for spec, members in report.groups.items():  # accounts and users first
+            kinds = [_ROLE_KIND.get(role) for role in spec]
+            for key in members:
+                for k, v in zip(kinds, key):
+                    if k:
+                        anon.name(k, v)
         groups = {}
         for spec, members in report.groups.items():
-            kinds = [_ROLE_KIND.get(role) for role in spec]
-            groups[spec] = {tuple(anon.name(k, v) if k else v for k, v in zip(kinds, key)): stats
+            kinds = [_ROLE_KIND.get(role) or ("vocab" if role in _VOCAB_ROLES else None)
+                     for role in spec]
+            groups[spec] = {tuple(anon.vocab(v) if k == "vocab" else anon.name(k, v) if k else v
+                                  for k, v in zip(kinds, key)): stats
                             for key, stats in members.items()}
         report.groups = groups
         kind = _ROLE_KIND.get(report.series_by or "")
         if kind:
             report.keyed_values = {anon.name(kind, k): v for k, v in report.keyed_values.items()}
-        lanes_kind = _ROLE_KIND.get(kwargs.get("lanes_by") or "")
+        elif report.series_by in _VOCAB_ROLES:
+            report.keyed_values = {anon.vocab(k): v for k, v in report.keyed_values.items()}
+        lanes_by = kwargs.get("lanes_by") or ""
+        lanes_kind = _ROLE_KIND.get(lanes_by)
         if lanes_kind:
             report.lanes = [type(l)(anon.name(lanes_kind, l.key), l.intervals) for l in report.lanes]
+        elif lanes_by in _VOCAB_ROLES:
+            report.lanes = [type(l)(anon.vocab(l.key), l.intervals) for l in report.lanes]
         report.where = where if where is not None else report.where
         report.notes = [type(n)(n.code, anon.scrub(n.message)) for n in report.notes]
         return report
@@ -243,8 +356,22 @@ class AnonHistory:
         run_type = kwargs.get("run_type")
         if run_type is not None:
             kwargs["run_type"] = (run_type[0], self._real_type(run_type[0], run_type[1]))
+        match = (kwargs.pop("match", None) or "").strip()
+        if match:
+            # Searching real names would reveal them: only a job id, or a whole pseudonym
+            # (mapped back), goes to history; anything else matches the pseudonyms shown.
+            real = self._anon.real("user", match)
+            if match.isdigit():
+                kwargs["match"] = match
+            elif real != match:
+                kwargs["match"] = real
         page = self._history.jobs(window, _translate(self._anon, where), *args, **kwargs)
         page.rows = [self._anon.row(r) for r in page.rows]
+        if match and "match" not in kwargs:
+            needle = match.lower()
+            page.rows = [r for r in page.rows if needle in r.display_id.lower()
+                         or needle in (r.name or "").lower() or needle in (r.user or "").lower()]
+            page.total = len(page.rows)
         return page
 
     def attempts(self, job_id: Any) -> List[Any]:
@@ -258,7 +385,7 @@ class AnonHistory:
             att.reason = self._anon.scrub(att.reason)
             for step in att.steps:
                 step.nodes = self._anon.names("node", step.nodes) or []
-                step.name = self._anon.job_name(step.name)
+                step.name = self._anon.step_name(step.name, step.step_id)
         found.message = self._anon.scrub(found.message) or ""
         return found
 
@@ -273,6 +400,9 @@ class AnonHistory:
 
     def capacity(self) -> Any:
         return self._history.capacity()
+
+    def rebuild(self) -> None:
+        self._history.rebuild()
 
     def build_rollup(self, *args: Any, **kwargs: Any) -> Any:
         return self._history.build_rollup(*args, **kwargs)
@@ -291,18 +421,10 @@ class AnonHistory:
         return found
 
     def _pseudo_type(self, by: str, key: str) -> str:
-        if by == "account":
-            return self._anon.name("account", key)
-        if by == "name_family":
-            return self._anon.name("job", key) or key
-        return key
+        return self._anon.run_type(by, key)
 
     def _real_type(self, by: str, key: str) -> str:
-        if by == "account":
-            return self._anon.real("account", key)
-        if by == "name_family":
-            return self._anon.real("job", key)
-        return key
+        return self._anon.run_type_real(by, key)
 
     def run_types(self, window: Any = None, where: Any = None, by: str = "gpu_count",
                   **kwargs: Any) -> Any:
@@ -343,7 +465,8 @@ class AnonCollector:
         self._collector, self._anon = collector, anon
 
     def snapshot(self) -> Any:
-        return self._anon.snapshot(self._collector.snapshot())
+        # a copy: the collector's own snapshot stays real (the app can switch back)
+        return self._anon.snapshot(copy.deepcopy(self._collector.snapshot()))
 
     def refresh(self) -> None:
         self._collector.refresh()
@@ -352,6 +475,7 @@ class AnonCollector:
         report = self._collector.steps(job)
         for step in report.steps:
             step.nodes = self._anon.names("node", step.nodes) or []
+            step.name = self._anon.step_name(step.name, step.step_id)
         report.detail = self._anon.scrub(report.detail) or ""
         return report
 

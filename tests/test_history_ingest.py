@@ -56,16 +56,65 @@ class CacheTest(unittest.TestCase):
 
     def test_default_location_honours_xdg(self):
         old = os.environ.get("XDG_CACHE_HOME")
+        old_type = store_module.filesystem_type
         os.environ["XDG_CACHE_HOME"] = "/somewhere/cache"
         try:
+            store_module.filesystem_type = lambda path: "nfs"  # even on a network home
             self.assertEqual(store_module.default_cache_dir(), "/somewhere/cache/slurm-usage")
+            store_module.filesystem_type = lambda path: "ext4"
             os.environ["XDG_CACHE_HOME"] = "relative"
             self.assertTrue(store_module.default_cache_dir().endswith(".cache/slurm-usage"))
         finally:
+            store_module.filesystem_type = old_type
             if old is None:
                 del os.environ["XDG_CACHE_HOME"]
             else:
                 os.environ["XDG_CACHE_HOME"] = old
+
+    def test_network_home_moves_the_default_to_private_local_disk(self):
+        old = os.environ.pop("XDG_CACHE_HOME", None)
+        saved = store_module.filesystem_type, store_module.LOCAL_BASE, store_module.BASE_OWNERS
+        try:
+            base = temp_dir(self)
+            store_module.filesystem_type = lambda path: (
+                "ext4" if path.startswith(base) else "virtiofs")
+            store_module.LOCAL_BASE = base
+            os.chmod(base, 0o1777)  # world-writable and sticky, like /var/tmp
+            # a base owned by anyone but root is never used
+            self.assertTrue(store_module.default_cache_dir().endswith(".cache/slurm-usage"))
+            store_module.BASE_OWNERS = (os.geteuid(),)  # stands in for root here
+            chosen = store_module.default_cache_dir()
+            self.assertEqual(chosen, os.path.join(base, "slurm-usage-%d" % os.geteuid()))
+            self.assertEqual(stat.S_IMODE(os.lstat(chosen).st_mode), 0o700)
+            # world-writable without the sticky bit: others could rename it away
+            os.chmod(base, 0o777)
+            self.assertTrue(store_module.default_cache_dir().endswith(".cache/slurm-usage"))
+            # a directory someone else could have made there is not used
+            os.chmod(base, 0o1777)
+            os.chmod(chosen, 0o755)
+            self.assertTrue(store_module.default_cache_dir().endswith(".cache/slurm-usage"))
+            # nor a local base on a network filesystem
+            os.chmod(chosen, 0o700)
+            store_module.filesystem_type = lambda path: "nfs"
+            self.assertTrue(store_module.default_cache_dir().endswith(".cache/slurm-usage"))
+        finally:
+            store_module.filesystem_type, store_module.LOCAL_BASE, store_module.BASE_OWNERS = saved
+            if old is not None:
+                os.environ["XDG_CACHE_HOME"] = old
+
+    def test_filesystem_type_from_mountinfo(self):
+        mountinfo = os.path.join(temp_dir(self), "mountinfo")
+        with open(mountinfo, "w") as handle:
+            handle.write("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n"
+                         "2 1 0:40 / /home rw shared:1 - nfs4 server:/home rw\n"
+                         "3 2 0:41 / /home/a\\040b rw - fuse.sshfs host: rw\n")
+        kind = store_module.filesystem_type
+        self.assertEqual(kind("/home/alice/.cache", mountinfo), "nfs4")
+        self.assertEqual(kind("/homework", mountinfo), "ext4")
+        self.assertEqual(kind("/home/a b/x", mountinfo), "fuse.sshfs")
+        self.assertTrue(store_module.is_network("fuse.sshfs"))
+        self.assertFalse(store_module.is_network("ext4"))
+        self.assertIsNone(kind("/", os.path.join(temp_dir(self), "missing")))
 
     def test_symlinked_cache_falls_back_to_memory(self):
         directory = temp_dir(self)
@@ -323,6 +372,19 @@ class EnvironmentTest(unittest.TestCase):
         self.assertIsNotNone(h._store.get_meta("dirty"))
         h.close()
 
+    def test_store_failure_does_not_mark_coverage(self):
+        fake = FakeSlurm([job(1, start=T0, end=T0 + H)], live=[])
+        h = make_history(fake)
+        h._open()
+
+        def broken(records, generation):
+            raise HistoryError(Status.ERROR, "history cache: disk full")
+        h._store.put = broken
+        with self.assertRaises(HistoryError):
+            h.refresh()
+        covered = h.info().covered_from  # empty pieces before the failure may count
+        self.assertTrue(covered is None or covered > T0 + H)
+
     def test_admin_sees_all(self):
         fake = FakeSlurm([], admin="Administrator")
         self.assertEqual(make_history(fake).info().visibility, "all")
@@ -339,6 +401,148 @@ class EnvironmentTest(unittest.TestCase):
             if "-j" not in call:
                 self.assertNotIn("SubmitLine", joined)
                 self.assertNotIn("WorkDir", joined)
+
+
+class PieceTest(unittest.TestCase):
+    """How history is cut into sacct calls: few, bounded in sacct's memory, paced."""
+
+    def setUp(self):
+        from slurm_usage.history import ingest
+        self.ingest = ingest
+
+    def windows(self, fake):
+        return [c for c in fake.sacct_calls("-X", "-S") if c[-1] != "UID"]
+
+    def test_a_day_is_one_call(self):
+        now = T0 + 30 * DAY
+        fake = FakeSlurm([job(i, start=now - i * 600, end=now - i * 600 + 60)
+                          for i in range(1, 100)], now=now, live=[])
+        h = make_history(fake)
+        h.refresh(Window(now - DAY, now))
+        self.assertEqual(len(self.windows(fake)), 1)
+
+    def test_sparse_history_takes_few_calls_and_loses_nothing(self):
+        now = T0 + 400 * DAY
+        jobs = [job(i, start=now - i * 7 * H, end=now - i * 7 * H + H) for i in range(1, 1300)]
+        fake = FakeSlurm(jobs, now=now, live=[])
+        h = make_history(fake)
+        h.refresh(Window(now - DAY, now))
+        h.refresh(update=False)  # everything else, in the background
+        self.assertEqual(h.query().total.attempts, len(jobs))
+        # a call per day would be 400 (plus an empty year looked through: no known origin)
+        self.assertLess(len(self.windows(fake)), 20)
+
+    def test_a_piece_that_grows_too_large_is_stopped_and_split(self):
+        import threading
+        from slurm_usage.history import commands
+        now = T0 + 60 * DAY
+        # quiet, then a burst of short array tasks five days back
+        jobs = [job(i, start=now - i * DAY, end=now - i * DAY + H) for i in range(1, 50)]
+        jobs += [job(1000 + i, start=now - 9 * DAY + i * 1200, end=now - 9 * DAY + i * 1200 + 30)
+                 for i in range(300)]
+        fake = FakeSlurm(jobs, now=now, live=[])
+        original, stopped = fake.stream, []
+
+        class Loading:
+            """Holds its rows back as sacct does while it loads, growing per row."""
+
+            def __init__(self, stream, rows):
+                self.stream, self.memory = stream, rows * 1000
+                self.argv, self.closed = stream._final.argv, threading.Event()
+
+            def __iter__(self):
+                if self.memory > 100 * 1000:  # big enough to be stopped: wait for that
+                    self.closed.wait(5)
+                    if self.closed.is_set():
+                        return
+                for line in self.stream:
+                    yield line
+
+            @property
+            def result(self):
+                return self.stream.result
+
+            def close(self):
+                if not self.closed.is_set() and self.memory > 100 * 1000:
+                    stopped.append(self.argv)
+                self.closed.set()
+                self.stream.close()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.close()
+
+        def stream(argv, timeout=None, max_bytes=None):
+            found = original(argv, timeout, max_bytes)
+            return Loading(found, len(found._lines)) if "-X" in argv else found
+        fake.stream = stream
+        saved = (self.ingest.CHILD_MEMORY, self.ingest.ROW_BYTES, self.ingest.TARGET_ROWS,
+                 commands.child_memory)
+        self.ingest.CHILD_MEMORY, self.ingest.ROW_BYTES, self.ingest.TARGET_ROWS = \
+            100 * 1000, 1000, 40
+        commands.child_memory = lambda s: getattr(s, "memory", None)
+        try:
+            h = make_history(fake)
+            h.refresh(Window(now - DAY, now))
+            h.refresh(update=False)
+        finally:
+            (self.ingest.CHILD_MEMORY, self.ingest.ROW_BYTES, self.ingest.TARGET_ROWS,
+             commands.child_memory) = saved
+        self.assertTrue(stopped)  # the burst was stopped at least once ...
+        self.assertLess(len(stopped), 6)  # ... and the next tries were sized by it
+        self.assertEqual(h.query().total.attempts, len(jobs))  # and nothing was lost
+        self.assertEqual(h.info().covered_from, 0)
+
+    def test_stream_lines_stops_a_command_past_its_memory(self):
+        from slurm_usage.history import commands
+        fake = FakeSlurm([job(1, start=T0, end=T0 + H)], live=[])
+        saved = commands.child_memory
+        commands.child_memory = lambda s: 10 ** 12
+        try:
+            stream = fake.stream
+
+            def slow(argv, timeout=None, max_bytes=None):
+                found = stream(argv, timeout, max_bytes)
+                found._on_line = lambda at: __import__("time").sleep(0.3)
+                return found
+            fake.stream = slow
+            lines = commands.stream_lines(fake, ["sacct", "-a", "-X", "-n", "-P", "-o", "JobIDRaw"],
+                                          lambda: False, 10, memory_limit=10 ** 9)
+            with self.assertRaises(commands.TooLarge):
+                list(lines)
+            fake.stream = stream
+            # without a limit nothing is watched
+            self.assertTrue(list(commands.stream_lines(
+                fake, ["sacct", "-a", "-X", "-n", "-P", "-o", "JobIDRaw"], lambda: False, 10)))
+        finally:
+            commands.child_memory = saved
+
+    def test_pause_follows_what_the_last_piece_cost(self):
+        ingest = self.ingest
+        fake = FakeSlurm([], live=[])
+        h = make_history(fake)
+        h._open()
+        sleeps = []
+        old = ingest.PIECE_PAUSE, ingest.time.sleep
+        ingest.PIECE_PAUSE, ingest.time.sleep = 5.0, sleeps.append
+        try:
+            clock = ingest.time.monotonic
+            h._ingest._last_wait, h._ingest._answered = 2.0, clock()
+            h._ingest._pause()
+            self.assertAlmostEqual(sum(sleeps), ingest.PACE * 2.0, places=1)
+            sleeps.clear()
+            h._ingest._last_wait, h._ingest._answered = 100.0, clock()
+            h._ingest._pause()
+            self.assertAlmostEqual(sum(sleeps), 5.0, places=1)  # never longer than the cap
+            sleeps.clear()
+            # what sacct spent printing since slurmdbd answered already counts as rest
+            h._ingest._last_wait, h._ingest._answered = 2.0, clock() - 10
+            h._ingest._pause()
+            self.assertEqual(sleeps, [])
+        finally:
+            ingest.PIECE_PAUSE, ingest.time.sleep = old
 
 
 if __name__ == "__main__":

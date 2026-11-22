@@ -203,7 +203,9 @@ def health(nodes: Optional[List[Node]], jobs: Optional[List[Job]]) -> Health:
     if not nodes:
         return result
     for node in nodes:
-        label = node.state or "unknown"
+        # the base state with its flags (IDLE+DRAIN, MIXED+NOT_RESPONDING): Slurm keeps
+        # DRAIN, DOWN-ish and maintenance flags apart from the base word
+        label = "+".join([node.state or "unknown"] + list(node.state_flags or ()))
         result.node_states[label] = result.node_states.get(label, 0) + 1
     present = [node for node in nodes if not is_future(node)]
     result.problem_nodes = [n for n in present if n.availability == Availability.UNAVAILABLE]

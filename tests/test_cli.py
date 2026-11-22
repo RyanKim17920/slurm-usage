@@ -17,7 +17,7 @@ def fake_build(anonymize=False):
         history, fake = uf.real_history(days=20)
         collector = uf.FakeCollector(uf.make_snapshot(fake.now))
         data = hd.HistoryData(history, clock=lambda: fake.now)
-        if args.no_history:
+        if args.history == "off":
             data = hd.HistoryData(hd.NoHistory())
         anon = None
         if args.anonymize:
@@ -44,9 +44,9 @@ class CliTest(unittest.TestCase):
 
     def test_args(self):
         args = cli.parse_args(["--range", "month", "--user", "u", "--account", "a",
-                               "--no-history", "--anonymize"])
-        self.assertEqual((args.range, args.user, args.account, args.no_history, args.anonymize),
-                         ("month", "u", "a", True, True))
+                               "--history", "off", "--anonymize"])
+        self.assertEqual((args.range, args.user, args.account, args.history, args.anonymize),
+                         ("month", "u", "a", "off", True))
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             cli.parse_args(["--range", "decade"])
 
@@ -91,8 +91,9 @@ class CliTest(unittest.TestCase):
             self.assertIn("Range", out)
             self.assertNotIn("\u2581", out)
 
-    def test_ascii_flag_and_json_is_ascii(self):
-        code, out = run(["--once", "--ascii"])
+    def test_legacy_terminal_gets_ascii_and_json_is_ascii(self):
+        with mock.patch.dict("os.environ", {"TERM": "vt100"}):
+            code, out = run(["--once"])
         self.assertTrue(all(ord(c) < 128 for c in out), out)
         code, out = run(["--json"])
         self.assertTrue(all(ord(c) < 128 for c in out))
@@ -117,7 +118,7 @@ class CliTest(unittest.TestCase):
         self.assertIn("≥2 jobs", person_line)
 
     def test_no_history(self):
-        code, out = run(["--json", "--no-history"])
+        code, out = run(["--json", "--history", "off"])
         data = json.loads(out)
         self.assertEqual(data["history"]["status"], "off")
         self.assertNotIn("trend", data)

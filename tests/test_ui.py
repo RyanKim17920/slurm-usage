@@ -331,7 +331,7 @@ class AnonymizeTest(unittest.TestCase):
         for real in uf.REAL_IDENTIFIERS:
             self.assertNotIn(real, blob, real)
         self.assertNotIn("/home/", blob)
-        self.assertIn("hidden by --anonymize", "\n".join(screens))
+        self.assertIn("hidden while anonymized", "\n".join(screens))
 
     def test_stable_pseudonyms_and_reverse_filters(self):
         anon = Anonymizer()
@@ -476,9 +476,9 @@ class BackgroundLoadTest(unittest.TestCase):
         data, windows = self.loaded(history, full_history=False)
         self.assertEqual(data.loaded, {"day", "week", "month", "year"})
         self.assertNotIn(None, windows)
-        self.assertIn("--no-full-history", data.limit_note())
-        args = __import__("slurm_usage.cli", fromlist=["x"]).parse_args(["--no-full-history"])
-        self.assertTrue(args.no_full_history)
+        self.assertIn("recent history only", data.limit_note())
+        args = __import__("slurm_usage.cli", fromlist=["x"]).parse_args(["--history", "recent"])
+        self.assertEqual(args.history, "recent")
 
     def test_memory_only_history_stops_at_a_month_and_says_so(self):
         history = uf.FakeHistory()
@@ -549,8 +549,8 @@ class PartsTest(unittest.TestCase):
             path = os.path.join(folder, "out.log")
             with open(path, "w") as handle:
                 handle.write("x")
-            started = time.time() - 100
-            self.assertEqual(check(path, started).note, "exists · changed since job ran")
+            started = time.time() - 1000
+            self.assertEqual(check(path, started).note, "exists · changed after the job ended")
             self.assertFalse(check(path, time.time() + 100).changed)
             self.assertFalse(check(path + ".gone", started).exists)
             self.assertIn("not a regular file", check(folder, started).note)

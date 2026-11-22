@@ -20,12 +20,20 @@ def _round(value: Optional[float], digits: int = 1) -> Optional[float]:
     return None if value is None else round(value, digits)
 
 
+MIN_COVER = 0.05  # as screens.MIN_COVER: below it a figure describes too little
+
+
 def _eff_text(eff: Any) -> str:
+    """'93%·62%': the value with the coverage it describes, always both; '?' when
+    nothing or too little (under 5%) of the allocation was measured."""
     if not eff:
         return fmt.NA
+    cover = eff["coverage"]
     if eff["value"] is None:
-        return fmt.NOT_YET if eff["coverage"] == 0 else fmt.NOT_APPLICABLE
-    return fmt.pct(eff["value"])
+        return fmt.NOT_YET if cover == 0 else fmt.NOT_APPLICABLE
+    if cover is not None and cover < MIN_COVER:
+        return fmt.NOT_YET
+    return fmt.pct(eff["value"]) + ("·" + fmt.pct(cover) if cover is not None else "")
 
 
 def _eff(eff: Any) -> Optional[Dict[str, Optional[float]]]:
@@ -149,7 +157,8 @@ def collect(snap: Any, data: Optional[hd.HistoryData], range_name: str,
                          cpu_hours_allocated=_round(item.amounts.cpu_hours),
                          gpu_share=_round(item.share, 4),
                          gpu_efficiency=_eff(item.amounts.efficiency("gpu")),
-                         complete=summary.complete)
+                         complete=summary.complete, source="hourly summary",
+                         as_of=summary.end)
     elif history_ok:
         report, error = _safe(lambda: data.report(range_name, None, group_by=(("account",),),
                                                   efficiency=True))
@@ -225,8 +234,7 @@ def render(summary: Dict[str, Any], width: int = 100) -> str:
                 label.upper()[:3], *(fmt.num(r[k]) for k in ("total", "alloc", "completing", "free",
                                                               "unavailable", "reserved"))))
         states = live["node_states"]
-        down = sum(c for s, c in states.items() if "DOWN" in s.upper())
-        drain = sum(c for s, c in states.items() if "DRAIN" in s.upper())
+        down, drain = fmt.down_drain(states)
         block = live["largest_free_gpu_block"]
         add("Nodes %s (%s schedulable)  %d down  %d drain  %d completing jobs  stranded GPUs %s"
             "  largest free block %s" % (fmt.num(live["nodes"]), fmt.num(live["nodes_schedulable"]),
@@ -242,13 +250,13 @@ def render(summary: Dict[str, Any], width: int = 100) -> str:
     trends = summary.get("trend")
     if trends is not None:
         add("")
-        add("%-6s %12s %6s %12s %6s %9s %9s %7s  %s" % ("Range", "GPU-h alloc", "util",
-                                                        "CPU-h alloc", "util", "GPU util*",
-                                                        "CPU eff", "ΔGPU", "trend"))
+        add("%-6s %12s %6s %12s %6s %10s %10s %7s  %s" % ("Range", "GPU-h alloc", "util",
+                                                          "CPU-h alloc", "util", "GPU util*",
+                                                          "CPU eff", "ΔGPU", "trend"))
         for t in trends:
             mark = "" if t["complete"] else "≥"
             ge, ce = t["gpu_util_peak"], t["cpu_efficiency"]
-            add("%-6s %12s %6s %12s %6s %9s %9s %7s  %s" % (
+            add("%-6s %12s %6s %12s %6s %10s %10s %7s  %s" % (
                 t["range"], mark + fmt.hours(t["gpu_hours_allocated"]),
                 _marked(mark, fmt.pct(t["gpu_utilization_of_live_capacity"])),
                 mark + fmt.hours(t["cpu_hours_allocated"]),
@@ -258,7 +266,8 @@ def render(summary: Dict[str, Any], width: int = 100) -> str:
                 if t["previous_complete"] else fmt.NOT_YET,
                 fmt.sparkline(t["series"], 16).strip()))
         add("util = allocated hours ÷ (live capacity × window); ≥ = window only partly loaded;"
-            " ? = not loaded or measured yet; GPU util* = peak sampled per-GPU utilization")
+            " ? = not loaded, or measured over under 5%; GPU util* = peak sampled per-GPU"
+            " utilization·the share of allocated hours measured")
         for error in summary.get("trend_errors", ()):
             add("%s: %s %s" % (error["range"], fmt.placeholder(error["status"]), error["message"]))
     else:
@@ -266,18 +275,24 @@ def render(summary: Dict[str, Any], width: int = 100) -> str:
     accounts = summary.get("accounts") or []
     if accounts:
         add("")
-        add("%-20s %5s %5s %5s %6s %9s %7s %8s  %s" % ("Account", "users", "run", "pend", "GPUs",
-                                                      "GPU-h", "share", "GPU utl*", "visible"))
+        add("%-20s %7s %5s %5s %6s %9s %7s %10s  %s" % ("Account", "members", "run", "pend",
+                                                        "GPUs", "GPU-h", "share", "GPU util*",
+                                                        "visible"))
         accounts = sorted(accounts, key=lambda a: -(a.get("gpu_hours_allocated") or 0))
         for a in accounts:
             eff = a.get("gpu_efficiency")
-            add("%-20s %5s %5s %5s %6s %9s %7s %8s  %s" % (
+            share = a.get("gpu_share")
+            add("%-20s %7s %5s %5s %6s %9s %7s %10s  %s" % (
                 fmt.fit(a["account"], 20).rstrip(), a["users"], a.get("running", 0),
                 a.get("pending", 0), fmt.num(a.get("gpus_now", 0)),
                 ("" if a.get("complete", True) else "≥") + fmt.hours(a.get("gpu_hours_allocated", 0)),
-                fmt.pct(a.get("gpu_share", 0), 1),
+                fmt.pct(share, 1) if share else fmt.NOT_APPLICABLE,
                 _eff_text(eff) if eff else fmt.NOT_APPLICABLE,
                 a.get("visibility", "")))
+        source = next((a for a in accounts if a.get("source")), None)
+        if source is not None:
+            add("accounts: from the hourly summary, to %s; members = users with an association "
+                "or usage" % fmt.when(source.get("as_of")))
     person = summary.get("person")
     if person:
         add("")
@@ -288,9 +303,12 @@ def render(summary: Dict[str, Any], width: int = 100) -> str:
                 t["range"], mark + fmt.hours(t["gpu_hours_allocated"]),
                 mark + fmt.hours(t["cpu_hours_allocated"]), mark + str(t["jobs"])))
         for kind in (person.get("run_types") or {}).get("gpu_count", ()):
-            add("  %-12s %5d attempts %5d jobs %8s GPU-h  fail %s" % (
+            util = {"value": kind["gpu_util_peak"], "coverage": kind["gpu_util_coverage"]}
+            add("  %-12s %5d attempts %5d jobs %8s GPU-h  GPU util* %s  fail %s" % (
                 kind["type"], kind["attempts"], kind["jobs"], fmt.hours(kind["gpu_hours_allocated"]),
-                fmt.pct(kind["failure_rate"])))
+                _eff_text(util), fmt.pct(kind["failure_rate"])))
+        if person.get("run_types"):
+            add("  fail = failed, node_fail or timeout among attempts that ended")
         for event in person.get("events", ())[:10]:
             add("  %s  %s" % (fmt.when(event["at"]), event["text"]))
     for warning in summary.get("warnings", ()):
@@ -321,6 +339,19 @@ def to_ascii(text: str) -> str:
     """The same text with ASCII glyphs; anything else left becomes "?"."""
     out = "".join(_ASCII.get(char, char) for char in text)
     return out.encode("ascii", "replace").decode("ascii")
+
+
+_ONE_CELL = {"…": ".", "±": "+", "→": ">", "←": "<", "≥": ">", "≤": "<", "▼": "v", "▲": "^",
+             "┌": "+", "┐": "+", "└": "+", "┘": "+", "├": "+", "┤": "+", "┊": ":", "▏": "|",
+             "↵": "<", "▌": "|", "↑": "^", "↓": "v", "‹": "<", "»": ">", "«": "<"}
+
+
+def ascii_cell(char: str) -> str:
+    """One screen cell in ASCII: the same width, whatever the glyph."""
+    if not char or ord(char[0]) < 128:
+        return char if char else " "  # "" is the tail of a double-width character
+    found = _ONE_CELL.get(char) or _ASCII.get(char, "?")
+    return found if len(found) == 1 else found[0]
 
 
 def can_encode(encoding: Optional[str]) -> bool:

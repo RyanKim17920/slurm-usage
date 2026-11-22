@@ -125,10 +125,18 @@ def make_row(row: Row, roles: Any, info: Optional[Info], nodes: str, outcome: st
         cpu_efficiency=cpu, mem_efficiency=rss, gpu_peak_utilization=gpu, first_start=begun)
 
 
+def _matches(part: Any, needle: str) -> bool:
+    """A job id, name or user containing ``needle`` (already lower case)."""
+    row = part.row
+    return (needle in str(row[1]) or needle in (row[18] or "").lower()
+            or needle in (part.roles.user or "").lower())
+
+
 def list_jobs(store: Any, as_of: int, window: Optional[Window] = None,
               where: Optional[Filter] = None, by: str = "job", sort: str = "gpu",
               descending: bool = True, limit: int = 200, offset: int = 0,
-              cancel: Any = None, run_type: Optional[Tuple[str, str]] = None) -> JobPage:
+              cancel: Any = None, run_type: Optional[Tuple[str, str]] = None,
+              match: Optional[str] = None) -> JobPage:
     """Jobs (or attempts) with usage in the window. ``nodes`` filters count only their share.
 
     run_type=(by, key) keeps only attempts of one types.run_types() row.
@@ -142,6 +150,7 @@ def list_jobs(store: Any, as_of: int, window: Optional[Window] = None,
         raise ValueError("by is job or attempt")
     window, cancelled = window or Window(), canceller(cancel)
     page = JobPage()
+    needle = (match or "").strip().lower()
 
     with store.lock:
         nodesets = store.nodesets()
@@ -153,7 +162,7 @@ def list_jobs(store: Any, as_of: int, window: Optional[Window] = None,
         def entries() -> Iterator[_Entry]:
             merged = {}  # only jobs with several attempts are held
             rows = store.scan(span.low, span.high, chosen.dim_ids, usage=True, ordered=False,
-                              extra=run_type is not None)
+                              extra=run_type is not None or bool(needle))
             try:
                 for number, part in enumerate(chosen.parts(rows, span)):
                     if not number % 1024 and cancelled():
@@ -161,6 +170,8 @@ def list_jobs(store: Any, as_of: int, window: Optional[Window] = None,
                     if run_type is not None and (part.problem or type_of(
                             run_type[0], part, part.row[18] or "",
                             nodesets.get(part.row[3], "")) != run_type[1]):
+                        continue
+                    if needle and not _matches(part, needle):
                         continue
                     s = part.seconds
                     entry = _Entry(part, _times(part.gpus, s), _times(part.cpus, s),

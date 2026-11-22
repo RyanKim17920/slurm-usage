@@ -33,7 +33,8 @@ class HistoryInfo:
     gpu_tracked: Optional[bool]
     covered_from: Optional[int] = None  # 0 = all of history
     as_of: Optional[int] = None
-    cache_path: Optional[str] = None  # None = this process only
+    cache_path: Optional[str] = None  # None = this process only, or hidden
+    persistent: Optional[bool] = None  # loaded history survives this run (a cache file)
     notes: List[Note] = field(default_factory=list)
 
 
@@ -121,6 +122,7 @@ class History:
                 info.accounting = self._failure.status
             info.gpu_tracked = self._gpu_tracked()
             info.cache_path = self._store.path
+            info.persistent = bool(self._store.path)
         info.notes = self._notes()
         return info
 
@@ -145,13 +147,14 @@ class History:
               group_by: Sequence[Any] = DEFAULT_GROUPS, series_by: Optional[str] = None,
               series_metric: str = "gpu", lanes_by: Optional[str] = None,
               lane_resolution: Optional[int] = None, efficiency: bool = False,
-              progress: ProgressFn = None, cancel: Any = None) -> Report:
+              progress: ProgressFn = None, cancel: Any = None,
+              lanes_metric: Optional[str] = None) -> Report:
         """Everything for one window and filter. Raises rather than showing zeros when unloaded."""
         as_of = self._as_of()
         window = window or Window()
         report = build_report(self._store, as_of, window, where, group_by, series_by,
                               series_metric, lanes_by, lane_resolution, efficiency,
-                              self._gpu_tracked(), progress, cancel)
+                              self._gpu_tracked(), progress, cancel, lanes_metric)
         report.complete = self._is_complete(window)
         report.floor = rollup_module.capacity_floor(self._store, self._ingest.coverage()[0]
                                                     if self._ingest.coverage() else None)
@@ -177,12 +180,13 @@ class History:
     def jobs(self, window: Optional[Window] = None, where: Optional[Filter] = None,
              by: str = "job", sort: str = "gpu", descending: bool = True, limit: int = 200,
              offset: int = 0, cancel: Any = None,
-             run_type: Optional[Any] = None) -> JobPage:
-        """run_type=(by, key) drills into one run_types() row."""
+             run_type: Optional[Any] = None, match: Optional[str] = None) -> JobPage:
+        """run_type=(by, key) drills into one run_types() row. ``match`` keeps jobs whose
+        id, name or user contains it (case-insensitive); page.total counts the matches."""
         window = window or Window()
         as_of = self._as_of()
         page = list_jobs(self._store, as_of, window, where, by, sort, descending, limit, offset,
-                         cancel, run_type)
+                         cancel, run_type, match)
         page.complete = self._is_complete(window)
         return page
 
@@ -223,7 +227,8 @@ class History:
                   cancel: Any = None) -> List[runtypes.RunType]:
         """Usage per kind of run: by gpu_count, name_family, account, qos, partition,
         outcome or node_count. Drill in with jobs(run_type=(by, row.key))."""
-        return runtypes.run_types(self._store, self._as_of(), window, where, by, metric,
+        as_of = self._as_of()  # opens the store: evaluate before reading self._store
+        return runtypes.run_types(self._store, as_of, window, where, by, metric,
                                   self._gpu_tracked(), cancel)
 
     def events(self, window: Optional[Window] = None, where: Optional[Filter] = None,

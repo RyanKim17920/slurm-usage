@@ -49,8 +49,10 @@ class Context:
         self.now = time.time()
         self.collector = app.collector
 
-    def hist(self, key: Tuple[Any, ...], fn: Callable[[], Any]) -> Entry:
-        return self.app.loader.get(("h",) + key, fn, generation=self.data.generation)
+    def hist(self, key: Tuple[Any, ...], fn: Callable[[], Any], version: Any = None) -> Entry:
+        """``version``: inputs that change the answer but should keep the old one on
+        screen while the new one is computed (a longer page, a search)."""
+        return self.app.loader.get(("h",) + key, fn, generation=(self.data.generation, version))
 
     def live(self, key: Tuple[Any, ...], fn: Callable[[], Any]) -> Entry:
         return self.app.loader.get(("l",) + key, fn, generation=self.app.snap_generation)
@@ -74,13 +76,28 @@ def missing(entry: Optional[Entry]) -> str:
     return fmt.NOT_YET
 
 
+def stale(entry: Optional[Entry]) -> bool:
+    """The last recomputation failed; what is shown is the previous answer."""
+    return entry is not None and entry.state == FAILED and entry.value is not None
+
+
+def busy(entry: Optional[Entry]) -> bool:
+    return entry is not None and (entry.busy or entry.at is None)
+
+
+MIN_COVER = 0.05  # an efficiency measured over less of the allocation than this is not shown
+
+
 def eff_cell(eff: Any) -> Tuple[str, str]:
-    """'54%·80%': efficiency over coverage of the allocation."""
+    """'54%·80%': efficiency over coverage of the allocation. Measured over almost none of
+    it (below MIN_COVER), it is '?': a value from a sliver would be read as the whole."""
     if eff is None:
         return fmt.NA, DIM
     val, cover = eff
     if val is None:  # nothing measured yet over an allocation: not sampled; no allocation: n/a
         return (fmt.NOT_YET if cover == 0 else fmt.NOT_APPLICABLE), DIM
+    if cover is not None and cover < MIN_COVER:
+        return fmt.NOT_YET, DIM
     style = GOOD if val >= 0.7 else WARN if val >= 0.3 else BAD
     text = fmt.pct(val)
     if cover is not None and cover < 0.995:
@@ -212,6 +229,19 @@ def cluster_trend(ctx: Context, name: str) -> Tuple[Any, Entry]:
     return value(entry), entry
 
 
+def person_share(row: Any, cluster: Any) -> Any:
+    """A person's part of the cluster's GPU-hours, only from equally loaded figures: both
+    complete gives the share; the person partly loaded but the cluster complete gives a
+    lower bound (≥); a partly loaded cluster total could be further behind than the
+    person's, so the share is not known (?)."""
+    if cluster is None or row.gpu_hours is None or not cluster.gpu_hours:
+        return fmt.NOT_YET if cluster is None else fmt.NOT_APPLICABLE, DIM
+    if not cluster.complete:
+        return fmt.NOT_YET, DIM
+    share = min(1.0, row.gpu_hours / cluster.gpu_hours)
+    return ("" if row.complete else "≥") + fmt.pct(share, 1), PLAIN
+
+
 def trend_pane(ctx: Context, params: Dict[str, Any], person: bool = False) -> Pane:
     table = Table(PERSON_TREND_COLUMNS if person else TREND_COLUMNS, ctx.width - 2)
     spark_width = next((size for i, col, size in table.layout if col.name == "trend"), 8)
@@ -233,11 +263,8 @@ def trend_pane(ctx: Context, params: Dict[str, Any], person: bool = False) -> Pa
         incomplete = incomplete or not row.complete
         spark = (fmt.sparkline(row.spark, spark_width, ctx.ascii), GOOD)
         if person:
-            cluster = cluster_trend(ctx, name)[0]
-            share = None
-            if cluster is not None and cluster.gpu_hours and row.gpu_hours is not None:
-                share = row.gpu_hours / cluster.gpu_hours
-            cells = [label, mark + fmt.hours(row.gpu_hours), fmt.pct(share, 1),
+            cells = [label, mark + fmt.hours(row.gpu_hours),
+                     person_share(row, cluster_trend(ctx, name)[0]),
                      mark + fmt.hours(row.cpu_hours), eff_cell(row.gpu_eff),
                      eff_cell(row.cpu_eff), delta_cell(row.gpu_hours, row.gpu_delta, row.previous_loaded),
                      mark + fmt.num(row.jobs), spark]
@@ -304,8 +331,7 @@ def cluster_now(ctx: Context) -> Pane:
     lines = [resource_line("GPU", t.gpus, ctx.ascii, ctx.width),
              resource_line("CPU", t.cpus, ctx.ascii, ctx.width)]
     lines[0].action = lines[1].action = nodes_target
-    down = sum(c for s, c in h.node_states.items() if "DOWN" in s.upper())
-    drain = sum(c for s, c in h.node_states.items() if "DRAIN" in s.upper())
+    down, drain = fmt.down_drain(h.node_states)
     completing = sum(1 for job in snap.jobs or () if job.state == "COMPLETING")
     parts = [("Nodes", HEAD), (" %s" % fmt.num(t.nodes), PLAIN), (" (%s schedulable)  " %
                                                                   fmt.num(t.nodes_schedulable), DIM),
@@ -350,8 +376,8 @@ def cluster_now(ctx: Context) -> Pane:
 
 
 ACCOUNT_COLUMNS = (
-    Column("Account", 12, "<", 10, flex=True),
-    Column("users", 5, ">", 5),
+    Column("Account", 12, "<", 10, flex=True, most=24),
+    Column("members", 7, ">", 5),
     Column("run", 4, ">", 8),
     Column("pend", 5, ">", 7),
     Column("GPUs", 5, ">", 8),
@@ -359,7 +385,7 @@ ACCOUNT_COLUMNS = (
     Column("GPU-h", 7, ">", 9),
     Column("share", 6, ">", 8),
     Column("GPU util*", 9, ">", 3),
-    Column("trend", 8, ">", 5),
+    Column("trend", 6, ">", 5, flex=True),
     Column("visible", 8, "<", 6),
 )
 
@@ -373,7 +399,26 @@ def _gpu_cap(ctx: Context, account: str) -> Optional[Tuple[Optional[float], floa
     return None
 
 
+def rollup_summary(ctx: Context, range_name: Optional[str] = None) -> Any:
+    """The history layer's hourly summary of a range, if it has one loaded (else None)."""
+    if not ctx.data.has("overview"):
+        return None
+    found = value(overview_entry(ctx))
+    if found is None:
+        return None
+    name = range_name or ctx.range
+    return next((r for r in found.ranges if r.name == name), None)
+
+
+def summary_note(summary: Any, ctx: Context) -> str:
+    end = getattr(summary, "end", None)
+    return "hourly summary to %s, exact figures computing…" % fmt.when(end, ctx.now) \
+        if end else "hourly summary, exact figures computing…"
+
+
 def accounts_pane(ctx: Context) -> Pane:
+    """Accounts in the range. The figures come from the same query as Roles (so the two
+    always agree); while it computes, the hourly summary stands in and says so."""
     snap = ctx.snap
     table = Table(ACCOUNT_COLUMNS, ctx.width - 2)
     spark_width = next((size for i, col, size in table.layout if col.name == "trend"), 8)
@@ -388,20 +433,8 @@ def accounts_pane(ctx: Context) -> Pane:
     live = {u.key: u for u in group_by(snap_jobs(ctx), "account")} if snap else {}
     names.update(k for k in live if k)
     hist = {}  # type: Dict[str, Tuple[Optional[float], Optional[float], Any, bool]]
-    summary = None
-    if ctx.data.has("overview"):
-        ov_entry = overview_entry(ctx)
-        found = value(ov_entry)
-        if found is not None:
-            summary = next((r for r in found.ranges if r.name == ctx.range), None)
-        entry = ov_entry if report is None else entry
-    if summary is not None:
-        for name, item in summary.accounts.items():
-            hist[name] = (item.amounts.gpu_hours, item.share, item.amounts.efficiency("gpu"),
-                          summary.complete)
-            users.setdefault(name, set()).update(item.users)
-        names.update(hist)
-    elif report is not None:
+    summary = None if report is not None else rollup_summary(ctx)
+    if report is not None:
         total_gpu = report.total.gpu_seconds
         for key, stats in report.group("account").items():
             hist[key[0]] = (stats.gpu_hours, stats.gpu_seconds / total_gpu if total_gpu else None,
@@ -409,6 +442,12 @@ def accounts_pane(ctx: Context) -> Pane:
         names.update(hist)
         for (user, account), _ in report.group("user", "account").items():
             users.setdefault(account, set()).add(user)
+    elif summary is not None:
+        for name, item in summary.accounts.items():
+            hist[name] = (item.amounts.gpu_hours, item.share, item.amounts.efficiency("gpu"),
+                          False)
+            users.setdefault(name, set()).update(item.users)
+        names.update(hist)
     loaded = summary is not None or report is not None
     invoker = snap.invoker if snap else None
     mine = [r.account for r in (snap.my_roles or ())] if snap else []
@@ -429,10 +468,12 @@ def accounts_pane(ctx: Context) -> Pane:
                 except (ValueError, KeyError):
                     spark = None
             hist_cells = [("" if complete else "≥") + fmt.hours(gpu_h), fmt.pct(share, 1),
-                          eff_cell(eff), (fmt.sparkline(spark, spark_width, ctx.ascii), GOOD)]
+                          eff_cell(eff), (fmt.sparkline(spark, spark_width, ctx.ascii)
+                                          if spark is not None else "", GOOD)]
         else:
             ph = "0" if loaded else missing(entry)
-            hist_cells = [ph, fmt.NOT_APPLICABLE if loaded else ph, fmt.NOT_APPLICABLE, ""]
+            hist_cells = [ph, fmt.NOT_APPLICABLE if loaded else ph,
+                          (fmt.NOT_APPLICABLE if loaded else ph, DIM), ""]
         if ctx.data.failure and not loaded:
             hist_cells = [fmt.placeholder(ctx.data.failure[0])] * 3 + [""]
         vis = hd.visibility(info, invoker, name, mine) if invoker else fmt.NOT_YET
@@ -454,17 +495,24 @@ def accounts_pane(ctx: Context) -> Pane:
             {"name": name, "GPU-h": (stats[0] or 0) if stats else 0,
              "running": use.running if use else 0, "pending": use.pending if use else 0,
              "GPUs": (use.gpus or 0) if use else 0}, key=name))
-    lines.sort(key=lambda line: -(line.sort.get("GPU-h") or 0) - 1e12 * (line.sort.get("GPUs") or 0))
+    lines.sort(key=lambda line: (-(line.sort.get("GPU-h") or 0), -(line.sort.get("GPUs") or 0),
+                                 line.sort.get("name") or ""))
+    if report is not None:
+        status = "GPU-hours allocated in the range"
+    elif summary is not None:
+        status = summary_note(summary, ctx)
+    else:
+        status = "history " + missing(entry)
     return Pane("accounts", "Accounts · %s" % ctx.range, lines, table.header(),
-                sorts=("GPU-h", "GPUs", "running", "pending", "name"),
-                status="hours allocated" if loaded else "history " + missing(entry))
+                sorts=("GPU-h", "GPUs", "running", "pending", "name"), status=status,
+                natural="GPU-h")
 
 
 # -- People ------------------------------------------------------------------
 
 PEOPLE_COLUMNS = (
-    Column("User", 12, "<", 10, flex=True),
-    Column("accounts", 14, "<", 3),
+    Column("User", 12, "<", 10, flex=True, most=24),
+    Column("accounts", 14, "<", 3, flex=True, most=40),
     Column("run", 4, ">", 8),
     Column("pend", 5, ">", 7),
     Column("GPUs", 5, ">", 8),
@@ -474,6 +522,44 @@ PEOPLE_COLUMNS = (
     Column("GPU util*", 9, ">", 4),
     Column("jobs", 6, ">", 3),
 )
+
+SHARE_OF = {"account": "of acct", "qos": "of QOS", "partition": "of part", "user": "of user"}
+
+
+def share_columns(columns: Sequence[Column], params: Dict[str, Any]) -> List[Column]:
+    """A drilled-into list's "share" is of its parent's total: say which."""
+    scope = [k for k in ("partition", "qos", "account", "user") if params.get(k)]
+    if not scope:
+        return list(columns)
+    label = SHARE_OF[scope[0]] if len(scope) == 1 else "of sel."
+    return [c._replace(name=label, width=max(c.width, 7)) if c.name == "share" else c
+            for c in columns]
+
+
+class _Amounts:
+    """Rollup amounts shaped like Stats for the People and Roles tables."""
+
+    def __init__(self, amounts: Any) -> None:
+        self.gpu_seconds, self.gpu_hours = amounts.gpu_seconds, amounts.gpu_hours
+        self.cpu_hours = amounts.cpu_hours
+        self.jobs = None
+        self._amounts = amounts
+
+    def efficiency(self, metric: str) -> Any:
+        return self._amounts.efficiency(metric)
+
+
+def rollup_users(summary: Any, account: Optional[str] = None) -> Dict[str, Any]:
+    """Per-user totals from the hourly summary (all accounts, or one)."""
+    out = {}  # type: Dict[str, Any]
+    for name, item in summary.accounts.items():
+        if account is not None and name != account:
+            continue
+        for user, amounts in item.users.items():
+            if user not in out:
+                out[user] = type(amounts)()
+            out[user].add(amounts)
+    return out
 
 
 def people(ctx: Context, view: View) -> List[Pane]:
@@ -488,50 +574,75 @@ def people(ctx: Context, view: View) -> List[Pane]:
     accounts = {}  # type: Dict[str, set]
     for job in jobs:
         accounts.setdefault(job.user, set()).add(job.account)
-    hist = {}
+    hist = {}  # type: Dict[str, Any]
     total = None
+    summary = None
     if report is not None:
         hist = {key[0]: stats for key, stats in report.group("user").items()}
         total = report.total.gpu_seconds
         for (user, account), _ in report.group("user", "account").items():
             accounts.setdefault(user, set()).add(account)
+    elif not params["qos"] and not params["partition"]:
+        summary = rollup_summary(ctx)  # stands in while the exact figures compute
+        if summary is not None:
+            found = rollup_users(summary, params["account"])
+            hist = {user: _Amounts(amounts) for user, amounts in found.items()}
+            total = sum(a.gpu_seconds for a in found.values())
+            for name, item in summary.accounts.items():
+                if params["account"] is None or name == params["account"]:
+                    for user in item.users:
+                        accounts.setdefault(user, set()).add(name)
     if ctx.snap and params["account"]:
         for role in ctx.snap.roles or ():
             if role.account == params["account"] and role.user:
                 accounts.setdefault(role.user, set()).add(role.account)
-    table = Table(PEOPLE_COLUMNS, ctx.width - 2)
+    table = Table(share_columns(PEOPLE_COLUMNS, params), ctx.width - 2)
     lines = []
     me = ctx.snap.invoker.user if ctx.snap else None
+    loaded = report is not None or summary is not None
+    mark = "" if report is not None else "≥" if summary is not None else ""
     for user in sorted(set(live) | set(hist) | set(accounts)):
         if not user:
             continue
         use, stats = live.get(user), hist.get(user)
-        hist_cells = ([fmt.hours(stats.gpu_hours),
-                       fmt.pct(stats.gpu_seconds / total if total else None, 1),
-                       fmt.hours(stats.cpu_hours), eff_cell(stats.efficiency("gpu")),
-                       fmt.num(stats.jobs)] if stats is not None
-                      else [missing(entry) if report is None else "0"] * 5)
-        name_style = (USER, ) if user != me else (USER,)
-        cells = [(user + (" (you)" if user == me else ""), name_style[0]),
+        if stats is not None:
+            hist_cells = [mark + fmt.hours(stats.gpu_hours),
+                          fmt.pct(stats.gpu_seconds / total if total else None, 1),
+                          mark + fmt.hours(stats.cpu_hours), eff_cell(stats.efficiency("gpu")),
+                          fmt.num(stats.jobs) if stats.jobs is not None else (fmt.NOT_YET, DIM)]
+        elif loaded:
+            hist_cells = ["0", fmt.NOT_APPLICABLE, "0", (fmt.NOT_APPLICABLE, DIM),
+                          "0" if report is not None else (fmt.NOT_YET, DIM)]
+        else:
+            hist_cells = [missing(entry)] * 5
+        cells = [(user + (" (you)" if user == me else ""), USER),
                  ",".join(sorted(a for a in accounts.get(user, ()) if a)),
                  str(use.running) if use else "0", str(use.pending) if use else "0",
                  fmt.num(use.gpus) if use else "0"] + hist_cells
-        lines.append(table.row(cells, Target("person", {"user": user}, user),
-                               {"GPU-h": stats.gpu_seconds if stats else 0,
-                                "GPUs": (use.gpus or 0) if use else 0,
-                                "pending": use.pending if use else 0, "user": user}, key=user))
-    lines.sort(key=lambda l: (-(l.sort["GPUs"]), -(l.sort["GPU-h"] or 0), l.sort["user"]))
+        line = table.row(cells, Target("person", {"user": user}, user),
+                         {"GPU-h": stats.gpu_seconds if stats else 0,
+                          "GPUs": (use.gpus or 0) if use else 0,
+                          "pending": use.pending if use else 0, "user": user}, key=user)
+        line.pinned = user == me
+        lines.append(line)
+    lines.sort(key=lambda l: (-(l.sort["GPU-h"] or 0), -(l.sort["GPUs"]), l.sort["user"]))
     scope = " · ".join("%s %s" % (k, v) for k, v in params.items() if v)
+    if report is not None:
+        status = "GPU-hours allocated in the range"
+    elif summary is not None:
+        status = summary_note(summary, ctx)
+    else:
+        status = "computing…" if busy(entry) else "history " + missing(entry)
     return [Pane("people", "People" + (" · " + scope if scope else "") + " · " + ctx.range,
                  lines, table.header(), sorts=("GPU-h", "GPUs", "pending", "user"),
-                 status="hours allocated")]
+                 status=status, natural="GPU-h")]
 
 
 # -- Roles -------------------------------------------------------------------
 
 ROLE_COLUMNS = (
-    Column("Name", 14, "<", 10, flex=True),
-    Column("users", 5, ">", 6),
+    Column("Name", 14, "<", 10, flex=True, most=28),
+    Column("active", 6, ">", 6),
     Column("run", 4, ">", 8),
     Column("pend", 5, ">", 7),
     Column("GPUs", 5, ">", 8),
@@ -557,11 +668,19 @@ def roles(ctx: Context, view: View) -> List[Pane]:
         live = {u.key: u for u in group_by(jobs, by)}
     hist, users = {}, {}  # type: Dict[str, Any], Dict[str, set]
     total = None
+    summary = None
     if report is not None:
         hist = {key[0]: stats for key, stats in report.group(by).items()}
         total = report.total.gpu_seconds
         for (user, key), _ in report.group("user", by).items():
             users.setdefault(key, set()).add(user)
+    elif by == "account":
+        summary = rollup_summary(ctx)  # stands in while the exact figures compute
+        if summary is not None:
+            hist = {name: _Amounts(item.amounts) for name, item in summary.accounts.items()}
+            total = summary.total.gpu_seconds
+            for name, item in summary.accounts.items():
+                users.setdefault(name, set()).update(item.users)
     for job in jobs:
         key = getattr(job, by) if by != "partition" else (job.partition or "").split(",")[0]
         users.setdefault(key, set()).add(job.user)
@@ -582,12 +701,18 @@ def roles(ctx: Context, view: View) -> List[Pane]:
             names.update(p.name for p in snap.partitions or ())
     table = Table(ROLE_COLUMNS, ctx.width - 2)
     lines = []
+    loaded = report is not None or summary is not None
+    mark = "≥" if summary is not None else ""
     for name in sorted(n for n in names if n):
         use, stats = live.get(name), hist.get(name)
-        hist_cells = ([fmt.hours(stats.gpu_hours),
-                       fmt.pct(stats.gpu_seconds / total if total else None, 1),
-                       fmt.hours(stats.cpu_hours), eff_cell(stats.efficiency("gpu"))]
-                      if stats is not None else [missing(entry) if report is None else "0"] * 4)
+        if stats is not None:
+            hist_cells = [mark + fmt.hours(stats.gpu_hours),
+                          fmt.pct(stats.gpu_seconds / total if total else None, 1),
+                          mark + fmt.hours(stats.cpu_hours), eff_cell(stats.efficiency("gpu"))]
+        elif loaded:  # no usage in the range: nothing to measure, not a measured zero
+            hist_cells = ["0", fmt.NOT_APPLICABLE, "0", (fmt.NOT_APPLICABLE, DIM)]
+        else:
+            hist_cells = [missing(entry)] * 4
         cells = [(name, RESOURCE), fmt.num(len(users.get(name, ()))),
                  str(use.running) if use else "0", str(use.pending) if use else "0",
                  fmt.num(use.gpus) if use else "0", fmt.num(use.cpus) if use else "0"
@@ -595,24 +720,29 @@ def roles(ctx: Context, view: View) -> List[Pane]:
         lines.append(table.row(cells, Target("people", {by: name}, "%s %s" % (by, name)),
                                {"GPU-h": stats.gpu_seconds if stats else 0,
                                 "GPUs": (use.gpus or 0) if use else 0, "name": name}, key=name))
-    lines.sort(key=lambda l: (-l.sort["GPUs"], -(l.sort["GPU-h"] or 0), l.sort["name"]))
+    lines.sort(key=lambda l: (-(l.sort["GPU-h"] or 0), -l.sort["GPUs"], l.sort["name"]))
     label = {"account": "Accounts", "qos": "QOS", "partition": "Partitions"}[by]
+    status = "g: account/QOS/partition"
+    if summary is not None:
+        status = summary_note(summary, ctx) + "  " + status
+    elif report is None and busy(entry):
+        status = "computing…  " + status
     return [Pane("roles", "Roles: %s · %s" % (label, ctx.range), lines, table.header(),
-                 sorts=("GPU-h", "GPUs", "name"), status="g: account/QOS/partition")]
+                 sorts=("GPU-h", "GPUs", "name"), status=status, natural="GPU-h")]
 
 
 # -- Nodes -------------------------------------------------------------------
 
 NODE_COLUMNS = (
-    Column("Node", 10, "<", 10, flex=True),
-    Column("state", 10, "<", 9),
-    Column("partitions", 12, "<", 2),
+    Column("Node", 10, "<", 10, flex=True, most=20),
+    Column("state", 10, "<", 9, flex=True, most=28),
+    Column("partitions", 12, "<", 2, flex=True, most=24),
     Column("CPU", 9, ">", 8),
     Column("mem", 11, ">", 4),
     Column("GPU", 7, ">", 8),
-    Column("type", 6, "<", 3),
+    Column("type", 6, "<", 3, flex=True, most=14),
     Column("load", 6, ">", 5),
-    Column("reason", 16, "<", 6, flex=False),
+    Column("reason", 16, "<", 6, flex=True),
 )
 
 
@@ -637,14 +767,19 @@ def nodes(ctx: Context, view: View) -> List[Pane]:
             fmt.placeholder(cap.status if cap else None), cap.detail if cap else ""), DIM)])]
     table = Table(NODE_COLUMNS, ctx.width - 2)
     lines = []
+    untracked = False
     for node in snap.nodes:
         state = (node.state or "?") + ("+" + "+".join(node.state_flags) if node.state_flags else "")
         gpu = fmt.ratio(node.gpus_alloc, node.gpus_total) if node.gpus_total else fmt.NOT_APPLICABLE
+        if node.mem_alloc is not None:
+            mem = "%s/%s" % (fmt.mem(node.mem_alloc), fmt.mem(node.mem_total))
+        else:  # Slurm does not track memory allocation here: show the size, not a usage
+            untracked = untracked or node.mem_total is not None
+            mem = (fmt.NA + "/" + fmt.mem(node.mem_total), DIM)
+        types = ",".join(sorted({fmt.gpu_model(t) for t in node.gpu_types}))
         cells = [(node.name, RESOURCE), (state, node_style(node)), ",".join(node.partitions),
-                 fmt.ratio(node.cpus_alloc, node.cpus_total),
-                 "%s/%s" % (fmt.mem(node.mem_alloc), fmt.mem(node.mem_total))
-                 if node.mem_alloc is not None else fmt.mem(node.mem_total),
-                 gpu, ",".join(sorted(node.gpu_types)) or fmt.NOT_APPLICABLE,
+                 fmt.ratio(node.cpus_alloc, node.cpus_total), mem,
+                 gpu, types or fmt.NOT_APPLICABLE,
                  "%.1f" % node.cpu_load if node.cpu_load is not None else fmt.NA,
                  (node.reason or "", WARN if node.reason else PLAIN)]
         free = node.gpus_free
@@ -652,25 +787,28 @@ def nodes(ctx: Context, view: View) -> List[Pane]:
                                {"name": node.name, "GPUs free": free, "CPUs free": node.cpus_free,
                                 "load": node.cpu_load, "state": state}, key=node.name))
     problems = sum(1 for node in snap.nodes if node_style(node) == BAD)
+    notes = ["%d need attention" % problems] if problems else []
+    if untracked:
+        notes.append("mem: alloc n/a (not tracked) / size")
     return [Pane("nodes", "Nodes (%d)" % len(snap.nodes), lines, table.header(),
                  sorts=("name", "GPUs free", "CPUs free", "load", "state"),
-                 status="%d need attention" % problems if problems else "")]
+                 status="  ".join(notes))]
 
 
 # -- Queue -------------------------------------------------------------------
 
 QUEUE_COLUMNS = (
-    Column("Job", 11, "<", 10),
-    Column("user", 9, "<", 9),
-    Column("account", 9, "<", 5),
+    Column("Job", 11, "<", 10, flex=True, most=14),
+    Column("user", 9, "<", 9, flex=True, most=16),
+    Column("account", 9, "<", 5, flex=True, most=14),
     Column("qos", 7, "<", 3),
     Column("partition", 9, "<", 4),
-    Column("state", 8, "<", 8),
+    Column("state", 8, "<", 8, flex=True, most=11),
     Column("GPUs", 4, ">", 8),
     Column("CPUs", 5, ">", 6),
     Column("time", 7, ">", 7),
     Column("reason/nodes", 14, "<", 6, flex=True),
-    Column("name", 14, "<", 2),
+    Column("name", 14, "<", 2, flex=True),
 )
 
 
@@ -680,6 +818,17 @@ def job_style(job: Any) -> str:
     if job.pending:
         return WARN
     return DIM
+
+
+def live_elapsed(job: Any, now: float) -> Optional[float]:
+    """A live job's run time. squeue reports 0 for a COMPLETING job (and none for some
+    states): then it is start to end, or to now while the end is not known."""
+    if job.elapsed and job.state != "COMPLETING":
+        return job.elapsed
+    if job.start:
+        stop = job.end if job.end and job.end <= now and job.state == "COMPLETING" else now
+        return max(job.elapsed or 0, stop - job.start)
+    return job.elapsed
 
 
 def queue(ctx: Context, view: View) -> List[Pane]:
@@ -711,8 +860,7 @@ def queue(ctx: Context, view: View) -> List[Pane]:
             gpus = job.gpus_req
             cpus = job.cpus_req
         else:
-            spent = job.elapsed if job.elapsed is not None else (
-                ctx.now - job.start if job.start else None)
+            spent = live_elapsed(job, ctx.now)
             where = ",".join(job.nodes[:3]) + ("…" if len(job.nodes) > 3 else "")
             gpus, cpus = job.gpus_alloc, job.cpus_alloc
         count = ""
@@ -736,7 +884,7 @@ def queue(ctx: Context, view: View) -> List[Pane]:
 # -- Person ------------------------------------------------------------------
 
 RUN_COLUMNS = (
-    Column("Run type", 14, "<", 10, flex=True),
+    Column("Run type", 14, "<", 10, flex=True, most=48),
     Column("att", 5, ">", 8),
     Column("jobs", 5, ">", 5),
     Column("GPU-h", 7, ">", 9),
@@ -791,7 +939,8 @@ def person(ctx: Context, view: View) -> List[Pane]:
     lines = []
     for job in sorted(live, key=lambda j: (not j.holds_resources, -(j.gpus_alloc or j.gpus_req or 0))):
         size = job.gpus_alloc if job.holds_resources else job.gpus_req
-        spent = (job.elapsed if job.holds_resources else (ctx.now - job.submit if job.submit else None))
+        spent = (live_elapsed(job, ctx.now) if job.holds_resources
+                 else (ctx.now - job.submit if job.submit else None))
         where = ",".join(job.nodes[:2]) if job.holds_resources else (job.reason or "")
         lines.append(Line([(fmt.fit(job.display_id or job.job_id, 12), PLAIN),
                            (fmt.fit(job.state or "?", 9), job_style(job)),
@@ -807,15 +956,17 @@ def person(ctx: Context, view: View) -> List[Pane]:
         lines, status = [status_line("live", ctx.app.snapshot_entry)], ""
     panes.append(Pane("live", "Now", lines, status=status, grow=False, max_lines=4))
 
-    # kinds of runs
+    # kinds of runs. Every lambda binds its inputs now: it runs later on a worker thread,
+    # after this function has moved on (a late-bound loop variable once turned the range
+    # into an outcome name there, and every query failed with ERR 'other').
     dim = view.extra.get("dim", "gpu_count")
     dim_label = dict(hd.DIMENSIONS)[dim]
     filt = make_filter(params)
-    name = ctx.range
-    types_entry = ctx.hist(("runtypes", name, user, dim),
-                          lambda: ctx.data.run_types(name, filt, dim))
+    range_name = ctx.range
+    types_entry = ctx.hist(("runtypes", range_name, user, dim),
+                           lambda r=range_name, f=filt, d=dim: ctx.data.run_types(r, f, d))
     kinds = value(types_entry)
-    table = Table(RUN_COLUMNS, ctx.width - 2)
+    table = Table(share_columns(RUN_COLUMNS, {"user": user}), ctx.width - 2)
     lines = []
     if kinds is None:
         lines.append(text_line("history: %s %s" % (missing(types_entry), types_entry.message), DIM))
@@ -839,14 +990,19 @@ def person(ctx: Context, view: View) -> List[Pane]:
             lines.append(table.row(cells, target,
                                    {"GPU-h": kind.gpu_hours, "attempts": kind.attempts,
                                     "fail": kind.failure, "runtime": kind.runtime}, key=kind.key))
+    runs_status = "g: GPUs/nodes/name/account/QOS/partition/outcome"
+    if stale(types_entry):
+        runs_status = "stale: %s %s  %s" % (fmt.placeholder(types_entry.status),
+                                            types_entry.message, runs_status)
     panes.append(Pane("runs", "What kinds of runs · by %s · %s" % (dim_label, ctx.range), lines,
                       table.header(), sorts=("GPU-h", "attempts", "fail", "runtime"),
-                      status="g: GPUs/nodes/name/account/QOS/partition/outcome"))
+                      status=runs_status))
 
     # events
     report_entry = range_report(ctx, params, (("account",), ("qos",), ("partition",)))
     report = value(report_entry)
-    events_entry = ctx.hist(("events", name, user), lambda: ctx.data.events(name, filt))
+    events_entry = ctx.hist(("events", range_name, user),
+                            lambda r=range_name, f=filt: ctx.data.events(r, f))
     found = value(events_entry)
     lines = []
     if found is not None:
@@ -877,16 +1033,16 @@ def person(ctx: Context, view: View) -> List[Pane]:
                               if ranked else None))
         parts = [(fmt.fit("outcome", 10), HEAD)]
         first = True
-        for name in hd.OUTCOME_ORDER:
-            stats = report.outcomes.get(name)
+        for outcome in hd.OUTCOME_ORDER:
+            stats = report.outcomes.get(outcome)
             if stats is None or not stats.attempts:
                 continue
             if not first:
                 parts.append(("  ", DIM))
             first = False
             style = {"completed": GOOD, "running": GOOD, "failed": BAD, "node_fail": BAD,
-                     "timeout": WARN, "preempted": WARN}.get(name, PLAIN)
-            parts += [(name, style), (" %d" % stats.attempts, PLAIN)]
+                     "timeout": WARN, "preempted": WARN}.get(outcome, PLAIN)
+            parts += [(outcome, style), (" %d" % stats.attempts, PLAIN)]
         lines.append(Line(parts))
     else:
         lines.append(text_line("history: %s" % missing(report_entry), DIM))
@@ -895,12 +1051,9 @@ def person(ctx: Context, view: View) -> List[Pane]:
     # activity, efficiency, waits
     panes.append(activity_pane(ctx, params, report, report_entry))
 
-    # jobs list
-    jobs_entry = ctx.hist(("jobs", ctx.range, user, "gpu"),
-                          lambda name=ctx.range: ctx.data.jobs(name, make_filter(params)))
-    jpage = value(jobs_entry)
-    panes.append(jobs_pane(ctx, "jobs", "Jobs · " + ctx.range,
-                           jpage.rows if jpage is not None else None, jobs_entry))
+    # jobs list: a page at a time; a search asks history, not only the rows loaded
+    panes.append(paged_jobs(ctx, view, "Jobs · " + ctx.range, ("jobs", ctx.range, user, "gpu"),
+                            filt))
     return panes
 
 
@@ -950,8 +1103,8 @@ def activity_pane(ctx: Context, params: Dict[str, Any], report: Any, entry: Entr
 
 JOB_COLUMNS = (
     Column("Job", 12, "<", 10),
-    Column("name", 14, "<", 6, flex=True),
-    Column("user", 9, "<", 4),
+    Column("name", 14, "<", 6, flex=True, most=48),
+    Column("user", 9, "<", 4, flex=True, most=16),
     Column("outcome", 9, "<", 9),
     Column("start", 12, "<", 5),
     Column("elapsed", 7, ">", 8),
@@ -966,8 +1119,13 @@ OUTCOME_STYLE = {"completed": GOOD, "running": GOOD, "failed": BAD, "node_fail":
 
 
 def jobs_pane(ctx: Context, pane_id: str, title: str, rows: Optional[Sequence[Any]],
-              entry: Optional[Entry] = None) -> Pane:
-    table = Table(JOB_COLUMNS, ctx.width - 2)
+              entry: Optional[Entry] = None, total: Optional[int] = None,
+              match: str = "", hours: str = "GPU-h") -> Pane:
+    """``total``: how many jobs there are when ``rows`` is only the first of them.
+    ``hours``: the GPU-hours column's label ("GPU-h in bin" for a timeline bin)."""
+    columns = [c._replace(name=hours, width=max(c.width, len(hours))) if c.name == "GPU-h"
+               else c for c in JOB_COLUMNS]
+    table = Table(columns, ctx.width - 2)
     lines = []
     if rows is None:
         return Pane(pane_id, title, [text_line("history: %s %s" % (
@@ -984,8 +1142,33 @@ def jobs_pane(ctx: Context, pane_id: str, title: str, rows: Optional[Sequence[An
                                {"GPU-h": row.gpu_seconds, "start": row.start,
                                 "elapsed": row.elapsed, "wait": row.wait, "GPUs": row.gpus},
                                key=row.key))
-    return Pane(pane_id, title + " (%d)" % len(rows), lines, table.header(),
-                sorts=("GPU-h", "start", "elapsed", "wait", "GPUs"))
+    more = total is not None and total > len(rows)
+    count = ("%s of %s" % (fmt.num(len(rows)), fmt.num(total)) if more
+             else fmt.num(len(rows)))
+    status = ""
+    if match:
+        status = "matching “%s”" % match
+    if more:
+        status = (status + "  " if status else "") + "↓ at the end loads more"
+    if entry is not None and busy(entry) and rows:
+        status = (status + "  " if status else "") + "loading…"
+    return Pane(pane_id, title + " (%s)" % count, lines, table.header(),
+                sorts=("GPU-h", "start", "elapsed", "wait", "GPUs"), more=more, status=status)
+
+
+def paged_jobs(ctx: Context, view: View, title: str, key: Tuple[Any, ...], filt: Any,
+               win: Any = None, run_type: Any = None, pane_id: str = "jobs") -> Pane:
+    """The first JOB_PAGE jobs, more as the cursor reaches the end (app.py raises
+    view.extra["jobs_limit"]); the pane's / filter is also sent to history as a search."""
+    state = view.panes.get(pane_id)
+    match = (state.filter if state is not None else "").strip()
+    limit = view.extra.get("jobs_limit", hd.JOB_PAGE)
+    entry = ctx.hist(key, lambda r=ctx.range, f=filt, l=limit, m=match: ctx.data.jobs(
+        r, f, limit=l, win=win, run_type=run_type, match=m), version=(limit, match))
+    page = value(entry)
+    total = getattr(page, "total", None) if page is not None else None
+    return jobs_pane(ctx, pane_id, title, page.rows if page is not None else None, entry,
+                     total, match, "GPU-h in bin" if win is not None else "GPU-h")
 
 
 def jobs_list(ctx: Context, view: View) -> List[Pane]:
@@ -996,12 +1179,9 @@ def jobs_list(ctx: Context, view: View) -> List[Pane]:
     win = spec.get("window")
     filt_params = {k: spec.get(k) for k in ("user", "account", "qos", "partition")}
     run_type = spec.get("run_type")
-    entry = ctx.hist(("joblist", ctx.range, filt_key(filt_params), win, run_type),
-                     lambda name=ctx.range: ctx.data.jobs(name, make_filter(filt_params),
-                                                          win=hd.Window(*win) if win else None,
-                                                          run_type=run_type))
-    page = value(entry)
-    return [jobs_pane(ctx, "jobs", view.title, page.rows if page is not None else None, entry)]
+    return [paged_jobs(ctx, view, view.title,
+                       ("joblist", ctx.range, filt_key(filt_params), win, run_type),
+                       make_filter(filt_params), hd.Window(*win) if win else None, run_type)]
 
 
 # -- Timeline ----------------------------------------------------------------
@@ -1009,9 +1189,10 @@ def jobs_list(ctx: Context, view: View) -> List[Pane]:
 def timeline(ctx: Context, view: View) -> List[Pane]:
     by = view.extra.get("lanes", "user")
     zoom = view.extra.get("zoom", 1)
-    entry = ctx.hist(("lanes", ctx.range, by),
-                     lambda name=ctx.range: ctx.data.report(name, None, lanes_by=by,
-                                                            efficiency=False))
+    gpus_now = ctx.snap.totals.gpus.total if ctx.snap is not None else None
+    metric = view.extra.get("metric") or ("gpu" if gpus_now != 0 else "cpu")
+    entry = ctx.hist(("lanes", ctx.range, by, metric),
+                     lambda name=ctx.range, b=by, m=metric: lanes_report(ctx, name, b, m))
     report = value(entry)
     if report is None:
         return [Pane("timeline", "Timeline", [text_line("history: %s %s" % (
@@ -1028,14 +1209,7 @@ def timeline(ctx: Context, view: View) -> List[Pane]:
     cursor = max(0, min(bins - 1, view.extra.get("bin", bins - 1)))
     view.extra["bin"] = cursor
     view.extra["bins"] = (start, size, bins)
-    axis = [" "] * bins
-    pattern = "%b %d" if shown > 2 * 86400 else "%H:%M"
-    sample = time.strftime(pattern, time.localtime(start))
-    for mark in range(0, bins - len(sample), len(sample) + 3):
-        label = time.strftime(pattern, time.localtime(start + mark * size))
-        for i, ch in enumerate(label):
-            if mark + i < bins:
-                axis[mark + i] = ch
+    axis = timeline_axis(start, size, bins, shown)
     header = Line([(fmt.fit(by, label_width) + " ", DIM), ("".join(axis), DIM)])
     lines = []
     for lane in report.lanes:
@@ -1050,43 +1224,107 @@ def timeline(ctx: Context, view: View) -> List[Pane]:
             for i in range(first, last + 1):
                 lo, hi = start + i * size, start + (i + 1) * size
                 cover[i] += max(0.0, min(b, hi) - max(a, lo)) / size
-        cells = "".join(fmt.shade(min(1.0, c), ctx.ascii) if c > 0 else "·" if ctx.ascii is False and False else (" " if c <= 0 else fmt.shade(c, ctx.ascii)) for c in cover)
+        cells = "".join(fmt.shade(min(1.0, c), ctx.ascii) if c > 0 else " " for c in cover)
         style = USER if by == "user" else RESOURCE
         bin_start = int(start + cursor * size)
         bin_end = int(start + (cursor + 1) * size) + 1
         parts = [(fmt.fit(lane.key, label_width) + " ", style), (cells[:cursor], GOOD),
                  (cells[cursor] if cells[cursor] != " " else "┊", WARN), (cells[cursor + 1:], GOOD)]
         params = {by: lane.key, "window": (bin_start, bin_end)}
-        lines.append(Line(parts, Target("jobs", params, "%s %s at %s" % (by, lane.key,
-                                                                         fmt.when(bin_start, ctx.now))),
+        lines.append(Line(parts, Target("jobs", params, "%s %s · jobs in the bin at %s" % (
+            by, lane.key, fmt.when(bin_start, ctx.now))),
                           {"busy": total, "name": lane.key}, key=lane.key))
     lines.sort(key=lambda l: -l.sort["busy"])
     status = "bin %s · %s → %s" % (fmt.duration(size), fmt.when(start + cursor * size, ctx.now),
                                    fmt.when(start + (cursor + 1) * size, ctx.now))
-    return [Pane("timeline", "Timeline · lanes by %s · %s · zoom %dx" % (by, ctx.range, zoom),
-                 lines, header, sorts=("busy", "name"), status=status)]
+    legend = "".join(fmt.shade(f, ctx.ascii) for f in (0.2, 0.45, 0.7, 1.0))
+    shade = "shade = part of the bin with %s held: %s low→full" % (
+        "GPUs" if metric == "gpu" else "CPUs", legend)
+    # the bin first: the legend is dropped whole on a narrow screen, never cut mid-word
+    return [Pane("timeline", "Timeline · %s lanes by %s · %s · zoom %dx" % (
+        "GPU" if metric == "gpu" else "CPU", by, ctx.range, zoom),
+                 lines, header, sorts=("busy", "name"), status=(status, shade),
+                 select_width=label_width + 2)]
+
+
+def lanes_report(ctx: Context, range_name: str, by: str, metric: str) -> Any:
+    """Lanes from attempts holding the metric's resource (GPU view: GPU jobs only), so a
+    CPU-only partition is not drawn solid on the GPU view."""
+    try:
+        return ctx.data.report(range_name, None, lanes_by=by, efficiency=False,
+                               lanes_metric=metric)
+    except TypeError:  # a history layer without per-metric lanes
+        return ctx.data.report(range_name, None, lanes_by=by, efficiency=False)
+
+
+def timeline_axis(start: float, size: float, bins: int, shown: float) -> List[str]:
+    """Time labels along the bins; a label equal to the previous one is left out, and
+    when labels are less than a day apart they carry the hour too."""
+    axis = [" "] * bins
+    daily = shown > 2 * 86400
+    sample = time.strftime("%b %d", time.localtime(start)) if daily else "00:00"
+    gap = (len(sample) + 3) * size
+    if daily and gap < 86400:
+        pattern = "%d %Hh"
+    else:
+        pattern = "%b %d" if daily else "%H:%M"
+    width = len(time.strftime(pattern, time.localtime(start)))
+    previous = None
+    for mark in range(0, max(0, bins - width), width + 3):
+        label = time.strftime(pattern, time.localtime(start + mark * size))
+        if label == previous:
+            continue
+        previous = label
+        for i, ch in enumerate(label):
+            if mark + i < bins:
+                axis[mark + i] = ch
+    return axis
 
 
 # -- Job ---------------------------------------------------------------------
 
 STEP_COLUMNS = (
     Column("Step", 10, "<", 10),
-    Column("name", 12, "<", 5, flex=True),
+    Column("name", 12, "<", 5, flex=True, most=40),
     Column("state", 10, "<", 8),
     Column("elapsed", 8, ">", 8),
     Column("tasks", 5, ">", 3),
     Column("CPU eff", 7, ">", 9),
     Column("max RSS", 8, ">", 7),
-    Column("GPU util", 8, ">", 7),
+    Column("GPU util*", 9, ">", 7),
     Column("GPU mem", 8, ">", 4),
 )
+STANDARD_STEPS = ("batch", "extern", "interactive")
 
 
-def step_cpu_eff(step: Any) -> Optional[float]:
+def step_cpu_eff(step: Any, elapsed: Optional[float] = None) -> Optional[float]:
     cpus = step.tres_alloc.get("cpu") if step.tres_alloc else None
-    if step.total_cpu is None or not cpus or not step.elapsed:
+    elapsed = step.elapsed or elapsed
+    if step.total_cpu is None or not cpus or not elapsed:
         return None
-    return step.total_cpu / (cpus * step.elapsed)
+    return step.total_cpu / (cpus * elapsed)
+
+
+def step_gpu_util(step: Any, job_gpus: Optional[int] = None) -> Optional[float]:
+    """Peak gpuutil per allocated GPU, capped at 100% as everywhere else. Slurm's raw
+    figure may be summed over a task's GPUs (645 on a 16-GPU step is about 40% each)."""
+    raw = step.gpu_util_max
+    gpus = (step.tres_alloc or {}).get("gres/gpu") or job_gpus
+    if raw is None or not gpus:
+        return None
+    return min(1.0, raw / (100.0 * gpus))
+
+
+def from_steps(steps: Sequence[Any], cpus: Optional[int], mem: Optional[int],
+               elapsed: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+    """(CPU efficiency, memory peak) of a whole attempt from its steps, when history has
+    not measured it yet: CPU time of every step over the attempt's allocation, and the
+    largest step RSS over the requested memory."""
+    used = [s.total_cpu for s in steps if s.total_cpu is not None]
+    cpu = sum(used) / (cpus * elapsed) if used and cpus and elapsed else None
+    rss = [s.max_rss for s in steps if s.max_rss]
+    peak = max(rss) / mem if rss and mem else None
+    return cpu, peak
 
 
 def job(ctx: Context, view: View) -> List[Pane]:
@@ -1104,26 +1342,30 @@ def job(ctx: Context, view: View) -> List[Pane]:
     lines = []
 
     def kv(label: str, *parts: Tuple[str, str]) -> None:
-        lines.append(Line([(fmt.fit(label, 10), HEAD)] + list(parts)))
+        lines.append(Line([(fmt.fit(label, 11), HEAD)] + list(parts)))
 
     if live is not None:
         src = live
         kv("who", (src.user or "?", USER), ("  account ", DIM), (src.account or "?", RESOURCE),
            ("  qos ", DIM), (src.qos or "?", RESOURCE), ("  partition ", DIM), (src.partition or "?", RESOURCE))
         kv("state", (src.state or "?", job_style(src)), ("  " + (src.reason or "") if src.pending else "", WARN))
-        kv("request", ("%s CPUs  %s GPUs  %s mem  limit %s" % (
-            fmt.num(src.cpus_req if src.pending else src.cpus_alloc),
-            fmt.num(src.gpus_req if src.pending else src.gpus_alloc),
-            fmt.mem(src.mem_req if src.pending else src.mem_alloc),
-            "unlimited" if src.time_unlimited else fmt.duration(src.time_limit)), PLAIN))
+        memory = fmt.mem(src.mem_req if src.pending else src.mem_alloc) + " mem"
+        if not src.pending and src.mem_alloc is None and src.mem_req is not None:
+            memory = "%s mem (requested)" % fmt.mem(src.mem_req)  # AllocTRES has no memory
+        kv("request", ("%s  %s  %s  limit %s" % (
+            fmt.plural(src.cpus_req if src.pending else src.cpus_alloc, "CPU"),
+            fmt.plural(src.gpus_req if src.pending else src.gpus_alloc, "GPU"),
+            memory, "unlimited" if src.time_unlimited else fmt.duration(src.time_limit)),
+            PLAIN))
         if src.nodes:
             kv("nodes", (",".join(src.nodes[:8]) + (" …" if len(src.nodes) > 8 else ""), RESOURCE))
         wait = src.start - (src.eligible or src.submit) if src.start and (src.eligible or src.submit) and not src.pending else None
         kv("timing", ("submit %s  start %s%s  end %s" % (
             fmt.when(src.submit, ctx.now), fmt.when(src.start, ctx.now),
             " (est.)" if src.pending else "", fmt.when(src.end, ctx.now) + (" (est.)" if src.end and src.end > ctx.now else "")), PLAIN))
-        used = src.elapsed / src.time_limit if src.elapsed and src.time_limit else None
-        kv("", ("waited %s  elapsed %s  limit used %s" % (fmt.duration(wait), fmt.duration(src.elapsed),
+        spent = live_elapsed(src, ctx.now) if not src.pending else None
+        used = spent / src.time_limit if spent and src.time_limit else None
+        kv("", ("waited %s  elapsed %s  limit used %s" % (fmt.duration(wait), fmt.duration(spent),
                                                           fmt.pct(used)), DIM))
         if src.name:
             kv("name", (src.name, PLAIN))
@@ -1133,8 +1375,8 @@ def job(ctx: Context, view: View) -> List[Pane]:
         kv("who", (row.user, USER), ("  account ", DIM), (row.account, RESOURCE), ("  qos ", DIM),
            (row.qos, RESOURCE), ("  partition ", DIM), (row.partition, RESOURCE))
         kv("outcome", (row.outcome, OUTCOME_STYLE.get(row.outcome, PLAIN)), ("  " + row.state, DIM))
-        kv("request", ("%s CPUs  %s GPUs  %s mem  limit %s" % (
-            fmt.num(row.cpus), fmt.num(row.gpus), fmt.mem(row.mem),
+        kv("request", ("%s  %s  %s mem  limit %s" % (
+            fmt.plural(row.cpus, "CPU"), fmt.plural(row.gpus, "GPU"), fmt.mem(row.mem),
             "unlimited" if row.time_unlimited else fmt.duration(row.time_limit)), PLAIN))
         if row.nodes:
             kv("nodes", (row.nodes, RESOURCE))
@@ -1145,9 +1387,22 @@ def job(ctx: Context, view: View) -> List[Pane]:
             fmt.duration(row.wait), fmt.duration(row.elapsed), fmt.pct(row.time_limit_used)), DIM))
         if row.name:
             kv("name", (row.name, PLAIN))
-        effs = [("CPU ", DIM), (fmt.pct(row.cpu_efficiency), PLAIN), ("  mem peak ", DIM),
-                (fmt.pct(row.mem_efficiency), PLAIN), ("  GPU peak ", DIM),
-                (fmt.pct(row.gpu_peak_utilization), PLAIN)]
+        cpu_eff, mem_peak = row.cpu_efficiency, row.mem_efficiency
+        note = ""
+        if cpu_eff is None or mem_peak is None:  # not measured by history yet: the steps
+            last = [a for a in getattr(detail, "attempts", ()) or ()]
+            steps_of = last[-1].steps if last else []
+            got = from_steps(steps_of, row.cpus, row.mem, row.elapsed)
+            if (cpu_eff is None and got[0] is not None) or (mem_peak is None
+                                                            and got[1] is not None):
+                note = "  (from steps)"
+            cpu_eff = cpu_eff if cpu_eff is not None else got[0]
+            mem_peak = mem_peak if mem_peak is not None else got[1]
+        gpu_peak = row.gpu_peak_utilization
+        effs = [("CPU ", DIM), (fmt.pct(cpu_eff), PLAIN), ("  mem peak ", DIM),
+                (fmt.pct(mem_peak), PLAIN), ("  GPU peak ", DIM),
+                (fmt.pct(min(1.0, gpu_peak)) if gpu_peak is not None else fmt.NA, PLAIN),
+                (note, DIM)]
         kv("efficiency", *effs)
     else:
         lines.append(text_line("not in the live queue; history: %s %s" % (
@@ -1158,12 +1413,17 @@ def job(ctx: Context, view: View) -> List[Pane]:
     # attempts
     lines = []
     for number, att in enumerate(attempts):
+        elapsed = att.elapsed
+        if att.end is None and att.start:  # still running: as now, not as of the last load
+            elapsed = (live_elapsed(live, ctx.now) if live is not None and live.start == att.start
+                       else ctx.now - att.start)
         lines.append(Line([(fmt.fit("#%d" % (number + 1), 4), DIM),
                            (fmt.fit(att.outcome, 10), OUTCOME_STYLE.get(att.outcome, PLAIN)),
                            (fmt.fit(fmt.when(att.start, ctx.now), 13), PLAIN),
-                           (fmt.fit(fmt.when(att.end, ctx.now), 13), PLAIN),
-                           (fmt.fit(fmt.duration(att.elapsed), 8, ">") + "  ", PLAIN),
-                           (fmt.fit("%s GPU" % fmt.num(att.gpus), 7), PLAIN),
+                           (fmt.fit(fmt.when(att.end, ctx.now) if att.end else "running", 13),
+                            PLAIN),
+                           (fmt.fit(fmt.duration(elapsed), 8, ">") + "  ", PLAIN),
+                           (fmt.fit(fmt.plural(att.gpus, "GPU"), 8), PLAIN),
                            (att.nodes, RESOURCE)]))
     if not attempts:
         lines.append(text_line("attempts: %s %s" % (
@@ -1190,17 +1450,30 @@ def job(ctx: Context, view: View) -> List[Pane]:
         note = missing(detail_entry)
     table = Table(STEP_COLUMNS, ctx.width - 2)
     lines = []
+    running = live is not None and live.holds_resources
+    job_gpus = (live.gpus_alloc if live is not None else row.gpus if row is not None else None)
+    whole = live_elapsed(live, ctx.now) if running else None
     for step in steps:
-        cells = [step.step_id, step.name or "", step.state or "", fmt.duration(step.elapsed),
+        # sstat on a running job leaves name, state and elapsed out: the standard steps are
+        # named after themselves, and batch/extern run as long as the job
+        name = step.name or (step.step_id if step.step_id in STANDARD_STEPS else "")
+        state = step.state or ("RUNNING" if running else "")
+        elapsed = step.elapsed
+        if elapsed is None and running and step.step_id in ("batch", "extern"):
+            elapsed = whole
+        shown = (fmt.duration(elapsed) if elapsed is not None
+                 else ("running", DIM) if running else fmt.NA)
+        util = step_gpu_util(step, job_gpus)
+        cells = [step.step_id, name, state, shown,
                  fmt.num(step.ntasks) if step.ntasks is not None else fmt.NA,
-                 fmt.pct(step_cpu_eff(step)), fmt.mem(step.max_rss),
-                 ("%.0f" % step.gpu_util_max) if step.gpu_util_max is not None else fmt.NA,
-                 fmt.mem(step.gpu_mem_max)]
+                 fmt.pct(step_cpu_eff(step, elapsed)), fmt.mem(step.max_rss),
+                 fmt.pct(util) if util is not None else fmt.NA, fmt.mem(step.gpu_mem_max)]
         lines.append(table.row(cells))
     if note:
-        lines.append(text_line(note, DIM if fmt.DENIED not in note else BAD))
+        for part in wrap(note, ctx.width - 3):
+            lines.append(text_line(part, DIM if fmt.DENIED not in note else BAD))
     panes.append(Pane("steps", "Steps", lines, table.header(), grow=False, max_lines=5,
-                      status="GPU util is Slurm's gpuutil, may sum GPUs"))
+                      status="GPU util* = peak sample per allocated GPU"))
 
     # logs and on-demand text
     lines = []
@@ -1219,6 +1492,8 @@ def job(ctx: Context, view: View) -> List[Pane]:
         out, err = last.stdout, last.stderr
         paths = (out.display if out else None, out.raw if out else None,
                  err.display if err else None, err.raw if err else None)
+    # logs are judged against the end of the last attempt; while it runs they are being
+    # written. A script is judged against the first start (what ran was read then).
     started = None
     if live is not None and live.start and not live.pending:
         started = live.start
@@ -1226,6 +1501,11 @@ def job(ctx: Context, view: View) -> List[Pane]:
         started = attempts[0].start
     elif row is not None:
         started = row.start
+    running = live is not None and (live.holds_resources or live.state == "SUSPENDED")
+    ended = None
+    if not running:
+        last = attempts[-1] if attempts else row
+        ended = getattr(last, "end", None) or (live.end if live is not None else None)
     workdir = None
     if live is not None and live.raw_workdir:
         workdir = (live.workdir, live.raw_workdir)
@@ -1239,7 +1519,10 @@ def job(ctx: Context, view: View) -> List[Pane]:
                   directory: bool = False) -> None:
         parts = [(fmt.fit(label, 8), HEAD), (shown_path or fmt.NOT_APPLICABLE, PLAIN)]
         if raw:
-            state = ctx.app.path_state(raw, started, directory)
+            if label == "script":
+                state = ctx.app.path_state(raw, started, False, False, "the job started")
+            else:
+                state = ctx.app.path_state(raw, ended, directory, running and not directory)
             if state is None:
                 parts.append(("  [checking ?]", DIM))
             else:
@@ -1248,7 +1531,7 @@ def job(ctx: Context, view: View) -> List[Pane]:
         lines.append(Line(parts))
 
     if ctx.app.anonymized:
-        lines.append(text_line("paths, scripts, submit lines and logs are hidden by --anonymize",
+        lines.append(text_line("paths, scripts, submit lines and logs are hidden while anonymized (A)",
                                DIM))
     else:
         if workdir is not None:
@@ -1271,22 +1554,32 @@ def job(ctx: Context, view: View) -> List[Pane]:
     if shown:
         entry = ctx.app.loader.peek(("o", "fetch", job_id, shown))
         text_lines = []
+        room = ctx.width - 3
+        tail = shown in ("stdout", "stderr")
+
+        def say(text: str, style: str = PLAIN, indent: int = 2) -> None:
+            for part in wrap(text, room, indent):  # messages and commands wrap, never clip
+                text_lines.append(text_line(part, style))
+
         if entry is None or entry.at is None:
             text_lines.append(text_line("asking Slurm… ?", DIM))
         elif entry.state == FAILED:
-            text_lines.append(text_line("%s: %s" % (fmt.placeholder(entry.status), entry.message), BAD))
+            say("%s: %s" % (fmt.placeholder(entry.status), entry.message), BAD)
         else:
             status, body, detail_text = entry.value
             if status not in Status.USABLE:
-                style = BAD if status == Status.DENIED else DIM
-                text_lines.append(text_line("%s: %s" % (fmt.placeholder(status), detail_text), style))
+                say("%s: %s" % (fmt.placeholder(status), detail_text),
+                    BAD if status == Status.DENIED else DIM)
             for text in body:
-                text_lines.append(text_line(text))
+                if tail:  # a log keeps its lines; long ones are cut at the edge
+                    text_lines.append(text_line(text))
+                else:
+                    say(text, PLAIN, 4)
             if not body and status in Status.USABLE:
-                text_lines.append(text_line("(empty) " + detail_text, DIM))
+                say("(empty) " + detail_text, DIM)
         label = {"stdout": "stdout tail", "stderr": "stderr tail", "script": "Batch script",
                  "submit": "Submit line"}[shown]
-        panes.append(Pane("output", label, text_lines))
+        panes.append(Pane("output", label, text_lines, follow=tail))
     return panes
 
 
@@ -1296,18 +1589,27 @@ HELP = [
     ("Navigation", HEAD),
     ("  o m n j p a t   Overview, Me, Nodes, Queue (jobs), People, Roles (accounts), Timeline", PLAIN),
     ("  ← →             previous / next tab (in Timeline: move the bin cursor)", PLAIN),
-    ("  ↑ ↓ PgUp PgDn   move in the focused pane;  Home/End  first/last", PLAIN),
+    ("  ↑ ↓ PgUp PgDn   move in the focused pane (PgUp/PgDn a page);  Home/End  first/last", PLAIN),
     ("  Tab Shift-Tab   next / previous pane", PLAIN),
     ("  Enter           drill into the row (›);  Esc / Backspace  back up the breadcrumb", PLAIN),
-    ("  /  s  S         filter the pane;  cycle sort column;  reverse sort", PLAIN),
+    ("  /  s  S         filter the pane as you type (Ctrl-U clears; a jobs list searches all of", PLAIN),
+    ("                  history);  cycle sort column (▼▲ in its header);  reverse sort", PLAIN),
     ("  [ ]  1-5        range: day, week, month, year, all — shared by every view", PLAIN),
     ("  g               Roles: account/QOS/partition;  Person: run types by GPUs, nodes, job name,", PLAIN),
     ("                  account, QOS, partition, outcome;", PLAIN),
     ("                  Timeline: lanes by user/account/QOS/partition", PLAIN),
-    ("  + - , .         Timeline zoom and pan", PLAIN),
+    ("  + - , .  c      Timeline zoom and pan;  c: GPU or CPU lanes", PLAIN),
     ("  l e b u         Job: stdout tail, stderr tail, batch script, submit line (on request only)", PLAIN),
     ("  E               load efficiency (step usage) for the current range and person", PLAIN),
     ("  r  ?  q         refresh now, this help, quit;  mouse: wheel scrolls, click selects, double-click opens", PLAIN),
+    ("", PLAIN),
+    ("Settings (any screen, no restart)", HEAD),
+    ("  A               anonymize on/off: pseudonyms for people, accounts, nodes and job names;", PLAIN),
+    ("                  closes open paths, scripts, submit lines and logs", PLAIN),
+    ("  C  U            colors on/off;  Unicode or ASCII glyphs", PLAIN),
+    ("  H               history: full (all of it in the background), recent (the chosen range and", PLAIN),
+    ("                  shorter), off (live view only; stops loading)", PLAIN),
+    ("  O               settings: every switch and its state, the cache location, clear the cache", PLAIN),
     ("", PLAIN),
     ("Colors", HEAD),
     ("  cyan     a resource: node, account, QOS, partition", RESOURCE),
@@ -1324,15 +1626,20 @@ HELP = [
     ("Glossary", HEAD),
     ("  GPU-h / CPU-h alloc   allocated hours (GPUs or CPUs held × wall time), not measured use", PLAIN),
     ("  util                  allocated hours ÷ (today's live capacity × window length)", PLAIN),
-    ("  GPU eff               peak sampled GPU utilization of measured attempts; CPU eff = CPU time ÷ allocated", PLAIN),
-    ("  ·cov                  share of allocated hours the efficiency figure describes", PLAIN),
+    ("  GPU util*             peak sampled GPU utilization per allocated GPU of measured attempts", PLAIN),
+    ("                        (capped at 100%); CPU eff = CPU time ÷ allocated", PLAIN),
+    ("  ·cov                  share of allocated hours the efficiency figure describes; under 5%", PLAIN),
+    ("                        the figure is shown as ? (too little measured)", PLAIN),
     ("  attempt / job         a requeue or preemption starts another attempt of the same job", PLAIN),
     ("  preempted             stopped by the scheduler for other work; allocated time still counts and", PLAIN),
     ("                        is not a failure or waste", PLAIN),
-    ("  fail                  failed or node_fail among finished attempts", PLAIN),
+    ("  fail                  failed, node_fail or timeout among attempts that ended", PLAIN),
     ("  limit                 elapsed ÷ requested time limit of completed and timed-out attempts", PLAIN),
     ("  stranded GPUs         free GPUs that cannot start: no free core or memory left on the node", PLAIN),
-    ("  share                 part of the cluster's allocated GPU-hours in the same range", PLAIN),
+    ("  share                 part of the cluster's allocated GPU-hours in the same range;", PLAIN),
+    ("                        of acct / of QOS / of part / of user: part of that one's GPU-hours", PLAIN),
+    ("  members               Overview: users with an association or usage in the account", PLAIN),
+    ("  active                Roles: users with jobs now or usage in the range", PLAIN),
     ("  visible               how much of an account's history you can see: full, own only,", PLAIN),
     ("                        denied, or no accounting", PLAIN),
     ("  Job environments are never shown.  Nothing here changes anything in Slurm.", DIM),
