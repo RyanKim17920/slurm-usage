@@ -1,0 +1,64 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit tests (Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 3.8 is no longer built for newer runner images
+          - { python: "3.8", os: ubuntu-22.04 }
+          - { python: "3.9", os: ubuntu-22.04 }
+          - { python: "3.10", os: ubuntu-latest }
+          - { python: "3.11", os: ubuntu-latest }
+          - { python: "3.12", os: ubuntu-latest }
+          - { python: "3.13", os: ubuntu-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run the unit tests (live tests skip themselves without Slurm)
+        run: python -B -m unittest discover -s tests -t . -v
+
+  package:
+    name: wheel, sdist and zipapp
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+      - name: Build wheel and sdist
+        run: uv build --out-dir dist
+      - name: Install the wheel into a fresh environment and run it
+        run: |
+          uv venv /tmp/wheel-env
+          uv pip install --python /tmp/wheel-env/bin/python dist/*.whl
+          /tmp/wheel-env/bin/slurm-usage --version
+          /tmp/wheel-env/bin/slurm-usage --once --no-history
+      - name: Run from the sdist's tests
+        run: |
+          mkdir /tmp/sdist && tar -xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
+          cd /tmp/sdist && python -B -m unittest discover -s tests -t .
+      - name: Build and run the zipapp
+        run: |
+          python scripts/build_zipapp.py -o dist/slurm-usage.pyz
+          python dist/slurm-usage.pyz --version
+          python dist/slurm-usage.pyz --once --no-history
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

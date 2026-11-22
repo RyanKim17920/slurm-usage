@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "slurm-usage"
+dynamic = ["version"]
+description = "Read-only terminal monitor and usage explorer for any Slurm cluster"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+license = { text = "MIT" }
+authors = [{ name = "Ryan Kim" }]
+keywords = ["slurm", "hpc", "cluster", "gpu", "monitoring", "tui"]
+classifiers = [
+    "Environment :: Console :: Curses",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Clustering",
+    "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Homepage = "https://github.com/RyanKim17920/slurm-usage"
+Changelog = "https://github.com/RyanKim17920/slurm-usage/blob/main/CHANGELOG.md"
+
+[project.scripts]
+slurm-usage = "slurm_usage.cli:main"
+
+[tool.hatch.version]
+path = "slurm_usage/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["slurm_usage"]
+
+[tool.hatch.build.targets.sdist]
+include = ["slurm_usage", "tests", "docs", "scripts", "pyproject.toml", "README.md",
+           "LICENSE", "CHANGELOG.md"]

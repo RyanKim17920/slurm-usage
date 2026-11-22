@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# environments
+.venv/
+venv/
+
+# build output
+build/
+dist/
+*.pyz
+*.whl
+
+# caches
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
