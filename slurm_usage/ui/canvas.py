@@ -9,7 +9,8 @@ from typing import Callable, List, Optional, Tuple
 from ..sanitize import clean
 from .fmt import char_width
 
-# Styles by meaning, not by color. The curses backend maps them to attributes.
+# Styles by meaning, not by color; theme.py holds the palette, and a style may carry
+# "+b" (bold) and "@background" (theme.resolve). The curses backend maps them to attributes.
 PLAIN = ""
 RESOURCE = "resource"    # cyan: a node, partition, account, QOS, GPU type
 USER = "user"            # magenta: a person
@@ -20,7 +21,23 @@ DIM = "dim"              # gray: context, unavailable
 HEAD = "head"            # bold: titles and column headers
 SELECTED = "selected"    # reverse: the cursor row
 TAB = "tab"              # the active tab
-STYLES = (PLAIN, RESOURCE, USER, GOOD, WARN, BAD, DIM, HEAD, SELECTED, TAB)
+FAINT = "faint"          # borders, rules, placeholders: recedes further than DIM
+ACCENT = "accent"        # focus and the cursor
+KEY = "key"              # a key in a hint (bold accent)
+BRIGHT = "bright"        # the biggest figures
+STYLES = (PLAIN, RESOURCE, USER, GOOD, WARN, BAD, DIM, HEAD, SELECTED, TAB, FAINT, ACCENT,
+          KEY, BRIGHT)
+SEL = "sel"              # the background of the selected row
+
+
+def on(style: str, background: str) -> str:
+    """``style`` drawn over ``background`` (its own colors kept)."""
+    return (style or "").partition("@")[0] + "@" + background
+
+
+def bold(style: str) -> str:
+    base, at, background = (style or "").partition("@")
+    return base + ("" if "+" in base else "+") + "b" + at + background
 
 Segment = Tuple[str, str]  # (text, style)
 _WIDE_TAIL = ""  # placeholder cell after a double-width character
@@ -71,6 +88,14 @@ class Canvas:
             return
         for at in range(max(0, start), min(self.width, end)):
             self.cells[row][at] = (self.cells[row][at][0], style)
+
+    def overlay(self, row: int, start: int, end: int, background: str) -> None:
+        """Put a background under cells, keeping their colors (the selected row)."""
+        if not 0 <= row < self.height:
+            return
+        for at in range(max(0, start), min(self.width, end)):
+            char, style = self.cells[row][at]
+            self.cells[row][at] = (char, on(style, background))
 
     def map_cells(self, fn: Callable[[str], str]) -> None:
         """Replace every cell's character (each result must be one cell wide)."""

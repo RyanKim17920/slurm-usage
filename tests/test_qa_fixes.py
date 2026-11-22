@@ -287,9 +287,10 @@ class RunningJobTest(unittest.TestCase):
 
     def test_running_job_summary_and_steps(self):
         app, job = self.make()
-        screen = draw(app, 160, 50).text()
+        # each line without its box border, so the content starts as it did
+        screen = "\n".join(line[1:] for line in draw(app, 160, 50).text().split("\n"))
         self.assertIn("%s mem (requested)" % fmt.mem(job.mem_req), screen)
-        self.assertIn("elapsed %s" % fmt.duration(job.elapsed), screen)
+        self.assertRegex(screen, r"elapsed +%s" % fmt.duration(job.elapsed))
         self.assertIn("4 GPUs", screen)
         batch = next(l for l in screen.split("\n") if l.startswith(" batch"))
         self.assertIn("RUNNING", batch)
@@ -342,7 +343,7 @@ class NoColorTest(unittest.TestCase):
                 if not chunk:
                     break
                 out += chunk
-            if not sent and (b"Cluster now" in out or time.time() - start > 8):
+            if not sent and (b"Trend" in out or time.time() - start > 8):
                 os.write(fd, b"q")
                 sent = True
         try:
@@ -351,7 +352,7 @@ class NoColorTest(unittest.TestCase):
             pass
         os.waitpid(pid, 0)
         os.close(fd)
-        self.assertIn(b"Cluster now", out)
+        self.assertIn(b"Trend", out)
         for code in (b"\x1b[37m", b"\x1b[40m", b"\x1b[39;49m\x1b[37m"):
             self.assertFalse(code in out, code)
         import re
@@ -528,7 +529,7 @@ class UxTest(unittest.TestCase):
         app.snapshot.nodes[0].gpu_types = {"nvidia_h100_80gb_hbm3": 8}
         app.go_tab("nodes")
         screen = draw(app, 160, 30).text()
-        self.assertIn("alloc n/a (not tracked)", screen)
+        self.assertIn("n/a/", screen)  # not tracked: the size only (see help: mem n/a/size)
         self.assertIn(" h100 ", screen)
 
     def test_sort_marker_in_header(self):
@@ -559,7 +560,8 @@ class UxTest(unittest.TestCase):
         app.key("t")
         screen = draw(app, 160, 40).text()
         self.assertIn("GPU lanes", screen)
-        self.assertIn("shade", screen)
+        self.assertIn("low ", screen)  # the legend of the lane shading
+        self.assertIn(" full", screen)
         app.key("c")
         self.assertIn("CPU lanes", draw(app, 160, 40).text())
 
@@ -681,31 +683,33 @@ class TimelineHeaderAndSelectionTest(unittest.TestCase):
         app.key("t")
         for width in (80, 120, 160, 240):
             title = draw(app, width, 30).row_text(1).rstrip()
-            self.assertLessEqual(fmt.width(title), width - 1)
+            self.assertLessEqual(fmt.width(title), width)
+            self.assertTrue(title.endswith("╮"), title)  # the box closes: nothing cut it
             self.assertIn("bin ", title)
-            self.assertTrue(title.endswith("low→full") or "shade" not in title, title)
+            # the legend is whole or left out, never cut mid-word
+            self.assertTrue("low" not in title or " full ─╮" in title, title)
 
     def test_a_single_long_note_is_ellipsized(self):
         canvas = Canvas(40, 3)
         pane = Pane("p", "Title", [Line([("x", "")])], status="a very long note about many things")
         draw_pane(canvas, 0, 3, pane, PaneState(), True, pane.lines)
         title = canvas.row_text(0).rstrip()
-        self.assertTrue(title.endswith("…"), title)
-        self.assertLessEqual(fmt.width(title), 39)
+        self.assertTrue(title.endswith("… ─╮"), title)
+        self.assertLessEqual(fmt.width(title), 40)
 
     def test_selected_lane_keeps_its_bars(self):
         """The selected lane was painted over in the selection color, bars and all."""
-        from slurm_usage.ui.canvas import GOOD, SELECTED
         app = make_app()
         app.key("t")
         canvas = draw(app, 120, 30)
+        selected = lambda style: style.endswith("@sel")
         row = next(r for r in range(canvas.height)
-                   if any(style == SELECTED for _, style in canvas.cells[r]))
+                   if any(selected(style) for _, style in canvas.cells[r]))
         styles = [style for _, style in canvas.cells[row]]
-        label = min(16, max(8, 120 // 6)) + 2
-        self.assertTrue(all(style == SELECTED for style in styles[1:label]))
-        self.assertNotIn(SELECTED, styles[label:])
-        self.assertIn(GOOD, styles[label:])
+        label = min(16, max(8, 120 // 6)) + 3  # the border, the padding, the label, a space
+        self.assertTrue(all(selected(style) for style in styles[1:label]))
+        self.assertFalse(any(selected(style) for style in styles[label:]))
+        self.assertTrue(any(style.startswith("heat") for style in styles[label:]))
 
 
 class TrendJobCountTest(unittest.TestCase):

@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- A redesigned terminal UI: panes in rounded boxes with the title and notes in
+  the border and the focused one in the accent color; a header with tab pills,
+  the range selector and a slim loading bar; key hints styled as keys.
+- One palette by meaning (`ui/theme.py`): truecolor with a direct-color
+  terminfo, a matched 256-color mapping, 16 and 8 colors, and no color.
+- Overview opens on cards for GPUs, CPUs, nodes and the queue with gauges;
+  sparklines are shaded on one color ramp, gauges have eighth-cell precision, timeline
+  lanes and the activity heatmap use one color ramp with a legend.
+- Less on screen at once: Me / person pages show four panes (events, jobs,
+  activity and roles share one box with tabs), Job detail shows steps and
+  attempts as tabs, efficiency columns appear once something is measured,
+  secondary columns only when the width allows, and the explanatory notes that
+  sat on screen moved to the `?` glossary.
+
 ## [0.1.0] - 2026-11-22
 
 First release.

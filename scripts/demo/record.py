@@ -110,6 +110,13 @@ def parse(ansi: str) -> pyte.Screen:
     return screen
 
 
+# up, down, left, right, rounded
+BOX = {0x2500: (0, 0, 1, 1, 0), 0x2502: (1, 1, 0, 0, 0), 0x256D: (0, 1, 0, 1, 1),
+       0x256E: (0, 1, 1, 0, 1), 0x2570: (1, 0, 0, 1, 1), 0x256F: (1, 0, 1, 0, 1),
+       0x250C: (0, 1, 0, 1, 0), 0x2510: (0, 1, 1, 0, 0), 0x2514: (1, 0, 0, 1, 0),
+       0x2518: (1, 0, 1, 0, 0), 0x251C: (1, 1, 0, 1, 0), 0x2524: (1, 1, 1, 0, 0)}
+
+
 def draw_cell(draw: ImageDraw.ImageDraw, fonts: Fonts, x: int, y: int, char: str,
               fg, bold: bool) -> None:
     code = ord(char) if len(char) == 1 else 0
@@ -127,10 +134,33 @@ def draw_cell(draw: ImageDraw.ImageDraw, fonts: Fonts, x: int, y: int, char: str
     elif code in (0x2591, 0x2592, 0x2593):  # shades
         share = {0x2591: 0.28, 0x2592: 0.5, 0x2593: 0.75}[code]
         draw.rectangle([x, y + 1, x + w - 1, y + h - 2], fill=blend(BG, fg, share))
-    elif code == 0x2500:  # ─
-        draw.line([x, y + h // 2, x + w - 1, y + h // 2], fill=fg)
-    elif code == 0x2502:  # │
-        draw.line([x + w // 2, y, x + w // 2, y + h - 1], fill=fg)
+    elif code in BOX:  # lines and corners, joined across cells (fonts leave gaps)
+        cx, cy = x + w // 2, y + h // 2
+        up, down, left, right, arc = BOX[code]
+        r = w // 2
+        if arc:
+            ox = cx + r if right else cx - r
+            oy = cy + r if down else cy - r
+            start = {(True, True): 180, (False, True): 270, (True, False): 90,
+                     (False, False): 0}[(right, down)]
+            draw.arc([ox - r, oy - r, ox + r, oy + r], start, start + 90, fill=fg)
+            if down:
+                draw.line([cx, oy, cx, y + h - 1], fill=fg)
+            else:
+                draw.line([cx, y, cx, oy], fill=fg)
+        else:
+            if left or right:
+                draw.line([x if left else cx, cy, x + w - 1 if right else cx, cy], fill=fg)
+            if up or down:
+                draw.line([cx, y if up else cy, cx, y + h - 1 if down else cy], fill=fg)
+    elif 0x2800 < code <= 0x28FF:  # braille: dots on a 2x4 grid
+        bits = code - 0x2800
+        for bit, (col, row) in enumerate(((0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2),
+                                          (0, 3), (1, 3))):
+            if bits & (1 << bit):
+                px = x + (w * (1 + 2 * col * 1.0)) / 4.0  # at a quarter and three quarters
+                py = y + h * (row + 0.75) / 4.4
+                draw.ellipse([px - 1.6, py - 1.6, px + 1.6, py + 1.6], fill=fg)
     elif char.strip():
         font = fonts.bold if bold else fonts.regular
         draw.text((x + w / 2, y + h / 2 + 1), char, font=font, fill=fg, anchor="mm")
@@ -274,7 +304,7 @@ def has(text: str, ready) -> bool:
 def efficiency_shown(text: str) -> bool:
     # efficiency figures in, the load finished, and no figure partial or unknown
     return ("%·" in text and "loading efficiency" not in text and "≥" not in text
-            and not re.search(r"^ day +\S+ +\?", text, re.M))
+            and not re.search(r"^\W*day +\S+ +\?", text, re.M))
 
 
 def settle(tmux: Tmux, name: str, least: float = 0.6, most: float = 12.0, quiet: float = 1.0,
@@ -337,11 +367,11 @@ SCRIPT = [
     ("people", "p", "p  People", 1.5, "People · week"),
     ("people", "Down", "↓", 0.3, None),
     ("people", "Down", "↓", 0.4, None),
-    ("person", "Enter", "Enter", 2.2, "Jobs · week"),
+    ("person", "Enter", "Enter", 2.2, "What kinds of runs"),
     ("runs", "g", "g  by job name", 1.8, "runs · by job name"),
     ("runs", "g", "g  by outcome", 1.8, "runs · by outcome"),
     ("anon", "A", "A  anonymize", 2.4, "ANON"),
-    ("anon", "A", "A  off", 0.7, "orion Overview"),
+    ("anon", "A", "A  off", 0.7, lambda text: "ANON" not in text.split("\n", 1)[0]),
     ("me", "m", "m  Me", 1.0, "Trend · alice"),
     ("me", "E", "E  efficiency", 2.0, efficiency_shown),
     ("job", "Tab", "Tab", 0.4, None),

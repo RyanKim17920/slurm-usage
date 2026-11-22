@@ -17,12 +17,15 @@ from . import data as hd
 from . import fmt
 from . import text as textmod
 from .anonymize import AnonCollector, AnonHistory, Anonymizer
-from .canvas import BAD, DIM, GOOD, HEAD, PLAIN, RESOURCE, SELECTED, TAB, WARN, Canvas
+from . import charts
+from . import theme
+from .canvas import (ACCENT, BAD, DIM, FAINT, GOOD, HEAD, KEY, PLAIN, RESOURCE, SEL, TAB,
+                     WARN, Canvas, bold, on)
 from .filestat import check as stat_path
 from .filestat import script_from_submit_line
 from .loader import Loader
 from .screens import FOOTERS, LANE_GROUPS, ROLE_GROUPS, SCREENS, TABS, Context, View
-from .widgets import PaneState, allocate, draw_pane, visible_lines
+from .widgets import PaneState, allocate, close_box, draw_pane, visible_lines
 
 ACTIVE_REFRESH = 30.0
 MAX_REFRESH = 300.0
@@ -240,17 +243,62 @@ class App:
         states = [view.panes.setdefault(p.id, PaneState()) for p in panes]
         shown = [visible_lines(p, s) for p, s in zip(panes, states)]
         self._reselect(view, panes, states, shown)
-        body = allocate(panes, [len(lines) for lines in shown], height - 2, view.focus)
-        self._page = max(1, body[view.focus] if 0 <= view.focus < len(body) else 10)
+        # a group shows one of its panes: the focused one, else the one last focused
+        visible = []  # type: List[int]
+        members = {}  # type: Dict[str, List[int]]
+        for index, pane in enumerate(panes):
+            if pane.group:
+                members.setdefault(pane.group, []).append(index)
+        for group, indices in members.items():
+            if view.focus in indices:
+                view.extra["tab:" + group] = panes[view.focus].id
+        for index, pane in enumerate(panes):
+            if pane.group:
+                indices = members[pane.group]
+                active = view.extra.get("tab:" + pane.group)
+                chosen = next((i for i in indices if panes[i].id == active), indices[0])
+                if index != chosen:
+                    continue
+            visible.append(index)
+        framed = any(panes[i].frame for i in visible)
+        focus_at = visible.index(view.focus) if view.focus in visible else 0
+        counts = [panes[i].fixed or len(shown[i]) if panes[i].draw is not None and
+                  not panes[i].frame else len(shown[i]) for i in visible]
+        room = height - 2 - (1 if framed else 0)
+        body = allocate([panes[i] for i in visible], counts, room, focus_at)
+        self._page = max(1, body[focus_at] if 0 <= focus_at < len(body) else 10)
+        glyphs = theme.box(self.ascii)
         row = 1
         self.hits = []
-        for index, (pane, state, lines, size) in enumerate(zip(panes, states, shown, body)):
+        self.group_hits = []  # type: List[Tuple[int, int, int, int]]
+        edge = "top"
+        last_framed = None  # type: Optional[int]
+        for slot, (index, size) in enumerate(zip(visible, body)):
+            pane, state, lines = panes[index], states[index], shown[index]
             if size < 0:
                 continue
-            chrome = 1 + (1 if pane.header is not None else 0)
-            hits = draw_pane(canvas, row, chrome + size, pane, state, index == view.focus, lines)
-            self.hits.extend((r, index, i) for r, i in hits)
+            chrome = (1 + (1 if pane.header is not None else 0)) if pane.frame else 0
+            tabs = None
+            tab_hits = []  # type: List[Tuple[int, int, Any]]
+            if pane.group and len(members[pane.group]) > 1:
+                tabs = [(panes[i], i == index) for i in members[pane.group]]
+            hits = draw_pane(canvas, row, chrome + size, pane, state, index == view.focus,
+                             lines, edge, glyphs, tabs, tab_hits)
+            for start, end, pane_id in tab_hits:
+                target = next((i for i in members.get(pane.group or "", ()) if
+                               panes[i].id == pane_id), None)
+                if target is not None:
+                    self.group_hits.append((row, start, end, target))
+            for hit in hits:
+                self.hits.append((hit[0], index, hit[1]) + tuple(hit[2:]))
+            if pane.frame:
+                edge = "join"
+                last_framed = index
+            else:
+                edge = "top"
             row += chrome + size
+        if framed and row < height - 1:
+            close_box(canvas, row, glyphs, last_framed == view.focus)
         self._footer(canvas)
         self._last = (panes, states, shown)
         self._last_view, self._width = view, width
@@ -262,77 +310,119 @@ class App:
     def _header(self, canvas: Canvas, ctx: Context) -> None:
         width = canvas.width
         name = ctx.snap.cluster.name if ctx.snap and ctx.snap.cluster.name else "slurm"
-        col = canvas.put(0, 0, name + " ", RESOURCE)
-        if self.anonymized:
-            col = canvas.put(0, col, "ANON", BAD) + 1
-        long_tabs = width >= 110
-        self.tab_hits = []
         root = self.stack[0].kind
-        for kind, title, short, _ in TABS:
-            label = title if long_tabs else short
-            start = col
-            col = canvas.put(0, col, label, TAB if kind == root else DIM)
-            self.tab_hits.append((start, col, kind))
-            col += 1
+        crumbs = [v.title for v in self.stack[1:]]
         age = None
         if self.snapshot is not None:
             age = time.time() - self.snapshot.taken_at
-        col = canvas.put(0, col, "│ ", DIM)
-        col = canvas.put(0, col, "%s · %s" % (self.range, fmt.age(age) if age is not None
-                                               else "?"), PLAIN)
-        if self.history_mode != "full":
-            col = canvas.put(0, col, " · history " + self.history_mode, WARN)
-        if self.data.progress and not self.no_history:
-            col = canvas.put(0, col, " · history ", DIM)
-            if self.data.fraction is not None:
-                col = canvas.put(0, col, fmt.bar(self.data.fraction, 6, self.ascii), WARN)
-                col = canvas.put(0, col, " ", DIM)
-            col = canvas.put(0, col, self.data.progress, WARN)
-        elif self.loader.busy:
-            col = canvas.put(0, col, " …", DIM)
-        crumbs = " › ".join(v.title for v in self.stack)
-        room = width - col - 3
-        if room > 4 and len(self.stack) > 1:
-            if fmt.width(crumbs) > room:
-                crumbs = "…" + crumbs[-(room - 1):]
-            canvas.put(0, col, " │ ", DIM)
-            canvas.put(0, col + 3, crumbs, HEAD)
+
+        # the right side, richest first: every range with the chosen one marked, then
+        # only the chosen one
+        def right(full: bool) -> List[Tuple[str, str]]:
+            parts = []  # type: List[Tuple[str, str]]
+            if self.data.progress and not self.no_history:
+                parts.append(("history ", DIM))
+                if self.data.fraction is not None:
+                    parts += charts.gauge(self.data.fraction, 6, self.ascii, ACCENT)
+                    parts.append((" ", PLAIN))
+                parts += [(self.data.progress, DIM), ("  ", PLAIN)]
+            elif self.loader.busy:
+                parts += [("…", DIM), ("  ", PLAIN)]
+            if self.history_mode != "full":
+                parts += [("history " + self.history_mode, WARN), ("  ", PLAIN)]
+            if full:
+                for number, option in enumerate(hd.RANGE_NAMES):
+                    if number:
+                        parts.append((" ", PLAIN))
+                    parts.append((option, KEY if option == self.range else FAINT))
+            else:
+                parts.append((self.range, KEY))
+            parts += [("  ", PLAIN), (fmt.age(age) if age is not None else "?", DIM), (" ", PLAIN)]
+            return parts
+
+        def tabs(long: bool) -> List[Tuple[str, str, str]]:
+            out = []
+            for kind, title, short, _ in TABS:
+                out.append((" %s " % (title if long else short),
+                            TAB if kind == root else DIM, kind))
+            return out
+
+        lead = [(" ◆ ", ACCENT), (name, bold(RESOURCE)), (" ", PLAIN)]
+        if self.anonymized:
+            lead += [("ANON", bold(BAD)), (" ", PLAIN)]
+        lead.append((" ", PLAIN))
+        trail = [(" › " + " › ".join(crumbs), HEAD)] if crumbs else []
+        options = [(True, True), (False, True), (True, False), (False, False)]
+        for long_tabs, full_range in options:
+            tab_parts = tabs(long_tabs)
+            used = (charts.width(lead) + sum(fmt.width(t) for t, _, _ in tab_parts)
+                    + charts.width(right(full_range)))
+            need = min(24, fmt.width(trail[0][0])) if crumbs else 0
+            if width - used - 1 >= need:
+                break
+        col = canvas.segments(0, 0, lead)
+        self.tab_hits = []
+        for text, style, kind in tab_parts:
+            start = col
+            col = canvas.put(0, col, text, style)
+            self.tab_hits.append((start, col, kind))
+        right_parts = right(full_range)
+        right_width = charts.width(right_parts)
+        if crumbs:
+            room = width - col - right_width - 1
+            text = trail[0][0]
+            if room > 4:
+                if fmt.width(text) > room:
+                    text = "…" + text[-(room - 1):]
+                canvas.put(0, col, text, HEAD)
+        canvas.segments(0, max(col, width - right_width), right_parts)
 
     def _footer(self, canvas: Canvas) -> None:
         row = canvas.height - 1
         if self.input is not None:
-            col = canvas.put(row, 0, "filter: ", HEAD)
+            col = canvas.put(row, 0, " / ", KEY)
+            col = canvas.put(row, col, "filter ", DIM)
             text = "".join(self.input)
             # the previous filter is selected: typing replaces it
-            col = canvas.put(row, col, text, SELECTED if self._replace and text else PLAIN)
-            col = canvas.put(row, col, "▏", PLAIN)
-            canvas.put(row, col + 1, "filters as you type · Enter keep · Esc cancel · "
-                                     "Ctrl-U clear", DIM)
+            col = canvas.put(row, col, text, on(PLAIN, SEL) if self._replace and text
+                             else bold(PLAIN))
+            col = canvas.put(row, col, "▏", ACCENT)
+            canvas.segments(row, col + 2, [("filters as you type  ", DIM), ("↵", KEY),
+                                           (" keep  ", DIM), ("esc", KEY), (" cancel  ", DIM),
+                                           ("^U", KEY), (" clear", DIM)])
             return
         flash = self._flash
         if flash is not None and (self.message != flash[0] or time.time() >= flash[1]):
             if self.message == flash[0]:
                 self.message = ""
             self._flash = None
-        specific = FOOTERS.get(self.view.kind, "")
-        items = ["↵ open", "esc back", "tab pane", "/ filter", "s sort", "[ ] range",
-                 "r refresh", "O settings", "? help", "q quit"]
-        if specific and specific != "↵ open":
-            items[3:3] = specific.split(" · ")
-        must = {"? help", "q quit", "esc back"}
-        room = canvas.width - 1 - (fmt.width(self.message) + 3 if self.message else 0)
+        items = [("↵", "open"), ("esc", "back"), ("tab", "pane"), ("/", "filter"),
+                 ("s", "sort"), ("[ ]", "range"), ("r", "refresh"), ("O", "settings"),
+                 ("?", "help"), ("q", "quit")]
+        specific = [item for item in FOOTERS.get(self.view.kind, ()) if item[0] != "↵"]
+        items[3:3] = specific
+        must = {"?", "q", "esc"}
+        room = canvas.width - 1 - (fmt.width(self.message) + 5 if self.message else 0)
+
+        def size(chosen: List[Tuple[str, str]]) -> int:
+            return sum(fmt.width(k) + 1 + fmt.width(d) for k, d in chosen) + 2 * len(chosen)
+
         chosen = list(items)
-        while chosen and fmt.width(" · ".join(chosen)) > room:
-            drop = next((i for i in range(len(chosen) - 1, -1, -1) if chosen[i] not in must),
+        while chosen and size(chosen) > room:
+            drop = next((i for i in range(len(chosen) - 1, -1, -1) if chosen[i][0] not in must),
                         None)
             if drop is None:
                 break
             del chosen[drop]
         col = 0
         if self.message:
-            col = canvas.put(row, 0, self.message, WARN) + 1
-            col = canvas.put(row, col, "│ ", DIM)
-        canvas.put(row, col, " · ".join(chosen), DIM)
+            col = canvas.put(row, 1, "● ", WARN)
+            col = canvas.put(row, col, self.message, WARN) + 1
+            col = canvas.put(row, col, "│", FAINT)
+        col += 1
+        for key, what in chosen:
+            col = canvas.put(row, col, key, KEY)
+            col = canvas.put(row, col, " " + what + "  ", DIM)
 
     # -- input -------------------------------------------------------------------
 
@@ -870,19 +960,28 @@ class App:
             rows.append(("X  clear cache (asks first)", PLAIN))
         rows.append(("", PLAIN))
         rows.append(("O or Esc closes", DIM))
-        inner = min(canvas.width - 4, max(fmt.width(t) for t, _ in rows) + 2)
-        height = min(canvas.height - 2, len(rows) + 2)
+        inner = min(canvas.width - 4, max(fmt.width(t) for t, _ in rows[1:]) + 4)
+        height = min(canvas.height - 2, len(rows) + 1)
         if inner < 10 or height < 4:
             return
         top = max(1, (canvas.height - height) // 2)
         left = max(0, (canvas.width - inner - 2) // 2)
-        canvas.put(top, left, "┌" + "─" * inner + "┐", HEAD)
+        glyphs = theme.box(self.ascii)
+        title = " Settings "
+        canvas.put(top, left, glyphs.tl + glyphs.h + " " * len(title)
+                   + glyphs.h * max(0, inner - 1 - len(title)) + glyphs.tr, ACCENT)
+        canvas.put(top, left + 2, title, KEY)
         for number in range(height - 2):
             row = top + 1 + number
-            text, style = rows[number] if number < len(rows) else ("", PLAIN)
-            canvas.put(row, left, "│" + " " * inner + "│", HEAD)
-            canvas.put(row, left + 2, text, style, limit=inner - 2)
-        canvas.put(top + height - 1, left, "└" + "─" * inner + "┘", HEAD)
+            text, style = rows[number + 1] if number + 1 < len(rows) else ("", PLAIN)
+            canvas.put(row, left, glyphs.v + " " * inner + glyphs.v, ACCENT)
+            canvas.restyle(row, left + 1, left + 1 + inner, PLAIN)
+            if len(text) > 3 and text[0] != " " and text[1:3] == "  ":
+                canvas.put(row, left + 2, text[0], KEY)
+                canvas.put(row, left + 3, text[1:], style, limit=inner - 3)
+            else:
+                canvas.put(row, left + 2, text, style, limit=inner - 2)
+        canvas.put(top + height - 1, left, glyphs.bl + glyphs.h * inner + glyphs.br, ACCENT)
 
     # -- mouse -------------------------------------------------------------------
 
@@ -896,8 +995,15 @@ class App:
                 if start <= x < end:
                     self.go_tab(kind)
             return
+        for row, start, end, pane in getattr(self, "group_hits", ()):
+            if row == y and start <= x < end:
+                self.view.focus = pane
+                return
         now = time.time()
-        for row, pane, line in self.hits:
+        for hit in self.hits:
+            row, pane, line = hit[:3]
+            if len(hit) > 3 and not hit[3] <= x < hit[4]:
+                continue
             if row == y:
                 view = self.view
                 view.focus = pane

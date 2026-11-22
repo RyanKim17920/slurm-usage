@@ -15,26 +15,29 @@ library, it runs as an ordinary user, and nothing it does can change anything in
 Slurm.
 
 ```
-orion Ovw Me Nodes Queue Ppl Roles Time │ week · 53s ago
-▌Cluster now · orion ──────────────────────────────────────────────────────────── 1/5
-›GPU  20 total  14 alloc  2 free  4 unavail  █████████████████████          70%
- CPU  384 total  184 alloc  104 free  96 unavail  ██████████████▍                48%
- Nodes 4 (3 schedulable)  0 down  0 drain  0 completing
- Free largest block 2 GPUs on gpu-a01  stranded GPUs 0
- Queue 4 running  12 pending: JobArrayTaskLimit 10 · Resources 2
- Trend ─────────────────────── 1/5  util = alloc ÷ live capacity · GPU util* = peak sample·coverage
- Range GPU-h alloc  util CPU-h alloc  util GPU util*   CPU eff   ΔGPU   ΔCPU                trend
- day           283   59%        2268   25%       41%       63%  +682%  +658% ▄   ▁▁▁▁▂▁▁▁▁▁▃▄▄▄▄█
- week         1568   47%       12.7k   20%       38%       58%  +138%  +138% ▂▃▅█▃▂▁▁▃▂▁▃▂▁▂▂▁ ▂▁▁▆
- month        3883   27%       31.3k   11%       36%       55%   +50%   +50% ▂▃▅▂▃▃▂▁▂▅█▁▄▃▄▂▂█▇▅▃▆
- year         6477    4%       52.1k    2%       36%       55%    new    new                  ▆▆█
- all          6477   34%       52.1k   14%       36%       55%    n/a    n/a █▇█▆▂▂▃▄▃▂▂▁▄▆▃▂▃▃▆▆▄▄
- Accounts · week ─────────────────────────────────────────────────────────── 1/3  hours allocated
- Account              members  run  pend  GPUs       cap   GPU-h  share GPU util*    trend visible
- physics                    2    3     0    14     12/16     420  26.8%       44% ▄▁▁▂▁ ▁█ full
- visiting                   1    0     1     0         —     651  41.5%       31% ▄█▁▁▂▁ ▁ full
- biolab                     2    1    11     0         —     497  31.7%       40% ▂█▂▆▄▅▃▁ full
-↵ open · esc back · tab pane · / filter · s sort · [ ] range · r refresh · ? help · q quit
+ ◆ orion   Overview  Me  Nodes  Queue  People  Roles  Timeline     day week month year all  43s ago
+╭─ GPUs ─────────────────╮ ╭─ CPUs ─────────────────╮ ╭─ Nodes ───────────╮ ╭─ Queue ──────────────╮
+│ 14 / 20 alloc      70% │ │ 184 / 384 alloc    48% │ │ 4 nodes   3 sched │ │ 4 run  12 pend       │
+│ ███████████████▍░░░░░░ │ │ ██████████▌░░░░░░░░░░░ │ │ ● 1 drain         │ │ ████████████████████ │
+│ 2 free  4 unavail      │ │ 104 free  96 unavail   │ │ 2 free on gpu-a01 │ │ JobArrayTaskLimit 10 │
+╰────────────────────────╯ ╰────────────────────────╯ ╰───────────────────╯ ╰──────────────────────╯
+╭─ Trend ─────────────────────────────────────────────────────────────────── 1/5  ≥ partly loaded ─╮
+│ Range    GPU-h   util    ΔGPU    CPU-h   util    ΔCPU                                      trend │
+│ day        274    57%   ▲698%     2189    24%   ▲673%                   ▆▂     ▁▁▁▁▂▂▁▁▁▁▃▇▇▇███ │
+│ week      1552    46%   ▲136%    12.5k    19%   ▲136%               ▂▂▃██▄▂▁▁▁▃▂▂▁▃▂▂▂▂▂▂ ▁▁▂▁▂▆ │
+│ month    ≥3875   ≥27%       ?   ≥31.2k   ≥11%       ?               ▂▃▃▄▂▃▁▂▂▁▁▂▅█▁▄▂▂▃▃▂▁█▇▃▃▃▆ │
+│ year     ≥3901   ≥27%       ?   ≥31.5k   ≥11%       ?                                        ▂▅█ │
+│ all      ≥3901   ≥27%     n/a   ≥31.5k   ≥11%     n/a               ▁▂▃▃▄▂▃▁▂▂▁▂▅▆▄▂▄▂▄▃▂▁██▃▄▃▆ │
+├─ Accounts · week ────────────────────────────────────────────────────────────────────────── 1/3 ─┤
+│ Account                 run pend GPUs     cap GPU-h▼  share members                        trend │
+│ visiting                  0    1    0       —    651  41.2%       1   ▂██▄  ▁  ▁  ▄    ▂▁    ▁▁  │
+│ biolab                    1   11    0       —    499  31.6%       2   ▂▇▆▂▄▂▁ █▃▁▁ ▅▃▃▃▂▃  ▁▄  ▁ │
+│ physics                   3    0   14   12/16    430  27.2%       2 ▂▃▂   ▁ ▁▁ ▂▂  ▁▁     ▁▁ ▁▁█ │
+├─ Warnings (3) ───────────────────────────────────────────────────────────────────────────── 1/6 ─┤
+│ gres/gpu capacity differs: nodes have 20, the accounting database records 24; live totals use    │
+│ the nodes                                                                                       ▼│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+ ↵ open  esc back  tab pane  / filter  s sort  [ ] range  r refresh  O settings  ? help  q quit
 ```
 
 Every screen in this README is made from invented data (the cluster `orion`,
@@ -155,13 +158,13 @@ under the cursor, `Esc` goes back up the breadcrumb.
 | Key | Screen | What it shows |
 | --- | --- | --- |
 | `o` | Overview | GPUs, CPUs, nodes and the queue now; usage per range against the previous equal period, with trend sparklines; accounts; warnings |
-| `m` | Me | your own page: trend per range, what is running now, kinds of runs, events, roles, daily activity, your jobs |
+| `m` | Me | your own page: trend per range, what is running now, kinds of runs, and one box with tabs (`Tab` moves through them) for events, your jobs, daily activity and roles |
 | `n` | Nodes | every node: state, partitions, CPUs, memory and GPUs in use, load, drain reason |
 | `j` | Queue | running and pending jobs with resources, time and the pending reason |
 | `p` | People | usage per person in the range, with running and pending counts |
 | `a` | Roles | usage by account, QOS or partition (`g` switches), with limits |
 | `t` | Timeline | GPU (or, with `c`, CPU) usage over the range in lanes by user, account, QOS or partition |
-| `?` | Help | keys, colors, placeholders and a glossary |
+| `?` | Help | keys, colors, placeholders and a glossary (what every column means) |
 
 Drilling down: an account leads to its people, a person to their page, a node
 to its jobs, and any job to **Job detail**: request, timing, every attempt with
@@ -171,21 +174,22 @@ scroll (the pane header then says `N of M`), and filtering one searches all of
 the loaded history, not only the rows on screen.
 
 ```
-▌Job 103 · eval_ckpt ───────────────────────────────────────────────────────── 1/8
- who       bob  account physics  qos normal  partition gpu
- state     RUNNING
- request   96 CPUs  8 GPUs  768G mem  limit 1d00h
- nodes     gpu-a02
- timing    submit 04:05  start 04:10  end n/a
-           waited 5m00s  elapsed 2h00m  limit used 8%
- Steps ──────────────────────────────────────────── 1/1  GPU util* = % per allocated GPU
- Step       name             state       elapsed tasks CPU eff  max RSS GPU util*  GPU mem
- 0          python           RUNNING      20m00s     4     31%      12G       88%      n/a
- Logs ──────────────────────────────────────────────────────────────────────────── 1/4
- workdir /home/bob/project  [exists]
- stdout  /home/bob/project/out-103.log  [exists · being written]
- paths as Slurm recorded them; checked with os.stat, never read
- keys    l/e stdout/stderr tail · b batch script · u submit line (on request)
+ ◆ orion   Ovw  Me  Nodes  Queue  Ppl  Roles  Time  › job 103  day week month year all  now
+╭─ Job 103 · eval_ckpt ────────────────────────────────────────────────────────────────────╮
+│ who        bob · physics · qos normal · partition gpu                                    │
+│ state      RUNNING                                                                       │
+│ request    8 GPUs · 96 CPUs · 768G mem                                                   │
+│ nodes      gpu-a02                                                                       │
+│ timing     submit 17:22 · start 17:27 · end n/a                                          │
+│ elapsed    2h00m of 1d00h  █▋░░░░░░░░░░░░░░░░░░ 8% · waited 5m00s                        │
+├─ Steps (1)  Attempts (0) ────────────────────────────────────────────────────────────────┤
+│ Step       name            state       elapsed tasks CPU eff  max RSS GPU util*  GPU mem │
+│ 0          python          RUNNING      20m00s     4     31%      12G       11%      n/a │
+├─ Logs ─────────────────────────────────────────── 1/2  l out  e err  b script  u submit ─┤
+│ workdir /home/bob/project  ● gone (from this host)                                       │
+│ stdout  /home/x/out-103.log  ● gone (from this host)                                     │
+╰──────────────────────────────────────────────────────────────────────────────────────────╯
+ ↵ open  esc back  tab pane  l e b u fetch  / filter  s sort  [ ] range  ? help  q quit
 ```
 
 ### Keys

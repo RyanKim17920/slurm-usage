@@ -7,7 +7,8 @@ from typing import Any, Dict, Optional
 
 from .app import App
 from .fmt import width
-from .canvas import BAD, DIM, GOOD, HEAD, PLAIN, RESOURCE, SELECTED, TAB, USER, WARN, Canvas
+from . import theme
+from .canvas import Canvas
 
 _KEYS = {
     curses.KEY_UP: "UP", curses.KEY_DOWN: "DOWN", curses.KEY_LEFT: "LEFT",
@@ -19,35 +20,77 @@ _KEYS = {
 }
 
 
-def _attrs(use_color: bool) -> Dict[str, int]:
-    base = {PLAIN: curses.A_NORMAL, HEAD: curses.A_BOLD, SELECTED: curses.A_REVERSE,
-            TAB: curses.A_REVERSE | curses.A_BOLD, DIM: curses.A_DIM, RESOURCE: curses.A_NORMAL,
-            USER: curses.A_NORMAL, GOOD: curses.A_NORMAL, WARN: curses.A_BOLD,
-            BAD: curses.A_BOLD | curses.A_UNDERLINE}
-    if not use_color:
-        return base
-    try:
-        curses.start_color()
-        curses.use_default_colors()
-        background = -1
-    except curses.error:
-        return base
-    amber = 214 if curses.COLORS >= 256 else curses.COLOR_YELLOW
-    gray = 244 if curses.COLORS >= 256 else curses.COLOR_WHITE
-    pairs = {RESOURCE: curses.COLOR_CYAN, USER: curses.COLOR_MAGENTA, GOOD: curses.COLOR_GREEN,
-             WARN: amber, BAD: curses.COLOR_RED, DIM: gray}
-    for number, (style, color) in enumerate(pairs.items(), start=1):
+class Attrs:
+    """curses attributes for style strings, made on first use (one color pair per
+    foreground/background combination the screens actually draw)."""
+
+    def __init__(self, use_color: bool) -> None:
+        self.depth = "mono"
+        self._cache = {}  # type: Dict[str, int]
+        self._pairs = {}  # type: Dict[Any, int]
+        if not use_color:
+            return
         try:
-            curses.init_pair(number, color, background)
-            base[style] = curses.color_pair(number) | (curses.A_BOLD if style == BAD else 0)
-            if style == DIM and curses.COLORS < 256:
-                base[style] |= curses.A_DIM
+            curses.start_color()
+            curses.use_default_colors()
         except curses.error:
-            pass
-    return base
+            return
+        self.depth = theme.detect_depth(getattr(curses, "COLORS", 0), True)
+
+    def get(self, style: str) -> int:
+        found = self._cache.get(style)
+        if found is None:
+            found = self._cache[style] = self._make(style)
+        return found
+
+    def _make(self, style: str) -> int:
+        look = theme.resolve(style)
+        if look.bg == "band" and not theme.backgrounds_shown(self.depth):
+            look = look._replace(bg=None)  # a tint only: nothing to say without it
+        attr = curses.A_BOLD if look.bold else curses.A_NORMAL
+        if self.depth == "mono" or (look.bg and not theme.backgrounds_shown(self.depth)):
+            if look.dim:
+                attr |= curses.A_DIM
+            if look.underline and self.depth == "mono":
+                attr |= curses.A_UNDERLINE
+            if look.bg == "sel":
+                return curses.A_REVERSE  # the selected row: reverse video, plain
+            if look.bg:
+                return attr | curses.A_REVERSE | curses.A_BOLD
+            if self.depth == "mono":
+                return attr
+        fg, dim = (-1, False) if look.fg is None else theme.color_number(look.fg, self.depth)
+        bg = -1
+        if look.bg and theme.backgrounds_shown(self.depth):
+            bg = theme.color_number(theme.BACKGROUNDS[look.bg], self.depth)[0]
+        if dim:
+            attr |= curses.A_DIM
+        if fg == -1 and bg == -1:
+            return attr
+        return attr | self._pair(fg, bg)
+
+    def _pair(self, fg: int, bg: int) -> int:
+        number = self._pairs.get((fg, bg))
+        if number is None:
+            number = len(self._pairs) + 1
+            try:
+                if number >= getattr(curses, "COLOR_PAIRS", 64):
+                    raise curses.error("out of color pairs")
+                curses.init_pair(number, fg, bg)
+            except (curses.error, ValueError, OverflowError):
+                if self.depth == "truecolor":  # no extended pairs here: use the 256 mapping
+                    self.depth = "256"
+                    self._cache.clear()
+                return 0
+            self._pairs[(fg, bg)] = number
+        return curses.color_pair(number)
 
 
-def _blit(screen: Any, canvas: Canvas, attrs: Dict[str, int]) -> None:
+def _attrs(use_color: bool) -> "Attrs":
+    return Attrs(use_color)
+
+
+def _blit(screen: Any, canvas: Canvas, attrs: Attrs) -> None:
     screen.erase()
     for row in range(canvas.height):
         col = 0
@@ -56,7 +99,7 @@ def _blit(screen: Any, canvas: Canvas, attrs: Dict[str, int]) -> None:
             if row == canvas.height - 1 and col + size >= canvas.width:
                 text = text[: max(0, canvas.width - col - 1)]  # the last cell scrolls the screen
             try:
-                screen.addstr(row, col, text, attrs.get(style, 0))
+                screen.addstr(row, col, text, attrs.get(style))
             except curses.error:
                 pass
             col += size
