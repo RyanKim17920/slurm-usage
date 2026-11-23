@@ -446,6 +446,202 @@ def events(rows: Sequence[Any], range_name: str, now: Optional[float] = None,
     return found[:limit]
 
 
+# -- one range in detail ---------------------------------------------------------
+
+HOUR = 3600
+# how a range is binned for its detail chart: day hourly, week by three hours, month
+# daily, year weekly; all of history weekly, or monthly once it spans years
+BIN_UNITS = {"day": "hour", "week": "3hour", "month": "day", "year": "week"}
+UNIT_SECONDS = {"hour": HOUR, "3hour": 3 * HOUR, "day": DAY, "week": 7 * DAY,
+                "month": 30 * DAY}
+UNIT_WORDS = {"hour": "hour", "3hour": "3 hours", "day": "day", "week": "week",
+              "month": "month"}
+
+
+def bin_unit(range_name: str, start: Optional[int] = None, end: Optional[int] = None) -> str:
+    unit = BIN_UNITS.get(range_name)
+    if unit is not None:
+        return unit
+    span = (end - start) if start is not None and end is not None else 0
+    if span <= 45 * DAY:
+        return "day"
+    return "week" if span <= 3 * 365 * DAY else "month"
+
+
+_UNIT_ORDER = ("hour", "3hour", "day", "week", "month")
+
+
+def chart_unit(range_name: str, start: int, end: int, covered: int) -> str:
+    """The range's bins, finer when its history begins well inside it (a year with
+    six weeks of data is drawn by the day, not as six bars)."""
+    unit = bin_unit(range_name, start, end)
+    if covered > start + 2 * DAY:
+        short = bin_unit("all", covered, end)
+        if _UNIT_ORDER.index(short) < _UNIT_ORDER.index(unit):
+            return short
+    return unit
+
+
+def bin_edges(start: int, end: int, unit: str) -> List[int]:
+    """[start, boundaries on local clock/calendar edges..., end] for ``unit``."""
+    import datetime
+    edges = [start]
+    if end <= start:
+        return [start, start]
+    if unit in ("hour", "3hour"):
+        every = 3 if unit == "3hour" else 1
+        at = start - start % HOUR
+        while True:
+            at += HOUR
+            if at >= end:
+                break
+            if time.localtime(at).tm_hour % every == 0 and at > edges[-1]:
+                edges.append(at)
+    else:
+        first = time.localtime(start)
+        day = datetime.date(first.tm_year, first.tm_mon, first.tm_mday)
+        while True:
+            day += datetime.timedelta(days=1)
+            if unit == "week" and day.weekday() != 0:
+                continue
+            if unit == "month" and day.day != 1:
+                continue
+            at = int(time.mktime((day.year, day.month, day.day, 0, 0, 0, 0, 1, -1)))
+            if at >= end:
+                break
+            if at > edges[-1]:
+                edges.append(at)
+    edges.append(end)
+    # a sliver of a bin at either end would read as a spike or a dip: it joins its
+    # neighbour
+    nominal = UNIT_SECONDS[unit]
+    if len(edges) > 3 and edges[1] - edges[0] < nominal / 2:
+        del edges[1]
+    if len(edges) > 3 and edges[-1] - edges[-2] < nominal / 2:
+        del edges[-2]
+    return edges
+
+
+def rebin(hour_edges: Sequence[int], values: Sequence[int], edges: Sequence[int],
+          shift: int = 0) -> List[int]:
+    """Sum per-hour usage (``values`` over ``hour_edges``) into the bins ``edges`` (moved
+    back by ``shift`` seconds, for the previous period); nothing is lost or counted twice
+    as long as every bin edge is an hour edge."""
+    from bisect import bisect_right
+    out = [0] * max(0, len(edges) - 1)
+    if not out:
+        return out
+    moved = [e - shift for e in edges]
+    last = len(out) - 1
+    for at, value in enumerate(values):
+        if not value:
+            continue
+        index = bisect_right(moved, hour_edges[at]) - 1
+        out[min(last, max(0, index))] += value
+    return out
+
+
+def covered_start(total: Any, gpu_util: Optional[float], cpu_util: Optional[float],
+                  gpu_capacity: Optional[int], cpu_capacity: Optional[int], end: float,
+                  start: float) -> int:
+    """Where a utilization was measured from: its span is usage / (capacity x share).
+    (The rollup applies the capacity floor without returning it.)"""
+    for util, capacity, metric in ((gpu_util, gpu_capacity, "gpu"),
+                                   (cpu_util, cpu_capacity, "cpu")):
+        used = total.amount(metric) if total is not None else None
+        if util and capacity and used:
+            return int(round(end - used / (capacity * util)))
+    return int(start)
+
+
+def _sum_amounts() -> Any:
+    from ..history import Amounts
+    return Amounts()
+
+
+def _less(total: Any, part: Any) -> Any:
+    """``total`` minus ``part`` (Amounts), never below zero."""
+    out = _sum_amounts()
+    for name in out.__slots__:
+        setattr(out, name, max(0, getattr(total, name) - (getattr(part, name) if part else 0)))
+    return out
+
+
+def _trim(edges: List[int], series: Sequence[Optional[List[int]]], covered: int
+          ) -> Tuple[List[int], List[Optional[List[int]]]]:
+    """Bins from ``covered`` on: the ones wholly before it go (nothing was recorded
+    there), the first one starts at it. Sums are unchanged."""
+    if covered <= edges[0] or len(edges) < 3:
+        return edges, list(series)
+    drop = 0
+    while drop < len(edges) - 2 and edges[drop + 1] <= covered and not any(
+            values[drop] for values in series if values is not None):
+        drop += 1
+    edges = edges[drop:]
+    edges[0] = max(edges[0], min(covered, edges[1] - 1))
+    return edges, [None if values is None else values[drop:] for values in series]
+
+
+class RangeSeries(NamedTuple):
+    """One range for one scope (the cluster, a person, an account), binned for a chart.
+
+    ``gpu``/``cpu`` are allocated seconds per bin and sum exactly to ``total``'s; the
+    previous equal period is binned at the same offsets (None for all of history)."""
+
+    range: str
+    start: int
+    end: int
+    unit: str
+    edges: List[int]
+    gpu: Optional[List[int]]
+    cpu: Optional[List[int]]
+    prev_gpu: Optional[List[int]]
+    prev_cpu: Optional[List[int]]
+    total: Any  # history Stats
+    previous: Any  # Stats of the previous period, or None
+    complete: bool
+    previous_complete: bool
+    groups: Dict[str, List[Tuple[str, Any]]]  # role -> [(name, Stats)], largest first
+    previous_groups: Dict[str, Dict[str, Any]]
+    gpu_util: Optional[float]
+    cpu_util: Optional[float]
+    # where averages and utilization are measured from: the window's start, or later
+    # when the cluster's history begins inside it (earlier for all of history when
+    # accounting began before the first record)
+    covered: Optional[int] = None
+
+    @property
+    def since(self) -> int:
+        return self.start if self.covered is None else self.covered
+
+    def seconds(self, metric: str) -> Optional[List[int]]:
+        return self.gpu if metric == "gpu" else self.cpu
+
+    def average(self, metric: str, previous: bool = False) -> Optional[List[float]]:
+        """Mean GPUs (or CPUs) held over each bin."""
+        values = (self.prev_gpu if metric == "gpu" else self.prev_cpu) if previous \
+            else self.seconds(metric)
+        if values is None:
+            return None
+        edges = self.edges
+        return [v / float(edges[i + 1] - edges[i]) if edges[i + 1] > edges[i] else 0.0
+                for i, v in enumerate(values)]
+
+    def mean(self, metric: str) -> Optional[float]:
+        """Mean GPUs (or CPUs) held over the covered span: the same span utilization
+        is measured over, so mean / capacity is the utilization."""
+        total = self.total.amount(metric) if self.total is not None else None
+        span = self.end - self.since
+        return total / float(span) if total is not None and span > 0 else None
+
+    def peak(self, metric: str) -> Tuple[Optional[int], Optional[float]]:
+        values = self.average(metric)
+        if not values:
+            return None, None
+        index = max(range(len(values)), key=lambda i: (values[i], i))
+        return index, values[index]
+
+
 # -- the adapter ---------------------------------------------------------------
 
 def _efficiency(stats: Any, metric: str) -> Any:
@@ -704,6 +900,124 @@ class HistoryData:
                         previous.gpu_hours if loaded else None,
                         previous.cpu_hours if loaded else None, spark, bool(summary.complete),
                         total.attempts, total.attempts, loaded or summary.name == "all")
+
+    def range_series(self, range_name: str, filt: Any = None, roles: Sequence[str] = (),
+                     win: Any = None, gpu_capacity: Optional[int] = None,
+                     cpu_capacity: Optional[int] = None) -> RangeSeries:
+        """``range_name`` in detail: per-bin usage now and in the previous equal period,
+        totals, utilization and the ``roles`` ranked (each against the previous period)."""
+        groups = tuple((role,) for role in roles)
+        report = self.report(range_name, filt, group_by=groups, win=win, efficiency=False)
+        start, end = report.start, report.end
+        # the span utilization counts (Report.utilization): from the capacity floor
+        floor = getattr(report, "floor", None)
+        covered = start if floor is None else max(start, floor)
+        if getattr(report.window, "start", 0) is None and floor is not None:
+            covered = min(start, floor)
+        unit = chart_unit(range_name, start, end, covered)
+        edges = bin_edges(start, end, unit)
+        values = getattr(report, "values", None) or {}
+        hours = getattr(report, "edges", None) or []
+
+        def binned(source: Any, metric: str, shift: int = 0) -> Optional[List[int]]:
+            found = (getattr(source, "values", None) or {}).get(metric)
+            if found is None or source.total.amount(metric) is None:
+                return None
+            return rebin(source.edges, found, edges, shift)
+
+        gpu, cpu = binned(report, "gpu"), binned(report, "cpu")
+        previous = prev_gpu = prev_cpu = None
+        previous_complete, previous_groups = False, {}  # type: bool, Dict[str, Dict[str, Any]]
+        length = _SECONDS.get(range_name)
+        if length is not None and hours:
+            try:
+                before = self.report(range_name, filt, group_by=groups, efficiency=False,
+                                     win=Window(start - (end - start), start))
+            except HistoryError:
+                before = None
+            if before is not None:
+                previous, previous_complete = before.total, bool(before.complete)
+                shift = end - start
+                prev_gpu, prev_cpu = binned(before, "gpu", shift), binned(before, "cpu", shift)
+                for role in roles:
+                    previous_groups[role] = {key[0]: stats for key, stats
+                                             in before.group(role).items()}
+        ranked = {}  # type: Dict[str, List[Tuple[str, Any]]]
+        for role in roles:
+            ranked[role] = [(key[0], stats) for key, stats in report.ranked(role)]
+        gpu_util = report.utilization(gpu_capacity, "gpu").fraction if gpu_capacity else None
+        cpu_util = report.utilization(cpu_capacity, "cpu").fraction if cpu_capacity else None
+        edges, (gpu, cpu, prev_gpu, prev_cpu) = _trim(edges, (gpu, cpu, prev_gpu, prev_cpu),
+                                                      covered)
+        return RangeSeries(range_name, start, end, unit, edges, gpu, cpu, prev_gpu, prev_cpu,
+                           report.total, previous, bool(report.complete), previous_complete,
+                           ranked, previous_groups, gpu_util, cpu_util, covered)
+
+    def rollup_series(self, range_name: str, gpu_capacity: Optional[int] = None,
+                      cpu_capacity: Optional[int] = None) -> Optional[RangeSeries]:
+        """The whole cluster's range from the hourly rollup (the overview's own figures,
+        in a fraction of a second where a full query of a busy year takes many); None
+        when this history keeps no rollup."""
+        if not self.has("overview"):
+            return None
+        length = _SECONDS[range_name]
+        ranges = [(range_name, length)]
+        if length is not None:
+            ranges.append(("twice", 2 * length))  # its first half is the previous period
+        found = self.history.overview(gpu_capacity=gpu_capacity, cpu_capacity=cpu_capacity,
+                                      ranges=ranges)
+        if found is None or not found.ranges:
+            return None
+        summary = found.ranges[0]
+        twice = found.ranges[1] if len(found.ranges) > 1 else None
+        start, end, step = summary.start, summary.end, summary.series_step
+        count = len(summary.gpu_series)
+        source = [end - (count - i) * step for i in range(count + 1)]
+        if source:
+            source[0] = max(source[0], min(start, end))
+        covered = covered_start(summary.total, summary.gpu_utilization,
+                                summary.cpu_utilization, gpu_capacity, cpu_capacity, end, start)
+        unit = chart_unit(range_name, start, end, covered)
+        if unit == "day" and step == DAY and len(source) > 1:
+            edges = list(source)  # whole days as the rollup keeps them
+        else:
+            edges = bin_edges(start, end, unit)
+        gpu = rebin(source, summary.gpu_series, edges)
+        cpu = rebin(source, summary.cpu_series, edges)
+        prev_gpu = prev_cpu = None
+        previous_complete = False
+        users = {}  # type: Dict[str, Any]
+        for item in summary.accounts.values():
+            for user, amounts in item.users.items():
+                users.setdefault(user, _sum_amounts()).add(amounts)
+        previous_groups = {"account": {name: item.previous for name, item
+                                       in summary.accounts.items() if item.previous is not None},
+                           "user": {}}  # type: Dict[str, Dict[str, Any]]
+        if twice is not None and length is not None:
+            previous_complete = bool(twice.complete)
+            older = len(twice.gpu_series) - count
+            if older > 0 and twice.series_step == step:
+                back = [e - length for e in source]
+                prev_gpu = rebin(back, twice.gpu_series[:older][-count:], edges, length)
+                prev_cpu = rebin(back, twice.cpu_series[:older][-count:], edges, length)
+            both = {}  # type: Dict[str, Any]
+            for item in twice.accounts.values():
+                for user, amounts in item.users.items():
+                    both.setdefault(user, _sum_amounts()).add(amounts)
+            for user, amounts in both.items():
+                previous_groups["user"][user] = _less(amounts, users.get(user))
+        ranked = {
+            "account": sorted(((name, item.amounts) for name, item in summary.accounts.items()),
+                              key=lambda p: (-p[1].gpu_seconds, -p[1].cpu_seconds, p[0])),
+            "user": sorted(users.items(), key=lambda p: (-p[1].gpu_seconds,
+                                                          -p[1].cpu_seconds, p[0])),
+        }
+        edges, (gpu, cpu, prev_gpu, prev_cpu) = _trim(edges, (gpu, cpu, prev_gpu, prev_cpu),
+                                                      covered)
+        return RangeSeries(range_name, start, end, unit, edges, gpu, cpu, prev_gpu, prev_cpu,
+                           summary.total, summary.previous, bool(summary.complete),
+                           previous_complete, ranked, previous_groups,
+                           summary.gpu_utilization, summary.cpu_utilization, covered)
 
     def spark(self, range_name: str, filt: Any = None) -> Optional[List[float]]:
         report = self.report(range_name, filt, efficiency=False)

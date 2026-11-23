@@ -343,7 +343,7 @@ class NoColorTest(unittest.TestCase):
                 if not chunk:
                     break
                 out += chunk
-            if not sent and (b"Trend" in out or time.time() - start > 8):
+            if not sent and (b"in use" in out or time.time() - start > 8):
                 os.write(fd, b"q")
                 sent = True
         try:
@@ -352,7 +352,7 @@ class NoColorTest(unittest.TestCase):
             pass
         os.waitpid(pid, 0)
         os.close(fd)
-        self.assertIn(b"Trend", out)
+        self.assertIn(b"in use", out)
         for code in (b"\x1b[37m", b"\x1b[40m", b"\x1b[39;49m\x1b[37m"):
             self.assertFalse(code in out, code)
         import re

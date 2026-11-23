@@ -25,7 +25,7 @@ from .filestat import check as stat_path
 from .filestat import script_from_submit_line
 from .loader import Loader
 from .screens import FOOTERS, LANE_GROUPS, ROLE_GROUPS, SCREENS, TABS, Context, View
-from .widgets import PaneState, allocate, close_box, draw_pane, visible_lines
+from .widgets import PaneState, Target, allocate, close_box, draw_pane, visible_lines
 
 ACTIVE_REFRESH = 30.0
 MAX_REFRESH = 300.0
@@ -203,7 +203,13 @@ class App:
     def push(self, kind: str, params: Dict[str, Any], title: str) -> None:
         if len(self.stack) > 40:
             del self.stack[1:2]
+        if kind == "range" and params.get("range") in hd.RANGE_NAMES:
+            self.set_range(params["range"])  # range detail opens on the range clicked
         self.stack.append(View(kind, params, title))
+
+    def step_range(self, step: int) -> None:
+        index = hd.RANGE_NAMES.index(self.range) + step
+        self.set_range(hd.RANGE_NAMES[max(0, min(len(hd.RANGE_NAMES) - 1, index))])
 
     def back(self) -> None:
         if len(self.stack) > 1:
@@ -212,6 +218,9 @@ class App:
     def set_range(self, name: str) -> None:
         if name != self.range:
             self.range = name
+            view = self.stack[-1] if self.stack else None
+            if view is not None and view.kind == "range" and " · " in view.title:
+                view.title = name.capitalize() + " · " + view.title.split(" · ", 1)[1]
             self.message = "range: " + name
             prioritize = getattr(self.data, "prioritize", None)
             if prioritize is not None and not self.no_history:
@@ -220,8 +229,8 @@ class App:
 
     # -- drawing -------------------------------------------------------------------
 
-    def panes(self, width: int) -> Tuple[Context, List[Any]]:
-        ctx = Context(self, width)
+    def panes(self, width: int, height: Optional[int] = None) -> Tuple[Context, List[Any]]:
+        ctx = Context(self, width, height if height is not None else self._height)
         builder = SCREENS.get(self.view.kind, SCREENS["overview"])
         return ctx, builder(ctx, self.view)
 
@@ -230,7 +239,9 @@ class App:
         if width < 20 or height < 5:
             canvas.put(0, 0, "too small" if width < 18 else "terminal too small", BAD)
             return
-        ctx, panes = self.panes(width)
+        self._height = height
+        self.click_targets = []  # (row, start, end, Target or ("range", name)) drawn this frame
+        ctx, panes = self.panes(width, height)
         self._header(canvas, ctx)
         view = self.view
         focusable = [i for i, p in enumerate(panes) if p.focusable] or [0]
@@ -243,6 +254,8 @@ class App:
         states = [view.panes.setdefault(p.id, PaneState()) for p in panes]
         shown = [visible_lines(p, s) for p, s in zip(panes, states)]
         self._reselect(view, panes, states, shown)
+        for pane, state, lines in zip(panes, states, shown):
+            keep_selection(pane, state, lines)
         # a group shows one of its panes: the focused one, else the one last focused
         visible = []  # type: List[int]
         members = {}  # type: Dict[str, List[int]]
@@ -262,8 +275,8 @@ class App:
             visible.append(index)
         framed = any(panes[i].frame for i in visible)
         focus_at = visible.index(view.focus) if view.focus in visible else 0
-        counts = [panes[i].fixed or len(shown[i]) if panes[i].draw is not None and
-                  not panes[i].frame else len(shown[i]) for i in visible]
+        counts = [panes[i].fixed or len(shown[i]) if panes[i].draw is not None
+                  else len(shown[i]) for i in visible]
         room = height - 2 - (1 if framed else 0)
         body = allocate([panes[i] for i in visible], counts, room, focus_at)
         self._page = max(1, body[focus_at] if 0 <= focus_at < len(body) else 10)
@@ -299,6 +312,9 @@ class App:
             row += chrome + size
         if framed and row < height - 1:
             close_box(canvas, row, glyphs, last_framed == view.focus)
+        for state, lines in zip(states, shown):
+            at = state.cursor
+            state.mark = (at, lines[at].key) if 0 <= at < len(lines) else None
         self._footer(canvas)
         self._last = (panes, states, shown)
         self._last_view, self._width = view, width
@@ -318,8 +334,8 @@ class App:
 
         # the right side, richest first: every range with the chosen one marked, then
         # only the chosen one
-        def right(full: bool) -> List[Tuple[str, str]]:
-            parts = []  # type: List[Tuple[str, str]]
+        def right(full: bool, clock: bool = True) -> List[Tuple[Any, ...]]:
+            parts = []  # type: List[Tuple[Any, ...]]
             if self.data.progress and not self.no_history:
                 parts.append(("history ", DIM))
                 if self.data.fraction is not None:
@@ -334,11 +350,12 @@ class App:
                 for number, option in enumerate(hd.RANGE_NAMES):
                     if number:
                         parts.append((" ", PLAIN))
-                    parts.append((option, KEY if option == self.range else FAINT))
+                    parts.append((option, KEY if option == self.range else FAINT, option))
             else:
-                parts.append((self.range, KEY))
-            parts += [("  ", PLAIN), (fmt.age(age) if age is not None else "?", DIM), (" ", PLAIN)]
-            return parts
+                parts.append((self.range, KEY, self.range))
+            if clock:
+                parts += [("  ", PLAIN), (fmt.age(age) if age is not None else "?", DIM)]
+            return parts + [(" ", PLAIN)]
 
         def tabs(long: bool) -> List[Tuple[str, str, str]]:
             out = []
@@ -352,12 +369,15 @@ class App:
             lead += [("ANON", bold(BAD)), (" ", PLAIN)]
         lead.append((" ", PLAIN))
         trail = [(" › " + " › ".join(crumbs), HEAD)] if crumbs else []
-        options = [(True, True), (False, True), (True, False), (False, False)]
-        for long_tabs, full_range in options:
+        # what gives way first: long tab names, the age, then the full list of ranges
+        options = [(True, True, True), (False, True, True), (False, True, False),
+                   (True, False, True), (False, False, True), (False, False, False)]
+        last = (" › " + crumbs[-1]) if crumbs else ""
+        for long_tabs, full_range, clock in options:
             tab_parts = tabs(long_tabs)
             used = (charts.width(lead) + sum(fmt.width(t) for t, _, _ in tab_parts)
-                    + charts.width(right(full_range)))
-            need = min(24, fmt.width(trail[0][0])) if crumbs else 0
+                    + sum(fmt.width(p[0]) for p in right(full_range, clock)))
+            need = min(24, fmt.width(last)) if crumbs else 0
             if width - used - 1 >= need:
                 break
         col = canvas.segments(0, 0, lead)
@@ -366,16 +386,24 @@ class App:
             start = col
             col = canvas.put(0, col, text, style)
             self.tab_hits.append((start, col, kind))
-        right_parts = right(full_range)
-        right_width = charts.width(right_parts)
+        right_parts = right(full_range, clock)
+        right_width = sum(fmt.width(p[0]) for p in right_parts)
         if crumbs:
             room = width - col - right_width - 1
             text = trail[0][0]
+            if fmt.width(text) > room:  # the deepest crumb is the one that says where
+                text = last
             if room > 4:
                 if fmt.width(text) > room:
-                    text = "…" + text[-(room - 1):]
+                    text = fmt.fit(text, room)
                 canvas.put(0, col, text, HEAD)
-        canvas.segments(0, max(col, width - right_width), right_parts)
+        col = max(col, width - right_width)
+        self.range_hits = []  # type: List[Tuple[int, int, str]]
+        for part in right_parts:
+            start = col
+            col = canvas.put(0, col, part[0], part[1])
+            if len(part) > 2 and col > start:
+                self.range_hits.append((start, col, part[2]))
 
     def _footer(self, canvas: Canvas) -> None:
         row = canvas.height - 1
@@ -400,6 +428,8 @@ class App:
                  ("s", "sort"), ("[ ]", "range"), ("r", "refresh"), ("O", "settings"),
                  ("?", "help"), ("q", "quit")]
         specific = [item for item in FOOTERS.get(self.view.kind, ()) if item[0] != "↵"]
+        if any(what == "range" for _, what in specific):
+            items = [item for item in items if item[1] != "range"]
         items[3:3] = specific
         must = {"?", "q", "esc"}
         room = canvas.width - 1 - (fmt.width(self.message) + 5 if self.message else 0)
@@ -428,10 +458,13 @@ class App:
 
     _last_view = None  # type: Optional[View]
     _width = 80
+    _height = 40
+    click_targets = []  # type: List[Tuple[int, int, int, Any]]
+    range_hits = []  # type: List[Tuple[int, int, str]]
 
     def _focused(self) -> Tuple[Any, PaneState, List[Any]]:
         if self._last_view is not self.view:  # keys arrived before the next draw
-            _, panes = self.panes(self._width)
+            _, panes = self.panes(self._width, self._height)
             states = [self.view.panes.setdefault(p.id, PaneState()) for p in panes]
             self._last = (panes, states, [visible_lines(p, st) for p, st in zip(panes, states)])
             self._last_view = self.view
@@ -485,8 +518,9 @@ class App:
             else:
                 self.push("help", {}, "Help")
         elif key in ("[", "]"):
-            index = hd.RANGE_NAMES.index(self.range) + (1 if key == "]" else -1)
-            self.set_range(hd.RANGE_NAMES[max(0, min(len(hd.RANGE_NAMES) - 1, index))])
+            self.step_range(1 if key == "]" else -1)
+        elif key in ("UP", "DOWN", "LEFT", "RIGHT") and pane is not None and pane.range_cursor:
+            self.step_range(1 if key in ("DOWN", "RIGHT") else -1)  # the tiles: cursor = range
         elif key in "12345" and len(key) == 1:
             self.set_range(hd.RANGE_NAMES[int(key) - 1])
         elif key == "r":
@@ -514,7 +548,7 @@ class App:
                 view.extra["jobs_limit"] = view.extra.get("jobs_limit", hd.JOB_PAGE) + hd.JOB_PAGE
                 self.message = "loading more jobs"
         elif key == "ENTER":
-            self._enter(lines, state)
+            self._enter(lines, state, pane)
         elif key == "/":
             self.input = list(state.filter)
             self._replace = True  # the old filter is selected: typing replaces it
@@ -526,6 +560,8 @@ class App:
             state.descending = not state.descending
         elif key == "g":
             self._group()
+        elif key in ("LEFT", "RIGHT") and view.kind == "range":
+            self.step_range(1 if key == "RIGHT" else -1)
         elif key in ("LEFT", "RIGHT"):
             if view.kind == "timeline":
                 view.extra["bin"] = view.extra.get("bin", 10 ** 6) + (1 if key == "RIGHT" else -1)
@@ -592,10 +628,12 @@ class App:
         at = focusable.index(view.focus) if view.focus in focusable else 0
         view.focus = focusable[(at + step) % len(focusable)]
 
-    def _enter(self, lines: List[Any], state: PaneState) -> None:
+    def _enter(self, lines: List[Any], state: PaneState, pane: Any = None) -> None:
         if not lines:
             return
         line = lines[max(0, min(state.cursor, len(lines) - 1))]
+        if pane is not None and pane.range_cursor:  # the tiles: the range is the cursor
+            line = next((l for l in lines if l.key == self.range), line)
         if line.action is not None:
             target = line.action
             self.push(target.kind, dict(target.params), target.title)
@@ -611,6 +649,10 @@ class App:
             current = view.extra.get("dim", "gpu_count")
             view.extra["dim"] = names[(names.index(current) + 1) % len(names)]
             view.panes.pop("runs", None)
+        elif view.kind == "range":
+            metric = view.extra.get("metric") or "gpu"
+            view.extra["metric"] = "cpu" if metric == "gpu" else "gpu"
+            self.message = "showing " + view.extra["metric"].upper() + "s"
         elif view.kind == "timeline":
             current = view.extra.get("lanes", "user")
             view.extra["lanes"] = LANE_GROUPS[(LANE_GROUPS.index(current) + 1) % len(LANE_GROUPS)]
@@ -986,6 +1028,9 @@ class App:
     # -- mouse -------------------------------------------------------------------
 
     def click(self, x: int, y: int) -> None:
+        """A click: a tab, a range in the header, a range tab or tile, the hero; on a
+        row it selects, and a second click on the selected row (or a double click) opens
+        it. Tiles open on one click."""
         self.last_input = time.time()
         if self.overlay is not None:  # a click outside the box closes it
             self.overlay = None
@@ -994,7 +1039,19 @@ class App:
             for start, end, kind in self.tab_hits:
                 if start <= x < end:
                     self.go_tab(kind)
+                    return
+            for start, end, name in self.range_hits:
+                if start <= x < end:
+                    self.set_range(name)
+                    return
             return
+        for row, start, end, what in self.click_targets:
+            if row == y and start <= x < end:
+                if isinstance(what, tuple) and len(what) == 2 and what[0] == "range":
+                    self.set_range(what[1])
+                elif isinstance(what, Target):
+                    self.push(what.kind, dict(what.params), what.title)
+                return
         for row, start, end, pane in getattr(self, "group_hits", ()):
             if row == y and start <= x < end:
                 self.view.focus = pane
@@ -1006,16 +1063,47 @@ class App:
                 continue
             if row == y:
                 view = self.view
-                view.focus = pane
                 panes, states, shown = self._last
+                was = view.focus == pane and states[pane].cursor == line
+                view.focus = pane
                 states[pane].cursor = line
                 last_time, last_pane, last_line = self._last_click
-                if now - last_time < 0.4 and (last_pane, last_line) == (pane, line):
+                double = now - last_time < 0.4 and (last_pane, last_line) == (pane, line)
+                if panes[pane].click_opens or was or double:
+                    self._last_click = (0.0, -1, -1)
                     self._enter(shown[pane], states[pane])
+                    return
                 self._last_click = (now, pane, line)
                 return
 
-    def wheel(self, step: int) -> None:
-        _, state, lines = self._focused()
+    def wheel(self, step: int, x: Optional[int] = None, y: Optional[int] = None) -> None:
+        """Scroll the pane under the pointer (else the focused one)."""
+        self.last_input = time.time()
+        if y is not None:
+            for hit in self.hits:
+                if hit[0] == y and (len(hit) <= 3 or x is None or hit[3] <= x < hit[4]):
+                    self.view.focus = hit[1]
+                    break
+        pane, state, lines = self._focused()
+        if pane is not None and pane.range_cursor:
+            self.step_range(1 if step > 0 else -1)
+            return
         if lines:
             state.cursor = max(0, min(len(lines) - 1, state.cursor + step))
+
+
+def keep_selection(pane: Any, state: PaneState, lines: List[Any]) -> None:
+    """Rows reordered or added since the last frame (a refresh): the cursor follows the
+    row it was on, found by its key, unless the cursor itself moved since."""
+    mark = state.mark
+    if mark is None or pane.range_cursor or not lines:
+        return
+    cursor, key = mark
+    if key is None or state.cursor != cursor:
+        return
+    if 0 <= cursor < len(lines) and lines[cursor].key == key:
+        return
+    for index, line in enumerate(lines):
+        if line.key == key:
+            state.cursor = index
+            return

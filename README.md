@@ -15,34 +15,48 @@ library, it runs as an ordinary user, and nothing it does can change anything in
 Slurm.
 
 ```
- ◆ orion   Overview  Me  Nodes  Queue  People  Roles  Timeline     day week month year all  43s ago
-╭─ GPUs ─────────────────╮ ╭─ CPUs ─────────────────╮ ╭─ Nodes ───────────╮ ╭─ Queue ──────────────╮
-│ 14 / 20 alloc      70% │ │ 184 / 384 alloc    48% │ │ 4 nodes   3 sched │ │ 4 run  12 pend       │
-│ ███████████████▍░░░░░░ │ │ ██████████▌░░░░░░░░░░░ │ │ ● 1 drain         │ │ ████████████████████ │
-│ 2 free  4 unavail      │ │ 104 free  96 unavail   │ │ 2 free on gpu-a01 │ │ JobArrayTaskLimit 10 │
-╰────────────────────────╯ ╰────────────────────────╯ ╰───────────────────╯ ╰──────────────────────╯
-╭─ Trend ─────────────────────────────────────────────────────────────────── 1/5  ≥ partly loaded ─╮
-│ Range    GPU-h   util    ΔGPU    CPU-h   util    ΔCPU                                      trend │
-│ day        274    57%   ▲698%     2189    24%   ▲673%                   ▆▂     ▁▁▁▁▂▂▁▁▁▁▃▇▇▇███ │
-│ week      1552    46%   ▲136%    12.5k    19%   ▲136%               ▂▂▃██▄▂▁▁▁▃▂▂▁▃▂▂▂▂▂▂ ▁▁▂▁▂▆ │
-│ month    ≥3875   ≥27%       ?   ≥31.2k   ≥11%       ?               ▂▃▃▄▂▃▁▂▂▁▁▂▅█▁▄▂▂▃▃▂▁█▇▃▃▃▆ │
-│ year     ≥3901   ≥27%       ?   ≥31.5k   ≥11%       ?                                        ▂▅█ │
-│ all      ≥3901   ≥27%     n/a   ≥31.5k   ≥11%     n/a               ▁▂▃▃▄▂▃▁▂▂▁▂▅▆▄▂▄▂▄▃▂▁██▃▄▃▆ │
-├─ Accounts · week ────────────────────────────────────────────────────────────────────────── 1/3 ─┤
+ ◆ orion   Overview  Me  Nodes  Queue  People  Roles  Timeline      day week month year all  5s ago
+╭─ GPUs in use ─────────────────────────────────────────────────────────────────────────────── now ╮
+│ █ █ █▀█   ╱ █▀▀ █▀▀   ▀▀█ ▄█  ▀ ╱   ██████████████████████████████████████████▉░░░░░░░░░░░░░░░░░ │
+│ ▀▀█ █ █  ╱  ▀▀█ █▀█     █  █   ╱    8 free  8 unavailable  largest free block 4 on gpu-a04       │
+│   ▀ ▀▀▀ ╱   ▀▀▀ ▀▀▀     ▀ ▀▀▀ ╱ ▀   CPUs 384/1184 32%  10 nodes  ● 1 drain                       │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Day ─────── 24h ╮ ╭─ Week ── 7 days ╮ ╭─ Month ─────────╮ ╭─ Year ──────────╮ ╭─ All ───────────╮
+│ 828 GPU-h        │ │ 7109 GPU-h      │ │ 27.3k GPU-h     │ │ 72.5k GPU-h     │ │ 72.5k GPU-h     │
+│ 62% util ████▍░░ │ │ 76% util ████▌░ │ │ 68% util ████░░ │ │ 45% util ██▋░░░ │ │ 45% util ██▋░░░ │
+│ ▼10% ▄▄▄▅▅▇▅▆▆▆█ │ │ ▼5% ▆██▆█▇▇█▆▅▆ │ │ ▲57% ▅▇▅▆▇▆███▇ │ │ from Jul 24   █ │ │ from Jul 24 ▄▅█ │
+╰──────────────────╯ ╰─────────────────╯ ╰─────────────────╯ ╰─────────────────╯ ╰─────────────────╯
+╭─ GPUs in use · week ────────────────── █ GPUs in use  ╌╌ previous week  ┄┄ average  ┈┈ capacity ─╮
+│ 60┤┈┈┈┈┈┈┈▁▁▁▁┈┈┈┈┈┈╌▁▂▁▂▁┈┈┈┈┈┈┈▁▂▂┈┈┈┈┈┈┈▁┈┈┈┈┈┈┈┈┈╌╌╌▁╌╌╌┈┈┈┈┈╌╌╌╌╌╌╌╌┈┈┈┈┈┈┈┈┈┈  capacity 56 │
+│   │      ▄████▅▁    ▆█████      ▄████╌╌   ▅█▅▂▃▅▅▂╌╌╌  ▅█▂  ▃   ╌        ╌╌╌╌╌╌╌                 │
+│   │┄┄┄┄┄▃███████▁┄╌▅██████▃┄┄┄┄╌█████▆▁╌┄▂████████▄┄┄┄▇███▇██▄┄╌┄▃▄▂┄┄┄┄┄┄┄┄┄┄┄▂▅▂┄  avg 42      │
+│ 40┤    ▂█████████▂▄████████▃  ╌▂███████▄▂██████████▆ ▆████████▃ ▄████▄        ▃███●  now 40      │
+│   │▆▅▂ █████████████████████▅  █████████████████████▇██████████▂██████▆▃▁▁▄▇▆▇█████              │
+│   │███▆███████████████████████▄████████████████████████████████████████████████████              │
+│ 20┤████████████████████████████████████████████████████████████████████████████████              │
+│   │████████████████████████████████████████████████████████████████████████████████              │
+│  0┤████████████████████████████████████████████████████████████████████████████████              │
+│            Tue 17      Wed 18     Thu 19      Fri 20     Sat 21      Sun 22     now              │
+├─ Accounts · week ────────────────────────────────────────────────────────────────────────── 1/5 ─┤
 │ Account                 run pend GPUs     cap GPU-h▼  share members                        trend │
-│ visiting                  0    1    0       —    651  41.2%       1   ▂██▄  ▁  ▁  ▄    ▂▁    ▁▁  │
-│ biolab                    1   11    0       —    499  31.6%       2   ▂▇▆▂▄▂▁ █▃▁▁ ▅▃▃▃▂▃  ▁▄  ▁ │
-│ physics                   3    0   14   12/16    430  27.2%       2 ▂▃▂   ▁ ▁▁ ▂▂  ▁▁     ▁▁ ▁▁█ │
-├─ Warnings (3) ───────────────────────────────────────────────────────────────────────────── 1/6 ─┤
-│ gres/gpu capacity differs: nodes have 20, the accounting database records 24; live totals use    │
-│ the nodes                                                                                       ▼│
+│ vision                    1    1    8    8/24   2427  34.1%       2 ▇▆▆▅█▇▇▇▇▄▅▇█▇▆▅▅▄▅▅▄▄▄▁ ▂▄▅ │
+│ physics                   2    4   24   24/32   2135  30.0%       3 ▁▃▆▅▁▂▃▁ ▂▇▄▁▂▄▇▇▃▅▆▇▆▇▆▆▇▆█ │
+│ visiting                  2   10    8     8/8   1273  17.9%       1 ▇██▇████████████████▇████▇▅▅ │
+│ astro                     0    0    0       —    893  12.6%       2  ▁▂▅▅▃▄█▄▁▂▃▃▂▅▃▂▃▅▃▁ ▁▃▁    │
+│ biolab                    0    4    0       —    383   5.4%       2  ▂▅█▂▂▇▃ ▃▆▇▂▅▆▃▁▃▇▃▂▁▃▁ ▃▂▂ │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
  ↵ open  esc back  tab pane  / filter  s sort  [ ] range  r refresh  O settings  ? help  q quit
 ```
 
-Every screen in this README is made from invented data (the cluster `orion`,
-the people `alice`, `bob`, `carol`, `dmitri`, `erin`, the accounts `physics`,
-`biolab`, `visiting`). The test suite renders the same invented cluster.
+The overview leads with what the cluster is doing: GPUs in use now in large
+figures, then one tile per range (day, week, month, year, all of history) with
+GPU-hours, utilization and the change against the previous equal period. Click a
+tile (or press `Enter` on it) for that range in detail.
+
+Every screen in this README is made from invented data: the demo cluster `orion`
+(the people `alice`, `bob`, `carol`, ... and the accounts `physics`, `biolab`,
+`astro`, `visiting`, `vision`; see [Try it without a cluster](#try-it-without-a-cluster)).
+The test suite renders a smaller invented cluster of the same name.
 
 ## Install
 
@@ -99,7 +113,8 @@ The removed options `--no-history`, `--no-full-history`, `--no-color`,
 
 The first start reads the current range from accounting and then fills in the
 longer ranges in the background, newest first, up to all of history; the header
-shows progress and partial figures (hours, utilization, job counts) are marked
+shows progress, a range tile says `loading…` (with a progress bar for the one
+being read) until its range is in, and partial figures elsewhere are marked
 `≥`. Later starts read only what changed. `--once` loads only the range it
 prints.
 
@@ -157,7 +172,8 @@ under the cursor, `Esc` goes back up the breadcrumb.
 
 | Key | Screen | What it shows |
 | --- | --- | --- |
-| `o` | Overview | GPUs, CPUs, nodes and the queue now; usage per range against the previous equal period, with trend sparklines; accounts; warnings |
+| `o` | Overview | GPUs in use now (large), with CPUs, nodes and the queue; a tile per range (GPU-hours, utilization, change against the previous equal period, a small trend); the chosen range's chart when there is room; accounts; warnings |
+| `↵` on a range | Range detail | one range for the cluster, an account or a person: GPUs in use over the range against capacity, the previous period and the average, the headline figures, and who used it (accounts and people, or a person's accounts and run sizes) |
 | `m` | Me | your own page: trend per range, what is running now, kinds of runs, and one box with tabs (`Tab` moves through them) for events, your jobs, daily activity and roles |
 | `n` | Nodes | every node: state, partitions, CPUs, memory and GPUs in use, load, drain reason |
 | `j` | Queue | running and pending jobs with resources, time and the pending reason |
@@ -165,6 +181,50 @@ under the cursor, `Esc` goes back up the breadcrumb.
 | `a` | Roles | usage by account, QOS or partition (`g` switches), with limits |
 | `t` | Timeline | GPU (or, with `c`, CPU) usage over the range in lanes by user, account, QOS or partition |
 | `?` | Help | keys, colors, placeholders and a glossary (what every column means) |
+
+**Range detail** opens from an overview tile, from any row of a Trend table (a
+person's page, an account's people) or from the chart on the overview. It shows
+GPUs in use over the range (the GPU-hours of each bin divided by its hours: a
+day by the hour, a week by three hours, a month by the day, a year by the week),
+against the live capacity, the average and the same stretch of the previous
+period (dashed), with the peak and now marked; above it the total, average,
+utilization, peak, change and CPU-hours; below it who used the range, each row
+opening its own detail. `←` `→` (or `[` `]`, or a click on a range) move
+through the ranges in place, `g` switches between GPUs and CPUs.
+
+```
+ ◆ orion   Ovw  Me  Nodes  Queue  Ppl  Roles  Time  › Month · cluster       day week month year all
+╭─ GPUs in use · orion ──────────────── █ GPUs in use  ╌╌ previous month  ┄┄ average  ┈┈ capacity ─╮
+│  Day   Week   Month   Year   All    Oct 24 – now                                                 │
+│ 27.3k GPU-h  ·  avg 38 GPUs in use  ·  68% of capacity  ·  peak 53 Nov 13                        │
+│ ▲57% vs previous month  ·  374k CPU-h                                                            │
+│                                                                                                  │
+│ 60┤                                                      ▾ peak 53                               │
+│   │┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈╌╌╌╌╌┈┈┈┈┈┈┈┈┈▁▁┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈  capacity 56 │
+│   │                                                     ▅██▂▂▁                                   │
+│   │        ▁▁                         ▂▂         ▅▅   ▄▄██████▆▆   ██▄  ▁▄▄▂▂                    │
+│   │        ███▇▇▁                    ▁██        ▄██  ▃███████████▄▄███▄▄█████▆       avg 38      │
+│ 40┤┄┄┄┄┄┄┄┄██████▆▆┄┄┄┄┄┄┄┄┄┄┄▁▁▃▃▃▅▅███▇▁▁┄┄┄┄┄███▇▇█████████████████████████▅▅┄┄●  now 40      │
+│   │        ████████           █████████████   ▁▁█████████████████████████████████▅▅              │
+│   │      ▅▅████████▇▇▅▁▁     ▃█████████████   █████████████████████████████████████              │
+│   │     ▅███████████████▃▁▁▃▃██████████████▂▂▇█████████████████████████████████████              │
+│   │▃▃▁╌╌███████████████████████████████████████████████████████████████████████████              │
+│ 20┤███▆▆███████████████████████████████████████████████████████████████████████████              │
+│   │████████████████████████████████████████████████████████████████████████████████              │
+│   │████████████████████████████████████████████████████████████████████████████████              │
+│   │████████████████████████████████████████████████████████████████████████████████              │
+│  0┤████████████████████████████████████████████████████████████████████████████████              │
+│    Oct 25  Oct 28  Oct 31  Nov 03  Nov 06  Nov 09  Nov 12  Nov 15  Nov 18       now              │
+├─ Accounts  People ───────────────────────────────────────────────────────────────────────── 1/5 ─┤
+│ Name                        GPU-h▼                                  share   avg in use   vs prev │
+│›physics                       8378  █████████▌░░░░░░░░░░░░░░░░░░░░░ 30.7%           12      ▼13% │
+│ vision                        7601  ████████▋░░░░░░░░░░░░░░░░░░░░░░ 27.9%           11       new │
+│ visiting                      5382  ██████▏░░░░░░░░░░░░░░░░░░░░░░░░ 19.7%          7.5      ▲95% │
+│ astro                         4598  █████▎░░░░░░░░░░░░░░░░░░░░░░░░░ 16.9%          6.4      ▲20% │
+│ biolab                        1305  █▌░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  4.8%          1.8       ▲6% │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+ ↵ open  esc back  tab pane  ←→ range  g GPU/CPU  / filter  s sort  r refresh  ? help  q quit
+```
 
 Drilling down: an account leads to its people, a person to their page, a node
 to its jobs, and any job to **Job detail**: request, timing, every attempt with
@@ -197,14 +257,14 @@ the loaded history, not only the rows on screen.
 | Keys | Action |
 | --- | --- |
 | `o m n j p a t` | Overview, Me, Nodes, Queue, People, Roles, Timeline |
-| `←` `→` | previous / next tab (in Timeline: move the bin cursor) |
+| `←` `→` | previous / next tab (in Timeline: move the bin cursor; on the range tiles and in Range detail: previous / next range) |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End` | move in the focused pane |
 | `Tab` `Shift-Tab` | next / previous pane |
 | `Enter`, `Esc` / `Backspace` | drill in, back out |
 | `/` | filter the focused pane as you type; `Ctrl-U` clears it; in a jobs list it searches all loaded history |
 | `s` `S` | cycle the sort column, reverse the sort |
-| `[` `]` or `1`-`5` | range: day, week, month, year, all (shared by every screen) |
-| `g` | Roles: account / QOS / partition. Me and person pages: group runs by GPUs, nodes, job name, account, QOS, partition, outcome. Timeline: lanes by user / account / QOS / partition |
+| `[` `]` or `1`-`5` | range: day, week, month, year, all (shared by every screen; the ranges in the header are clickable too) |
+| `g` | Range detail: GPUs / CPUs. Roles: account / QOS / partition. Me and person pages: group runs by GPUs, nodes, job name, account, QOS, partition, outcome. Timeline: lanes by user / account / QOS / partition |
 | `+` `-` `,` `.` `c` | Timeline zoom and pan; `c` switches GPU / CPU lanes |
 | `l` `e` `b` `u` | Job detail: stdout tail, stderr tail, batch script, submit line (fetched only on that keypress) |
 | `E` | load efficiency (step usage) for the current range and person |
@@ -217,7 +277,9 @@ the loaded history, not only the rows on screen.
 | `?` | help |
 | `q` | quit |
 
-The mouse works too: the wheel scrolls, a click selects, a double click opens.
+The mouse works too: click a tab, a range in the header, a range tile or a range
+in Range detail; on a row a click selects it and a second click (or a double
+click) opens it; the wheel scrolls the pane under the pointer.
 
 ## What it reads
 

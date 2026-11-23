@@ -89,9 +89,9 @@ class LayoutTest(unittest.TestCase):
     def test_overview_content_80x24(self):
         self.app.go_tab("overview")
         screen = draw(self.app).text()
-        for needle in ("GPUs", "CPUs", "Nodes", "Queue", "Trend", "day", "week", "month",
-                       "year", "all", "Accounts", "physics", "biolab", "Warnings",
-                       "capacity differs", "drain", "JobArray"):
+        for needle in ("GPUs in use", "CPUs", "nodes", "Day", "Week", "Month", "Year", "All",
+                       "GPU-h", "util", "day", "week", "month", "year", "all", "Accounts",
+                       "physics", "biolab", "Warnings", "capacity differs", "drain"):
             self.assertIn(needle, screen)
         self.assertIn("12/16", screen)  # the GrpTRES gpu cap joined from Snapshot.limits
 

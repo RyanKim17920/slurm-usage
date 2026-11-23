@@ -117,7 +117,8 @@ def _main(screen: Any, app: App) -> None:
     screen.keypad(True)
     screen.timeout(250)
     try:
-        curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        # no REPORT_MOUSE_POSITION: motion reports would wake the loop on every move
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
         curses.mouseinterval(0)
     except curses.error:
         pass
@@ -146,12 +147,15 @@ def _main(screen: Any, app: App) -> None:
                 _, x, y, _, state = curses.getmouse()
             except curses.error:
                 continue
-            if state & getattr(curses, "BUTTON4_PRESSED", 0):
-                app.wheel(-3)
-            elif state & getattr(curses, "BUTTON5_PRESSED", 0):
-                app.wheel(3)
-            elif state & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
+            action = mouse_action(state)
+            if action == "up":
+                app.wheel(-3, x, y)
+            elif action == "down":
+                app.wheel(3, x, y)
+            elif action == "click":
                 app.click(x, y)
+            else:
+                continue  # a release or a motion report: nothing changed, nothing to draw
             dirty = True
             continue
         if key is None:
@@ -161,6 +165,25 @@ def _main(screen: Any, app: App) -> None:
         if not app.key(key):
             return
         dirty = True
+
+
+# ncurses before mouse version 2 (older distributions) has no BUTTON5 names: the wheel
+# turning down arrives as bit 0x200000 there (and REPORT_MOUSE_POSITION on some builds)
+_WHEEL_UP = getattr(curses, "BUTTON4_PRESSED", 0x80000)
+_WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", 0x200000)
+_CLICK = curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED
+
+
+def mouse_action(state: int) -> Optional[str]:
+    """'up', 'down' (the wheel), 'click', or None for anything else."""
+    if state & _WHEEL_UP:
+        return "up"
+    if state & _WHEEL_DOWN or (not hasattr(curses, "BUTTON5_PRESSED")
+                               and state & getattr(curses, "REPORT_MOUSE_POSITION", 0)):
+        return "down"
+    if state & _CLICK:
+        return "click"
+    return None
 
 
 def _decode(code: Any) -> Optional[str]:

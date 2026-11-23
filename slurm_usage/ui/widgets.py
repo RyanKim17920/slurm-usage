@@ -48,7 +48,8 @@ class Pane:
                  follow: bool = False, more: bool = False,
                  select_width: Optional[int] = None, group: Optional[str] = None,
                  tab: Optional[str] = None, draw: Optional[Callable[..., Any]] = None,
-                 fixed: int = 0, frame: bool = True) -> None:
+                 fixed: int = 0, frame: bool = True, click_opens: bool = False,
+                 range_cursor: bool = False) -> None:
         self.id = pane_id
         self.title = title
         self.lines = lines or []
@@ -75,10 +76,12 @@ class Pane:
         self.draw = draw
         self.fixed = fixed
         self.frame = frame  # False: no box (the overview's cards)
+        self.click_opens = click_opens  # one click opens a row (tiles are buttons)
+        self.range_cursor = range_cursor  # the cursor is the range: arrows change it
 
 
 class PaneState:
-    __slots__ = ("cursor", "scroll", "filter", "sort", "descending", "follow")
+    __slots__ = ("cursor", "scroll", "filter", "sort", "descending", "follow", "mark")
 
     def __init__(self) -> None:
         self.cursor = 0
@@ -87,6 +90,9 @@ class PaneState:
         self.sort = -1  # index into Pane.sorts; -1 = natural order
         self.descending = True
         self.follow = None  # type: Optional[bool]  # None until the pane is first drawn
+        # (cursor, key) of the selected row when last drawn: a refresh that reorders the
+        # rows keeps the same row selected
+        self.mark = None  # type: Optional[Tuple[int, Any]]
 
 
 def visible_lines(pane: Pane, state: PaneState) -> List[Line]:
@@ -413,6 +419,8 @@ def draw_pane(canvas: Canvas, top: int, height: int, pane: Pane, state: PaneStat
     glyphs = glyphs or theme.ROUNDED
     width = canvas.width
     if pane.draw is not None and not pane.frame:
+        if height <= 0:  # no rows given (a short screen): nothing may draw over others
+            return []
         return pane.draw(canvas, top, height, width, state, focused, lines)
     border = ACCENT if focused else FAINT
     title_style = KEY if focused else HEAD

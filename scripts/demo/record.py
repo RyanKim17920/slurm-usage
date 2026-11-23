@@ -335,7 +335,8 @@ def wait_loaded(tmux: Tmux, name: str, timeout: float = 600) -> None:
     while time.time() < deadline:
         text = tmux.text(name)
         header = text.split("\n", 1)[0]
-        if "Trend" in text and "≥" not in text and "history" not in header and "…" not in header:
+        if ("in use" in text and "loading" not in text and "≥" not in text
+                and "history" not in header and "…" not in header):
             return
         time.sleep(2)
     raise SystemExit("history did not finish loading")
@@ -343,11 +344,13 @@ def wait_loaded(tmux: Tmux, name: str, timeout: float = 600) -> None:
 
 # --------------------------------------------------------------------------- script
 CAPTIONS = {
-    "now": "The whole cluster right now: GPUs, nodes, the queue, problems",
+    "now": "GPUs in use right now, and every range at a glance",
     "ranges": "Day · week · month · year · all time, against the period before",
+    "detail": "Click a range: GPUs in use over it, against capacity and the period before",
+    "step": "Step through the ranges in place",
+    "drill": "Who used it: drill into an account or a person",
     "people": "Every GPU-hour, by person and account",
     "person": "One person: trend, running now, kinds of runs, events",
-    "runs": "Group their runs by GPUs, nodes, job name, QOS or outcome",
     "anon": "A anonymizes everything at once, for demos and screenshots",
     "me": "Your own page, with measured GPU and CPU efficiency",
     "job": "Drill down to one job: attempts, steps, a live log tail",
@@ -358,32 +361,52 @@ CAPTIONS = {
 
 # (caption id, keys to send, keycap label, seconds to hold, text to wait for).
 # With a text to wait for, the keys are sent again (up to 8 times) until it shows:
-# that is how ``g`` cycles to a chosen grouping.
+# that is how ``g`` cycles to a chosen grouping. A key ("click", text, rows below, n)
+# clicks the mouse n times on the first place ``text`` shows, ``rows below`` it.
 SCRIPT = [
-    ("now", None, None, 3.0, "Accounts"),
-    ("ranges", "3", "3  month", 1.3, "Accounts · month"),
-    ("ranges", "5", "5  all", 1.6, "Accounts · all"),
-    ("ranges", "2", "2  week", 0.5, "Accounts · week"),
-    ("people", "p", "p  People", 1.5, "People · week"),
+    ("now", None, None, 3.2, "Accounts"),
+    ("ranges", "3", "3  month", 1.2, "Accounts · month"),
+    ("ranges", "5", "5  all", 1.2, "Accounts · all"),
+    ("ranges", "2", "2  week", 0.6, "Accounts · week"),
+    ("detail", ("click", "─ Month ", 2, 1), "click  Month", 3.4, "GPUs in use · orion"),
+    ("step", "]", "]  year", 1.8, "Year · cluster"),
+    ("step", "Left", "←  month", 1.0, "Month · cluster"),
+    ("step", "[", "[  week", 1.8, "Week · cluster"),
+    ("drill", ("click", "physics ", 0, 2), "click  physics", 2.6, "GPUs in use · physics"),
+    ("drill", "Escape", "Esc", 0.4, "GPUs in use · orion"),
+    ("people", "p", "p  People", 1.3, "People · week"),
     ("people", "Down", "↓", 0.3, None),
     ("people", "Down", "↓", 0.4, None),
     ("person", "Enter", "Enter", 2.2, "What kinds of runs"),
-    ("runs", "g", "g  by job name", 1.8, "runs · by job name"),
-    ("runs", "g", "g  by outcome", 1.8, "runs · by outcome"),
-    ("anon", "A", "A  anonymize", 2.4, "ANON"),
-    ("anon", "A", "A  off", 0.7, lambda text: "ANON" not in text.split("\n", 1)[0]),
+    ("anon", "A", "A  anonymize", 2.2, "ANON"),
+    ("anon", "A", "A  off", 0.6, lambda text: "ANON" not in text.split("\n", 1)[0]),
     ("me", "m", "m  Me", 1.0, "Trend · alice"),
-    ("me", "E", "E  efficiency", 2.0, efficiency_shown),
+    ("me", "E", "E  efficiency", 1.8, efficiency_shown),
     ("job", "Tab", "Tab", 0.4, None),
-    ("job", "Enter", "Enter", 2.4, "Attempts (2)"),
-    ("job", "l", "l  log tail", 3.0, "stdout tail"),
-    ("timeline", "t", "t  Timeline", 1.8, "lanes by user"),
-    ("timeline", "g", "g  by account", 1.5, "lanes by account"),
+    ("job", "Enter", "Enter", 2.0, "Attempts (2)"),
+    ("job", "l", "l  log tail", 2.4, "stdout tail"),
+    ("timeline", "t", "t  Timeline", 1.6, "lanes by user"),
     ("roles", "a", "a  Roles", 1.2, "Roles: Accounts"),
-    ("roles", "g", "g  by QOS", 1.4, "Roles: QOS"),
-    ("nodes", "n", "n  Nodes", 1.9, "Nodes ("),
-    ("nodes", "j", "j  Queue", 1.6, "Queue"),
+    ("nodes", "n", "n  Nodes", 1.6, "Nodes ("),
+    ("nodes", "j", "j  Queue", 1.4, "Queue"),
 ]
+
+
+def click(tmux: "Tmux", name: str, needle: str, below: int, times: int, ready=None) -> None:
+    """Mouse clicks (SGR encoding, as xterm sends them) where ``needle`` shows, up to
+    ``times`` of them, stopping once ``ready`` shows (a first click may only select)."""
+    for row, line in enumerate(tmux.text(name).split("\n")):
+        col = line.find(needle)
+        if col >= 0:
+            x, y = col + 2, row + below + 1
+            for _ in range(times):
+                for end in ("M", "m"):
+                    tmux("send-keys", "-t", name, "-l", "\x1b[<0;%d;%d%s" % (x, y, end))
+                time.sleep(0.6)
+                if ready is not None and has(tmux.text(name), ready):
+                    return
+            return
+    raise SystemExit("nothing to click: %r" % needle)
 
 
 def run_sessions(tmux: Tmux, work: str) -> List[Tuple[str, str, Optional[str], float]]:
@@ -401,7 +424,9 @@ def run_sessions(tmux: Tmux, work: str) -> List[Tuple[str, str, Optional[str], f
     for caption_id, key, label, hold, ready in SCRIPT:
         quick = key in ("Down", "Tab")
         for attempt in range(8 if ready and key == "g" else 1):
-            if key:
+            if isinstance(key, tuple):
+                click(tmux, "main", *key[1:], ready=ready)
+            elif key:
                 tmux.keys("main", key)
             screen = settle(tmux, "main", 0.25 if quick else 0.6, quiet=0.4 if quick else 1.0,
                             most=3.0 if key == "g" else 12.0, ready=ready)
