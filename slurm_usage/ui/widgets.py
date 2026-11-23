@@ -49,7 +49,7 @@ class Pane:
                  select_width: Optional[int] = None, group: Optional[str] = None,
                  tab: Optional[str] = None, draw: Optional[Callable[..., Any]] = None,
                  fixed: int = 0, frame: bool = True, click_opens: bool = False,
-                 range_cursor: bool = False) -> None:
+                 range_cursor: bool = False, footer: Optional[Line] = None) -> None:
         self.id = pane_id
         self.title = title
         self.lines = lines or []
@@ -78,10 +78,13 @@ class Pane:
         self.frame = frame  # False: no box (the overview's cards)
         self.click_opens = click_opens  # one click opens a row (tiles are buttons)
         self.range_cursor = range_cursor  # the cursor is the range: arrows change it
+        # a row under the lines that never scrolls or takes the cursor (a legend)
+        self.footer = footer
 
 
 class PaneState:
-    __slots__ = ("cursor", "scroll", "filter", "sort", "descending", "follow", "mark")
+    __slots__ = ("cursor", "scroll", "filter", "sort", "descending", "follow", "mark",
+                 "chosen")
 
     def __init__(self) -> None:
         self.cursor = 0
@@ -93,6 +96,9 @@ class PaneState:
         # (cursor, key) of the selected row when last drawn: a refresh that reorders the
         # rows keeps the same row selected
         self.mark = None  # type: Optional[Tuple[int, Any]]
+        # the viewer picked the row (a key, a click, the wheel): only then does a reorder
+        # carry the cursor along; else it stays on the first row as the rows load
+        self.chosen = False
 
 
 def visible_lines(pane: Pane, state: PaneState) -> List[Line]:
@@ -295,7 +301,7 @@ def fit_parts(parts: Sequence[Segment], size: int, align: str = "<") -> List[Seg
 def _chrome(pane: Pane) -> int:
     if not pane.frame:
         return 0
-    return 1 + (1 if pane.header is not None else 0)
+    return 1 + (1 if pane.header is not None else 0) + (1 if pane.footer is not None else 0)
 
 
 def chrome(pane: Pane) -> int:
@@ -451,6 +457,9 @@ def draw_pane(canvas: Canvas, top: int, height: int, pane: Pane, state: PaneStat
     body = top + height - row
     for at in range(row, top + height):
         sides(at)
+    if pane.footer is not None and body > 1:  # the last row: fixed, under the lines
+        canvas.segments(top + height - 1, 2, pane.footer.parts, inner)
+        body -= 1
     hits = []  # type: List[Tuple[int, int]]
     if body <= 0:
         return hits

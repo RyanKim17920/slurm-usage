@@ -350,11 +350,12 @@ CAPTIONS = {
     "step": "Step through the ranges in place",
     "drill": "Who used it: drill into an account or a person",
     "people": "Every GPU-hour, by person and account",
-    "person": "One person: trend, running now, kinds of runs, events",
+    "person": "One person: where their GPU-hours went, and under which roles",
+    "kind": "A kind of run: its chart, outcomes, runtime and wait (j: its jobs)",
     "anon": "A anonymizes everything at once, for demos and screenshots",
     "me": "Your own page, with measured GPU and CPU efficiency",
     "job": "Drill down to one job: attempts, steps, a live log tail",
-    "timeline": "Timeline: who held the cluster, and when",
+    "timeline": "Timeline: who held the GPUs, and when; a lane opens its chart",
     "roles": "Accounts, QOS and partitions, with their limits",
     "nodes": "Every node and every queued job, live",
 }
@@ -377,7 +378,12 @@ SCRIPT = [
     ("people", "p", "p  People", 1.3, "People · week"),
     ("people", "Down", "↓", 0.3, None),
     ("people", "Down", "↓", 0.4, None),
-    ("person", "Enter", "Enter", 2.2, "What kinds of runs"),
+    ("person", "Enter", "Enter", 2.4, "GPU-hours went"),
+    ("kind", "Tab", "Tab", 0.3, None),
+    ("kind", "Tab", "Tab", 0.3, None),
+    ("kind", "Down", "↓", 0.3, None),
+    ("kind", "Enter", "Enter", 2.6, "its jobs"),
+    ("kind", "Escape", "Esc", 0.4, "GPU-hours went"),
     ("anon", "A", "A  anonymize", 2.2, "ANON"),
     ("anon", "A", "A  off", 0.6, lambda text: "ANON" not in text.split("\n", 1)[0]),
     ("me", "m", "m  Me", 1.0, "Trend · alice"),
@@ -385,7 +391,11 @@ SCRIPT = [
     ("job", "Tab", "Tab", 0.4, None),
     ("job", "Enter", "Enter", 2.0, "Attempts (2)"),
     ("job", "l", "l  log tail", 2.4, "stdout tail"),
-    ("timeline", "t", "t  Timeline", 1.6, "lanes by user"),
+    ("timeline", "t", "t  Timeline", 1.8,
+     lambda text: "per person" in text and "alice " in text),
+    ("timeline", "g", "g  by account", 1.2,
+     lambda text: "per account" in text and "physics " in text),
+    ("timeline", ("click", "physics ", 0, 1), "click  physics", 2.2, "GPUs in use · physics"),
     ("roles", "a", "a  Roles", 1.2, "Roles: Accounts"),
     ("nodes", "n", "n  Nodes", 1.6, "Nodes ("),
     ("nodes", "j", "j  Queue", 1.4, "Queue"),
@@ -406,7 +416,7 @@ def click(tmux: "Tmux", name: str, needle: str, below: int, times: int, ready=No
                 if ready is not None and has(tmux.text(name), ready):
                     return
             return
-    raise SystemExit("nothing to click: %r" % needle)
+    raise SystemExit("nothing to click: %r on\n%s" % (needle, tmux.text(name)))
 
 
 def run_sessions(tmux: Tmux, work: str) -> List[Tuple[str, str, Optional[str], float]]:

@@ -24,7 +24,9 @@ from .canvas import (ACCENT, BAD, DIM, FAINT, GOOD, HEAD, KEY, PLAIN, RESOURCE, 
 from .filestat import check as stat_path
 from .filestat import script_from_submit_line
 from .loader import Loader
+from . import screens
 from .screens import FOOTERS, LANE_GROUPS, ROLE_GROUPS, SCREENS, TABS, Context, View
+from .widgets import chrome as pane_chrome
 from .widgets import PaneState, Target, allocate, close_box, draw_pane, visible_lines
 
 ACTIVE_REFRESH = 30.0
@@ -290,7 +292,7 @@ class App:
             pane, state, lines = panes[index], states[index], shown[index]
             if size < 0:
                 continue
-            chrome = (1 + (1 if pane.header is not None else 0)) if pane.frame else 0
+            chrome = pane_chrome(pane)
             tabs = None
             tab_hits = []  # type: List[Tuple[int, int, Any]]
             if pane.group and len(members[pane.group]) > 1:
@@ -510,7 +512,8 @@ class App:
                 state.filter = ""
             else:
                 self.back()
-        elif key in TAB_KEYS and view.kind != "help":
+        elif key in TAB_KEYS and view.kind != "help" and not (
+                key == "j" and view.kind == "runtype"):  # j there: its jobs
             self.go_tab(TAB_KEYS[key])
         elif key == "?":
             if view.kind == "help":
@@ -541,6 +544,7 @@ class App:
             step = {"UP": -1, "k": -1, "DOWN": 1, "J": 1, "PGUP": -page, "PGDN": page,
                     "HOME": -10 ** 9, "END": 10 ** 9}[key]
             state.cursor = max(0, min(len(lines) - 1, state.cursor + step)) if lines else 0
+            state.chosen = True
             # a log tail keeps following its end until moved away from it
             state.follow = bool(pane is not None and pane.follow and key == "END")
             if pane is not None and pane.more and lines and state.cursor >= len(lines) - 1 \
@@ -560,24 +564,22 @@ class App:
             state.descending = not state.descending
         elif key == "g":
             self._group()
-        elif key in ("LEFT", "RIGHT") and view.kind == "range":
+        elif key == "j" and view.kind == "runtype":
+            target = screens.runtype_jobs_target(view)
+            self.push(target.kind, dict(target.params), target.title)
+        elif key in ("LEFT", "RIGHT") and view.kind in ("range", "runtype"):
             self.step_range(1 if key == "RIGHT" else -1)
         elif key in ("LEFT", "RIGHT"):
-            if view.kind == "timeline":
-                view.extra["bin"] = view.extra.get("bin", 10 ** 6) + (1 if key == "RIGHT" else -1)
-            else:
-                root = TAB_KINDS.index(self.stack[0].kind) if self.stack[0].kind in TAB_KINDS else 0
-                self.go_tab(TAB_KINDS[(root + (1 if key == "RIGHT" else -1)) % len(TAB_KINDS)])
+            root = TAB_KINDS.index(self.stack[0].kind) if self.stack[0].kind in TAB_KINDS else 0
+            self.go_tab(TAB_KINDS[(root + (1 if key == "RIGHT" else -1)) % len(TAB_KINDS)])
         elif key == "c" and view.kind == "timeline":
             metric = view.extra.get("metric") or "gpu"
             view.extra["metric"] = "cpu" if metric == "gpu" else "gpu"
             view.panes.clear()
-        elif key in ("+", "-", "=") and view.kind == "timeline":
-            zoom = view.extra.get("zoom", 1)
-            view.extra["zoom"] = max(1, min(256, zoom * 2 if key in ("+", "=") else zoom // 2))
-        elif key in (",", ".", "<", ">") and view.kind == "timeline":
-            pan = view.extra.get("pan", 0.0) + (0.5 if key in (",", "<") else -0.5)
-            view.extra["pan"] = max(0.0, min(view.extra.get("zoom", 1) - 1.0, pan))
+        elif key == "v" and view.kind == "range":
+            view.extra["hide_previous"] = not view.extra.get("hide_previous")
+            self.message = "previous period " + ("hidden" if view.extra["hide_previous"]
+                                                 else "shown")
         elif key == "E":
             self._efficiency()
         elif key in FETCH_KEYS and view.kind == "job":
@@ -645,7 +647,7 @@ class App:
             view.extra["group"] = ROLE_GROUPS[(ROLE_GROUPS.index(current) + 1) % len(ROLE_GROUPS)]
             view.panes.clear()
         elif view.kind in ("person", "me"):
-            names = [d for d, _ in hd.DIMENSIONS]
+            names = list(screens.PAGE_DIMENSIONS)
             current = view.extra.get("dim", "gpu_count")
             view.extra["dim"] = names[(names.index(current) + 1) % len(names)]
             view.panes.pop("runs", None)
@@ -935,6 +937,7 @@ class App:
                 action = line.action
                 if action is not None and dict(action.params, _kind=action.kind) == params:
                     state.cursor = number
+                    state.chosen = True
                     break
             view.extra.pop("reselect", None)
 
@@ -1064,9 +1067,14 @@ class App:
             if row == y:
                 view = self.view
                 panes, states, shown = self._last
-                was = view.focus == pane and states[pane].cursor == line
+                # a second click opens: on a row the viewer selected (by a click or a key),
+                # not on the row the cursor merely starts on, so one click never opens
+                # one row and selects another
+                was = (view.focus == pane and states[pane].cursor == line
+                       and states[pane].chosen)
                 view.focus = pane
                 states[pane].cursor = line
+                states[pane].chosen = True
                 last_time, last_pane, last_line = self._last_click
                 double = now - last_time < 0.4 and (last_pane, last_line) == (pane, line)
                 if panes[pane].click_opens or was or double:
@@ -1090,13 +1098,14 @@ class App:
             return
         if lines:
             state.cursor = max(0, min(len(lines) - 1, state.cursor + step))
+            state.chosen = True
 
 
 def keep_selection(pane: Any, state: PaneState, lines: List[Any]) -> None:
     """Rows reordered or added since the last frame (a refresh): the cursor follows the
     row it was on, found by its key, unless the cursor itself moved since."""
     mark = state.mark
-    if mark is None or pane.range_cursor or not lines:
+    if mark is None or pane.range_cursor or not lines or not state.chosen:
         return
     cursor, key = mark
     if key is None or state.cursor != cursor:

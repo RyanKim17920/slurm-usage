@@ -472,14 +472,25 @@ def _state_dir() -> str:
     return path
 
 
+def _version() -> str:
+    with open(os.path.abspath(__file__), "rb") as source:  # a changed world is a new cache
+        return hashlib.sha1(source.read()).hexdigest()[:12]
+
+
+def world_id(at: Optional[int] = None) -> str:
+    """Which world ``at`` sees: the simulation is anchored to that day's midnight, so the
+    same job ids carry other times on another day. A history cache kept across runs
+    must be one per world, or yesterday's rows would sit beside today's and count twice
+    (an hour with more GPUs in use than the cluster has)."""
+    return "%s-%d" % (_version(), anchor(now() if at is None else at))
+
+
 def world(at: Optional[int] = None) -> Tuple[int, List[Attempt]]:
     """(anchor, every attempt of the simulated cluster). Cached per day."""
     at = now() if at is None else at
     base = anchor(at)
     me = os.getuid()
-    with open(os.path.abspath(__file__), "rb") as source:  # a changed world is a new cache
-        version = hashlib.sha1(source.read()).hexdigest()[:12]
-    path = os.path.join(_state_dir(), "world-%s-%d-%d.pickle" % (version, base, me))
+    path = os.path.join(_state_dir(), "world-%s-%d-%d.pickle" % (_version(), base, me))
     try:
         with open(path, "rb") as handle:
             return base, pickle.load(handle)

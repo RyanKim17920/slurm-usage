@@ -126,15 +126,20 @@ class NavigationTest(unittest.TestCase):
         draw(app)
         app.key("TAB")
         app.key("TAB")  # runs pane
+        app.key("DOWN")  # past the stacked bar (which opens the person's chart)
         app.key("ENTER")
+        self.assertEqual(app.view.kind, "runtype")  # a kind of run: a breakdown, not jobs
+        draw(app)
+        app.key("j")
         self.assertEqual(app.view.kind, "jobs")
         draw(app)
         app.key("ENTER")
         self.assertEqual(app.view.kind, "job")
         screen = draw(app).text()
         self.assertIn("› job ", screen.split("\n")[0])
-        self.assertEqual([v.kind for v in app.stack], ["people", "person", "jobs", "job"])
-        for _ in range(3):
+        self.assertEqual([v.kind for v in app.stack],
+                         ["people", "person", "runtype", "jobs", "job"])
+        for _ in range(4):
             app.key("ESC")
         self.assertEqual([v.kind for v in app.stack], ["people"])
         app.key("ESC")
@@ -186,21 +191,21 @@ class NavigationTest(unittest.TestCase):
     def test_person_run_types_cycle_and_timeline_keys(self):
         app = self.app
         app.key("m")
-        for _ in range(len(hd.DIMENSIONS)):
+        for _ in range(3):
             screen = draw(app, 200, 50).text()
-            self.assertIn("What kinds of runs", screen)
+            self.assertIn("Where your GPU-hours went", screen)
+            self.assertIn("Roles  Events", screen)  # your roles: the first tab, on show
             app.key("g")
         app.key("t")
         draw(app, 120, 30)
-        for key in ("+", "+", ",", "LEFT", "g", "-", "."):
+        for key in ("g", "c", "g", "DOWN", "c"):
             app.key(key)
             assert_clean(self, draw(app, 120, 30))
         app.key("g")
         app.key("g")
-        app.key("g")
         draw(app, 120, 30)
         app.key("ENTER")
-        self.assertEqual(app.view.kind, "jobs")
+        self.assertEqual(app.view.kind, "range")  # a lane opens its chart, not jobs
         assert_clean(self, draw(app, 120, 30))
 
     def test_mouse(self):

@@ -68,12 +68,12 @@ class PersonRunTypesTest(unittest.TestCase):
     def test_every_dimension_loads_when_run_later(self):
         app = deferred_app()
         app.key("m")
-        for dim, label in hd.DIMENSIONS:
+        for dim in screens.PAGE_DIMENSIONS:
             screen = settle(app)
-            self.assertIn("by %s" % label, screen)
+            self.assertIn("by %s" % screens.DIM_WORDS[dim], screen)
             self.assertNotIn("ERR", screen, dim)
             self.assertNotIn("'other'", screen, dim)
-            entry = app.loader.peek(("h", "runtypes", "week", "alice", dim))
+            entry = app.loader.peek(("h", "runtypes", "week", (("user", "alice"),), dim))
             self.assertEqual(entry.state, "ok", (dim, entry.message))
             app.key("g")
         events = app.loader.peek(("h", "events", "week", "alice"))
@@ -83,7 +83,7 @@ class PersonRunTypesTest(unittest.TestCase):
         app = deferred_app()
         app.key("m")
         settle(app)
-        key = ("h", "runtypes", "week", "alice", "gpu_count")
+        key = ("h", "runtypes", "week", (("user", "alice"),), "gpu_count")
         first = app.loader.peek(key).value
         app.data.generation += 1  # more history loaded, or E measured efficiency
         settle(app)
@@ -406,12 +406,23 @@ class ConsistencyTest(unittest.TestCase):
                   elapsed=0)
         self.assertEqual(screens.live_elapsed(job, now), 540)
 
-    def test_timeline_bin_drill_says_in_bin(self):
+    def test_timeline_lane_opens_its_range_detail(self):
+        """A lane is an aggregate: it opens a chart of that lane, not a list of jobs."""
         app = make_app()
         app.key("t")
-        draw(app, 160, 40)
-        app.key("ENTER")
-        self.assertIn("GPU-h in bin", draw(app, 160, 40).text())
+        for group in ("user", "account", "qos", "partition"):
+            self.assertEqual(app.view.extra.get("lanes", "user"), group)
+            draw(app, 160, 40)
+            _, state, lines = app._focused()
+            key = lines[state.cursor].key
+            app.key("ENTER")
+            self.assertEqual(app.view.kind, "range")
+            self.assertIn(key, app.view.title)
+            screen = draw(app, 160, 40).text()
+            self.assertIn("in use · ", screen)
+            self.assertNotIn("history ?", screen)
+            app.key("ESC")
+            app.key("g")
 
     def test_batch_script_message_for_an_sbatch_job(self):
         from slurm_usage import parse
@@ -558,17 +569,21 @@ class UxTest(unittest.TestCase):
             self.assertEqual(len(labels), len(set(labels)), axis)  # no "Nov 16  Nov 16"
         app = make_app()
         app.key("t")
-        screen = draw(app, 160, 40).text()
-        self.assertIn("GPU lanes", screen)
-        self.assertIn("low ", screen)  # the legend of the lane shading
-        self.assertIn(" full", screen)
+        screen = draw(app, 200, 40).text()
+        self.assertIn("GPUs in use per person over time", screen)
+        self.assertIn("GPUs held on average", screen)  # the scale of the lane shading
+        self.assertRegex(screen, r"░≤[0-9.]+ ▒≤[0-9.]+ ▓≤[0-9.]+ █>[0-9.]+")
         app.key("c")
-        self.assertIn("CPU lanes", draw(app, 160, 40).text())
+        self.assertIn("CPUs in use per person", draw(app, 200, 40).text())
 
-        def busy(metric):
-            report = app.loader.peek(("h", "lanes", "week", "user", metric)).value
-            return sum(b - a for lane in report.lanes for a, b in lane.intervals)
-        self.assertLess(busy("gpu"), busy("cpu"))  # CPU-only jobs are not GPU lanes
+        def held(metric):
+            report = app.data.history.query(hd.window("week", app.data.clock()), None,
+                                            series_by="user", series_metric=metric)
+            lanes = screens.compute_lanes(report, 100)
+            return {key: total for key, _, total, _, _ in lanes.lanes}
+        gpu, cpu = held("gpu"), held("cpu")
+        self.assertLessEqual(set(gpu), set(cpu))  # CPU-only jobs are not GPU lanes
+        self.assertLess(sum(gpu.values()), sum(cpu.values()))
 
     def test_filter_select_all_ctrl_u_and_live(self):
         app = make_app(uf.FakeHistory())
@@ -685,9 +700,12 @@ class TimelineHeaderAndSelectionTest(unittest.TestCase):
             title = draw(app, width, 30).row_text(1).rstrip()
             self.assertLessEqual(fmt.width(title), width)
             self.assertTrue(title.endswith("╮"), title)  # the box closes: nothing cut it
-            self.assertIn("bin ", title)
-            # the legend is whole or left out, never cut mid-word
-            self.assertTrue("low" not in title or " full ─╮" in title, title)
+            self.assertIn(" avg ", title)  # the selected lane, in the title row
+            # the shade scale: a row of its own under the lanes, whole at every width
+            screen = draw(app, width, 30).text().split("\n")
+            scale = [row for row in screen if "shade =" in row]
+            self.assertEqual(len(scale), 1, width)
+            self.assertRegex(scale[0], r"GPUs held on average +│$")
 
     def test_a_single_long_note_is_ellipsized(self):
         canvas = Canvas(40, 3)

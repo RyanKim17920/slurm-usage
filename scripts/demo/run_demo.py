@@ -94,8 +94,12 @@ def main(argv=None) -> int:
         env = demo_environment(scratch)
         os.environ.clear()
         os.environ.update(env)
-        if keep:
-            os.environ["SLURM_USAGE_CACHE"] = keep
+        if keep:  # one cache per demo world (it is regenerated each day)
+            sys.path.insert(0, HERE)
+            import fakeslurm
+            kept = os.path.join(keep, "orion-" + fakeslurm.world_id())
+            os.makedirs(kept, mode=0o700, exist_ok=True)
+            os.environ["SLURM_USAGE_CACHE"] = kept
         else:
             cache = os.path.join(scratch, "cache")
             os.makedirs(cache, mode=0o700)

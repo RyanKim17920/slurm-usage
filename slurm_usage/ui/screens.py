@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..live import applicable_limits, group_by
 from ..model import Status
-from . import charts
+from . import breakdown, charts
 from . import data as hd
 from . import fmt
 from . import plot
@@ -262,6 +262,27 @@ def person_share(row: Any, cluster: Any) -> Any:
     return ("" if row.complete else "≥") + fmt.pct(share, 1), PLAIN
 
 
+def rollup_stand_in(ctx: Context, params: Dict[str, Any], name: str) -> Any:
+    """(amounts, previous GPU-hours or None, CPU-hours) of one account or person in a
+    range from the hourly summary, or None: shown (marked ≥) while the exact figures
+    compute, so a drill does not open on a column of placeholders."""
+    if set(k for k, v in params.items() if v) - {"user", "account"}:
+        return None
+    summary = rollup_summary(ctx, name)
+    if summary is None:
+        return None
+    account, user = params.get("account"), params.get("user")
+    if user:
+        found = rollup_users(summary, account).get(user)
+        return (found, None, found.cpu_hours) if found is not None else None
+    item = summary.accounts.get(account) if account else None
+    if item is None:
+        return None
+    before = item.previous.gpu_hours if item.previous is not None and summary.complete \
+        and name != "all" else None
+    return item.amounts, before, item.amounts.cpu_hours
+
+
 def trend_pane(ctx: Context, params: Dict[str, Any], person: bool = False) -> Pane:
     table = Table(PERSON_TREND_COLUMNS if person else TREND_COLUMNS, ctx.width - 2,
                   prune=EFFICIENCY)
@@ -276,6 +297,16 @@ def trend_pane(ctx: Context, params: Dict[str, Any], person: bool = False) -> Pa
         label = (name, KEY if name == ctx.range else PLAIN)
         target = range_target(name, params)
         if row is None:
+            stand_in = rollup_stand_in(ctx, params, name) if person else None
+            if stand_in is not None:  # the hourly summary's figures while exact ones compute
+                gpu, before, cpu = stand_in
+                incomplete = True
+                cells = [label, "≥" + fmt.hours(gpu.gpu_hours), (fmt.NOT_YET, FAINT),
+                         delta_cell(gpu.gpu_hours, before, before is not None),
+                         (fmt.NOT_YET, FAINT), "≥" + fmt.hours(cpu),
+                         (fmt.NOT_YET, FAINT), (fmt.NOT_YET, FAINT), ""]
+                lines.append(table.row(cells[:len(table.columns)], target, key=name))
+                continue
             ph = missing(entry)
             cells = [label] + [(ph, FAINT)] * (len(table.columns) - 1)
             lines.append(table.row(cells, target, key=name))
@@ -558,10 +589,22 @@ RANGE_WORDS = {"day": "day", "week": "week", "month": "month", "year": "year",
                "all": "history"}
 
 
+SCOPE_ROLES = ("user", "account", "qos", "partition")
+
+
+def scope_name(params: Dict[str, Any]) -> Optional[str]:
+    """Who a range detail is about: the person, else the account, QOS or partition."""
+    for role in SCOPE_ROLES:
+        if params.get(role):
+            return params[role] if role in ("user", "account") else "%s %s" % (
+                "QOS" if role == "qos" else role, params[role])
+    return None
+
+
 def range_target(name: str, params: Dict[str, Any]) -> Target:
-    """Range detail for ``name``: the cluster, or one person or account."""
-    keep = {k: params[k] for k in ("user", "account") if params.get(k)}
-    who = keep.get("user") or keep.get("account") or "cluster"
+    """Range detail for ``name``: the cluster, or one person, account, QOS or partition."""
+    keep = {k: params[k] for k in SCOPE_ROLES if params.get(k)}
+    who = scope_name(keep) or "cluster"
     return Target("range", dict(keep, range=name), "%s · %s" % (name.capitalize(), who))
 
 
@@ -849,7 +892,7 @@ def _live_used(ctx: Context, params: Dict[str, Any], metric: str) -> Optional[fl
     snap = ctx.snap
     if snap is None:
         return None
-    if not params.get("user") and not params.get("account"):
+    if not any(params.get(role) for role in SCOPE_ROLES):
         res = snap.totals.gpus if metric == "gpu" else snap.totals.cpus
         if res.alloc is None:
             return None
@@ -861,6 +904,10 @@ def _live_used(ctx: Context, params: Dict[str, Any], metric: str) -> Optional[fl
         if params.get("user") and job.user != params["user"]:
             continue
         if params.get("account") and job.account != params["account"]:
+            continue
+        if params.get("qos") and job.qos != params["qos"]:
+            continue
+        if params.get("partition") and params["partition"] not in (job.partition or "").split(","):
             continue
         total += (job.gpus_alloc or 0) if metric == "gpu" else (job.cpus or 0)
     return float(total)
@@ -912,7 +959,9 @@ def _headline(series: Any, metric: str, name: str, ctx: Context, scoped: bool,
         stamp = time.strftime("%H:%M" if series.unit in ("hour", "3hour") and name == "day"
                               else "%a %d %H:%M" if series.unit in ("hour", "3hour")
                               else "%b %d", time.localtime(when))
-        out.append([("peak ", DIM), (plot._figure(peak), bold(BRIGHT)), (" " + stamp, DIM)])
+        # a bar is an average over its bin, so its peak is the busiest bin's average
+        out.append([("peak %s avg " % plot.bin_word(series.unit), DIM),
+                    (plot._figure(peak), bold(BRIGHT)), (" " + stamp, DIM)])
     if name != "all":
         before = series.previous.amount(metric) if series.previous is not None else None
         change = charts.delta(total, before, series.previous_complete)
@@ -929,43 +978,45 @@ def _headline(series: Any, metric: str, name: str, ctx: Context, scoped: bool,
 
 
 def scope_chart(ctx: Context, params: Dict[str, Any], name: str, metric: str,
-                roles: Sequence[str] = ()) -> Tuple[Entry, Any, Any]:
-    """(entry, RangeSeries or None, plot.Chart or None) for a range and scope."""
+                roles: Sequence[str] = (), previous: bool = True) -> Tuple[Entry, Any, Any]:
+    """(entry, RangeSeries or None, plot.Chart or None) for a range and scope. The
+    ceiling drawn is the cluster's capacity; for an account with a GPU limit, the
+    limit; for a person (or an account without one), the cluster's, named so."""
     entry = range_entry(ctx, params, name, roles)
     series = value(entry)
     gpus, cpus = capacity(ctx)
-    cap = None  # type: Optional[float]
-    if not params:
-        cap = gpus if metric == "gpu" else cpus
-    elif params.get("account") and metric == "gpu":
+    cap = gpus if metric == "gpu" else cpus  # type: Optional[float]
+    cap_label = "cluster" if params else "capacity"
+    if params.get("account") and not params.get("user") and metric == "gpu":
         found = _gpu_cap(ctx, params["account"])
-        cap = found[1] if found else None
+        if found:
+            cap, cap_label = found[1], "limit"
     chart = None
     if series is not None and series.seconds(metric) is not None:
-        before = series.average(metric, previous=True) if name != "all" else None
+        before = series.average(metric, previous=True) if name != "all" and previous \
+            else None
         if before is not None and not any(before):
             before = None  # nothing then: no line, and no legend for it
         chart = plot.Chart(series.average(metric), series.edges, series.unit, before,
                            cap, series.mean(metric), _live_used(ctx, params, metric), ctx.now,
-                           "GPUs" if metric == "gpu" else "CPUs")
+                           "GPUs" if metric == "gpu" else "CPUs", cap_label)
     return entry, series, chart
 
 
 def chart_status(ctx: Context, entry: Entry, series: Any, chart: Any, name: str
                  ) -> List[Any]:
-    """The chart's title notes: loading, then the legend (dropped first when short)."""
+    """The chart's title notes: loading or updating. (The legend is drawn in the chart,
+    under its time axis, where it cannot be cut off or scrolled away.)"""
     status = []  # type: List[Any]
     if series is not None and not series.complete:
         status.append([("loading " + (ctx.data.progress or "…"), WARN)])
     elif busy(entry) and series is not None:
         status.append([("updating…", DIM)])
-    if chart is not None:
-        status.append(plot.legend(chart, RANGE_WORDS[name], ctx.ascii))
     return status
 
 
 def draw_chart(canvas: Any, row: int, rows: int, ctx: Context, chart: Any, entry: Entry,
-               inner: int, what: str) -> None:
+               inner: int, what: str, name: str = "") -> None:
     if chart is None:
         if value(entry) is None:
             text = "computing…" if busy(entry) else "history " + missing(entry)
@@ -975,9 +1026,13 @@ def draw_chart(canvas: Any, row: int, rows: int, ctx: Context, chart: Any, entry
         return
     if rows < 3:
         return
-    for parts in plot.area_chart(chart, inner, rows - 1, ctx.ascii, ctx.color):
+    key = rows >= 5  # the legend row, under the time axis
+    for parts in plot.area_chart(chart, inner, rows - 1 - key, ctx.ascii, ctx.color):
         canvas.segments(row, 2, parts, inner)
         row += 1
+    if key:
+        canvas.segments(row, 2, plot.legend(chart, RANGE_WORDS.get(name, name), ctx.ascii,
+                                             inner, ctx.color), inner)
 
 
 def overview_chart(ctx: Context, rows: int) -> Pane:
@@ -989,7 +1044,7 @@ def overview_chart(ctx: Context, rows: int) -> Pane:
 
     def draw(canvas: Any, top: int, height: int, width: int, state: Any, focused: bool,
              shown: List[Line]) -> List[Tuple[int, ...]]:
-        draw_chart(canvas, top, height, ctx, chart, entry, width - 4, what)
+        draw_chart(canvas, top, height, ctx, chart, entry, width - 4, what, name)
         for at in range(top - 1, top + height):
             ctx.app.click_targets.append((at, 0, width, target))
         return []
@@ -1001,21 +1056,16 @@ def overview_chart(ctx: Context, rows: int) -> Pane:
 
 
 def range_detail(ctx: Context, view: View) -> List[Pane]:
-    params = {k: view.params.get(k) for k in ("user", "account") if view.params.get(k)}
+    params = {k: view.params.get(k) for k in SCOPE_ROLES if view.params.get(k)}
     name = ctx.range
     metric = view.extra.get("metric") or gpu_metric(ctx)
     scoped = bool(params)
-    who = params.get("user") or params.get("account") or (
+    who = scope_name(params) or (
         ctx.snap.cluster.name if ctx.snap and ctx.snap.cluster.name else "cluster")
-    view.title = "%s · %s" % (name.capitalize(), params.get("user") or params.get("account")
-                              or "cluster")
-    if params.get("user"):
-        roles = ("account",)
-    elif params.get("account"):
-        roles = ("user",)
-    else:
-        roles = ("account", "user")
-    entry, series, chart = scope_chart(ctx, params, name, metric, roles)
+    view.title = "%s · %s" % (name.capitalize(), scope_name(params) or "cluster")
+    roles = scope_roles(params)
+    entry, series, chart = scope_chart(ctx, params, name, metric, roles,
+                                       not view.extra.get("hide_previous"))
     gpus, _ = capacity(ctx)
     heads = _headline(series, metric, name, ctx, scoped, gpus) if series is not None else []
     what = "GPUs" if metric == "gpu" else "CPUs"
@@ -1069,7 +1119,7 @@ def range_detail(ctx: Context, view: View) -> List[Pane]:
             canvas.segments(row, 2, parts, inner)
             row += 1
         row += 1 if rows - (row - top) > 10 else 0
-        draw_chart(canvas, row, top + rows - row, ctx, chart, entry, inner, what)
+        draw_chart(canvas, row, top + rows - row, ctx, chart, entry, inner, what, name)
         return []
 
     chart_pane = Pane("chart", "%s in use · %s" % (what, who), [text_line(name)],
@@ -1077,6 +1127,16 @@ def range_detail(ctx: Context, view: View) -> List[Pane]:
                       status=chart_status(ctx, entry, series, chart, name),
                       min_lines=chart_body, max_lines=chart_body)
     return [chart_pane] + below
+
+
+def scope_roles(params: Dict[str, Any]) -> Tuple[str, ...]:
+    """What a range detail breaks its usage down by: a person's accounts, an account's
+    people, a QOS's or a partition's (or the cluster's) accounts and people."""
+    if params.get("user"):
+        return ("account",)
+    if params.get("account"):
+        return ("user",)
+    return ("account", "user")
 
 
 def range_breakdown(ctx: Context, params: Dict[str, Any], name: str, series: Any,
@@ -1092,12 +1152,8 @@ def range_breakdown(ctx: Context, params: Dict[str, Any], name: str, series: Any
         Column("avg in use", 10, ">", 6),
         Column("vs prev", 7, ">", 7),
     )
-    if params.get("user"):
-        tabs = [("account", "Accounts")]
-    elif params.get("account"):
-        tabs = [("user", "People")]
-    else:
-        tabs = [("account", "Accounts"), ("user", "People")]
+    tabs = [(role, {"account": "Accounts", "user": "People"}[role])
+            for role in scope_roles(params)]
     panes = []
     span = (series.end - series.since) if series is not None else 0  # as the headline
     for role, label in tabs:
@@ -1144,11 +1200,8 @@ def range_breakdown(ctx: Context, params: Dict[str, Any], name: str, series: Any
             lines.append(text_line("history: " + ("computing…" if busy(types)
                                                   else missing(types)), FAINT))
         else:
-            who = params.get("user") or params.get("account")
-            for kind in kinds:
-                title = "%s · GPUs %s" % (who, kind.label)
-                target = (jobs_target(title, kind.rows) if kind.rows is not None else
-                          Target("jobs", dict(params, run_type=("gpu_count", kind.key)), title))
+            for kind in kinds:  # each opens its breakdown (j there lists the jobs)
+                target = runtype_target(params, "gpu_count", kind.key, kind.label)
                 lines.append(table.row([kind.label, ("" if kind.complete else "≥")
                                         + fmt.hours(kind.gpu_hours),
                                         share_cell(kind.share, ctx, 6), ""], target,
@@ -1508,7 +1561,9 @@ def roles(ctx: Context, view: View) -> List[Pane]:
         elif by == "qos":
             for qos in snap.qos or ():
                 names.add(qos.name)
-                limits[qos.name] = sum(1 for l in qos.limits if l.limit is not None)
+                count = sum(1 for l in qos.limits if l.limit is not None)
+                if count:
+                    limits[qos.name] = count
         else:
             names.update(p.name for p in snap.partitions or ())
     table = Table(ROLE_COLUMNS, ctx.width - 2, prune=EFFICIENCY)
@@ -1729,10 +1784,23 @@ def person_attempts(ctx: Context, user: str) -> Entry:
     return ctx.hist(("attempts", name, user), lambda: ctx.data.attempts(name, filt))
 
 
+# events about a whole role or period open a breakdown or a chart; events about a
+# few attempts (a failure burst, a preemption run, a pause) open those attempts
+_ROLE_EVENTS = {"first_account": "account", "first_qos": "qos"}
+_CHART_EVENTS = ("record_day", "change", "no_baseline")
+
+
 def event_target(event: Any, user: Optional[str]) -> Optional[Target]:
     title = event.text if len(event.text) <= 40 else event.text[:39] + "…"
     if event.job_id:
         return Target("job", {"job_id": event.job_id}, "job " + event.job_id)
+    role = _ROLE_EVENTS.get(event.kind)
+    where = event.where.items() if event.where is not None else ()
+    values = {r: next(iter(v)) for r, v in where if len(v) == 1}
+    if role is not None and values.get(role) and user:
+        return runtype_target({"user": user}, role, values[role], values[role])
+    if event.kind in _CHART_EVENTS and user:
+        return range_target_current(user)
     if event.rows:
         return jobs_target(title, event.rows)
     if event.window is not None or event.where is not None:
@@ -1748,6 +1816,11 @@ def event_target(event: Any, user: Optional[str]) -> Optional[Target]:
             params["window"] = (low, high)
         return Target("jobs", params, title)
     return None
+
+
+def range_target_current(user: str) -> Target:
+    """The person's range detail for the range on show (push keeps the current range)."""
+    return Target("range", {"user": user}, "Range · %s" % user)
 
 
 def jobs_target(title: str, rows: Sequence[Any]) -> Target:
@@ -1783,55 +1856,18 @@ def person(ctx: Context, view: View) -> List[Pane]:
     status = "%d running · %d pending" % (run, sum(j.task_count for j in live if j.pending))
     if ctx.snap is None:
         lines, status = [status_line("live", ctx.app.snapshot_entry)], ""
-    panes.append(Pane("live", "Now", lines, status=status, grow=False, max_lines=4))
-    more = "more"  # one box at the bottom: events, jobs, activity, roles as tabs
-
-    # kinds of runs. Every lambda binds its inputs now: it runs later on a worker thread,
-    # after this function has moved on (a late-bound loop variable once turned the range
-    # into an outcome name there, and every query failed with ERR 'other').
-    dim = view.extra.get("dim", "gpu_count")
-    dim_label = dict(hd.DIMENSIONS)[dim]
-    filt = make_filter(params)
+    panes.append(Pane("live", "Now", lines, status=status, grow=False,
+                      max_lines=4 if ctx.height >= 30 else 2))
+    more = "more"  # one box at the bottom: your roles first, then events, jobs, activity
     range_name = ctx.range
-    types_entry = ctx.hist(("runtypes", range_name, user, dim),
-                           lambda r=range_name, f=filt, d=dim: ctx.data.run_types(r, f, d))
-    kinds = value(types_entry)
-    table = Table(share_columns(RUN_COLUMNS, {"user": user}), ctx.width - 2, prune=EFFICIENCY)
-    lines = []
-    if kinds is None:
-        lines.append(text_line("history: %s %s" % (missing(types_entry), types_entry.message), DIM))
-    else:
-        for kind in kinds:
-            style = RESOURCE if dim in ("account", "qos", "partition") else PLAIN
-            if dim == "outcome":
-                style = OUTCOME_STYLE.get(kind.key, PLAIN)
-            fail_style = (BAD if kind.failure and kind.failure >= 0.25 else
-                          FAINT if not kind.failure else PLAIN)
-            cells = [(kind.label, style), fmt.num(kind.attempts), fmt.num(kind.jobs),
-                     ("" if kind.complete else "≥") + fmt.hours(kind.gpu_hours),
-                     fmt.pct(kind.share), fmt.duration(kind.runtime),
-                     fmt.duration(kind.wait), fmt.pct(kind.limit_use),
-                     eff_cell((kind.gpu_eff, kind.gpu_cover)),
-                     eff_cell((kind.cpu_eff, kind.cpu_cover)),
-                     (fmt.pct(kind.failure), fail_style) if kind.failure is not None
-                     else (fmt.NOT_APPLICABLE, DIM)]
-            title = "%s · %s %s" % (user, dim_label, kind.label)
-            target = (jobs_target(title, kind.rows) if kind.rows is not None else
-                      Target("jobs", {"user": user, "run_type": (dim, kind.key)}, title))
-            lines.append(table.row(cells, target,
-                                   {"GPU-h": kind.gpu_hours, "attempts": kind.attempts,
-                                    "fail": kind.failure, "runtime": kind.runtime}, key=kind.key))
-    runs_status = [[("g", KEY), (" group", DIM)]]  # type: List[Any]
-    if stale(types_entry):
-        runs_status.insert(0, "stale: %s %s" % (fmt.placeholder(types_entry.status),
-                                                types_entry.message))
-    panes.append(Pane("runs", "What kinds of runs · by %s · %s" % (dim_label, ctx.range), lines,
-                      table.header(), sorts=("GPU-h", "attempts", "fail", "runtime"),
-                      status=runs_status))
+    filt = make_filter(params)
+
+    # where the GPU-hours went, by kind of run (g: GPUs, job name, outcome), and under
+    # which roles: both answered on the page itself, each row opening its breakdown
+    panes.append(gpu_breakdown_pane(ctx, view, params))
+    panes.append(roles_breakdown_pane(ctx, params, group=more))
 
     # events
-    report_entry = range_report(ctx, params, (("account",), ("qos",), ("partition",)))
-    report = value(report_entry)
     events_entry = ctx.hist(("events", range_name, user),
                             lambda r=range_name, f=filt: ctx.data.events(r, f))
     found = value(events_entry)
@@ -1850,46 +1886,395 @@ def person(ctx: Context, view: View) -> List[Pane]:
     panes.append(Pane("events", "Events · " + ctx.range, lines, sorts=("time",), group=more,
                       tab="Events"))
 
-    # roles and outcomes
-    lines = []
-    if report is not None:
-        total = report.total.gpu_seconds or 0
-        for role in ("account", "qos", "partition"):
-            ranked = report.ranked(role)
-            parts = [(fmt.fit(role.replace("qos", "QOS"), 10), DIM)]
-            for number, (key, stats) in enumerate(ranked[:4]):
-                if number:
-                    parts.append(("  ", DIM))
-                share = stats.gpu_seconds / total if total else None
-                parts += [(key[0], RESOURCE), (" " + fmt.hours(stats.gpu_hours), PLAIN),
-                          (" GPU-h ", DIM), (fmt.pct(share), PLAIN)]
-            lines.append(Line(parts, Target("people", {role: ranked[0][0][0]}, role)
-                              if ranked else None))
-        parts = [(fmt.fit("outcome", 10), DIM)]
-        first = True
-        for outcome in hd.OUTCOME_ORDER:
-            stats = report.outcomes.get(outcome)
-            if stats is None or not stats.attempts:
-                continue
-            if not first:
-                parts.append(("  ", DIM))
-            first = False
-            style = {"completed": GOOD, "running": GOOD, "failed": BAD, "node_fail": BAD,
-                     "timeout": WARN, "preempted": WARN}.get(outcome, PLAIN)
-            parts += [(outcome, style), (" %d" % stats.attempts, PLAIN)]
-        lines.append(Line(parts))
-    else:
-        lines.append(text_line("history: %s" % missing(report_entry), DIM))
-    split = Pane("split", "Roles and outcomes · " + ctx.range, lines, grow=False,
-                 group=more, tab="Roles")
-
     # jobs list: a page at a time; a search asks history, not only the rows loaded
     jobs = paged_jobs(ctx, view, "Jobs · " + ctx.range, ("jobs", ctx.range, user, "gpu"), filt)
     jobs.group, jobs.tab = more, jobs.title.replace(" · " + ctx.range, "")
-    activity = activity_pane(ctx, params, report, report_entry)
+    report_entry = range_report(ctx, params, (("account",), ("qos",), ("partition",)))
+    activity = activity_pane(ctx, params, value(report_entry), report_entry)
     activity.group, activity.tab = more, "Activity"
-    panes += [jobs, activity, split]
+    panes += [jobs, activity]
     return panes
+
+
+# -- where the GPU-hours went --------------------------------------------------------
+
+# the kinds of runs the Me/Person page splits GPU-hours by (g cycles them); accounts,
+# QOS and partitions have their own pane beside it
+PAGE_DIMENSIONS = ("gpu_count", "name_family", "outcome")
+# one color per slice of a stacked bar, and for its row's name, largest first
+SLICE_STYLES = ("heat5", ACCENT, GOOD, WARN, USER, RESOURCE, "heat3", BAD)
+SLICE_GLYPHS = "█▓▒░"  # the same slices without color
+BREAKDOWN_COLUMNS = (
+    Column("Name", 12, "<", 10, flex=True, most=30),
+    Column("GPU-h", 6, ">", 9),
+    Column("share", 12, ">", 8, flex=True, most=30),
+    Column("vs prev", 7, ">", 7),
+    Column("trend", 8, ">", 6, flex=True, most=SPARK_MOST),
+)
+DIM_WORDS = {"gpu_count": "GPUs", "node_count": "nodes", "name_family": "job name",
+             "outcome": "outcome", "account": "account", "qos": "QOS", "partition": "partition"}
+
+
+def slice_style(index: int, ctx: Context) -> Tuple[str, str]:
+    """(glyph, style) of the index-th slice: a color, or a shade without color."""
+    if ctx.color:
+        return ("#" if ctx.ascii else "█"), SLICE_STYLES[index % len(SLICE_STYLES)]
+    glyphs = "#=+-" if ctx.ascii else SLICE_GLYPHS
+    return glyphs[index % len(glyphs)], PLAIN
+
+
+def stacked_bar(ctx: Context, shares: Sequence[float], size: int) -> List[Tuple[str, str]]:
+    """One bar of ``size`` cells split by ``shares``, each slice in its row's color."""
+    cells = breakdown.proportional(list(shares), size)
+    out = []  # type: List[Tuple[str, str]]
+    for index, count in enumerate(cells):
+        if count:
+            glyph, style = slice_style(index, ctx)
+            out.append((glyph * count, style))
+    used = sum(cells)
+    if used < size:
+        out.append((("." if ctx.ascii else "░") * (size - used), FAINT))
+    return out
+
+
+def scope_attempts(ctx: Context, params: Dict[str, Any], name: str) -> Entry:
+    """The scope's attempts in the range (newest first, up to a page): trends per kind."""
+    filt = make_filter(params)
+    return ctx.hist(("attempts", name, filt_key(params)),
+                    lambda r=name, f=filt: ctx.data.attempts(r, f))
+
+
+def previous_types(ctx: Context, params: Dict[str, Any], name: str, dim: str) -> Entry:
+    """GPU-hours per kind of run in the previous equal period, for the change column."""
+    filt = make_filter(params)
+    data = ctx.data
+
+    def load(r: str = name, f: Any = filt, d: str = dim) -> Optional[Dict[str, float]]:
+        win = hd.previous_window(r, data.clock())
+        if win is None:
+            return None
+        if data.has("run_types"):
+            found = data.history.run_types(win, f, by=d, cancel=getattr(data, "_cancel", None))
+            return {item.key: (item.stats.gpu_hours or 0.0) for item in found}
+        page = data.attempts(r, f, win=win)
+        out = {}  # type: Dict[str, float]
+        for kind in hd.run_types(page.rows, d):
+            out[kind.key] = kind.gpu_hours or 0.0
+        return out
+    return ctx.hist(("runtypes-prev", name, filt_key(params), dim), load)
+
+
+def range_bins(ctx: Context, name: str, rows: Sequence[Any]) -> List[int]:
+    """The range's chart bins (for all of history, from the oldest attempt shown)."""
+    end = int(ctx.now)
+    start = hd.window(name, end).start
+    if start is None:
+        starts = [r.start for r in rows if r.start is not None]
+        start = min(starts) if starts else end - 86400
+    return hd.bin_edges(int(start), end, hd.bin_unit(name, int(start), end))
+
+
+def gpu_breakdown_pane(ctx: Context, view: View, params: Dict[str, Any]) -> Pane:
+    """The scope's GPU-hours by kind of run: one stacked bar, then a row per kind with
+    its GPU-hours, share, change on the previous period and a small trend."""
+    dim = view.extra.get("dim", "gpu_count")
+    if dim not in PAGE_DIMENSIONS:
+        dim = view.extra["dim"] = "gpu_count"
+    name = ctx.range
+    filt = make_filter(params)
+    types_entry = ctx.hist(("runtypes", name, filt_key(params), dim),
+                           lambda r=name, f=filt, d=dim: ctx.data.run_types(r, f, d))
+    kinds = value(types_entry)
+    before = value(previous_types(ctx, params, name, dim)) if name != "all" else None
+    attempts = value(scope_attempts(ctx, params, name))
+    trends = {}  # type: Dict[Optional[str], List[float]]
+    if attempts is not None:
+        rows = attempts.rows
+        trends = breakdown.held_per_bin(rows, range_bins(ctx, name, rows), int(ctx.now),
+                                        lambda row, d=dim: hd._key(row, d))
+    table = Table(BREAKDOWN_COLUMNS, ctx.width - 2)
+    lines = []
+    if kinds is None:
+        lines.append(text_line("history: %s %s" % ("computing…" if busy(types_entry)
+                                                   else missing(types_entry),
+                                                   types_entry.message), DIM))
+    else:
+        kinds = [k for k in kinds if k.gpu_hours]
+        total = sum(k.gpu_hours or 0 for k in kinds)
+        if kinds:
+            # the whole bar is the scope's GPU-hours: it opens their chart
+            lines.append(Line(stacked_bar(ctx, [k.gpu_hours or 0 for k in kinds],
+                                          max(10, ctx.width - 6)), range_target(name, params),
+                              {"GPU-h": float("inf"), "name": ""}, key="(all)", pinned=True))
+        else:
+            lines.append(text_line("no GPU-hours in this range", FAINT))
+        for index, kind in enumerate(kinds):
+            share = (kind.gpu_hours or 0) / total if total else None
+            glyph, style = slice_style(index, ctx)
+            prev = before.get(kind.key, 0.0) if before is not None else None
+            spark = trends.get(kind.key)
+            # a swatch of its slice of the bar, so the bar reads without color too
+            cells = [[(glyph, style), (" " + kind.label, style if ctx.color else PLAIN)],
+                     ("" if kind.complete else "≥") + fmt.hours(kind.gpu_hours),
+                     (lambda size, f=share: share_cell(f, ctx, max(3, size - 7))),
+                     delta_cell(kind.gpu_hours, prev, before is not None)
+                     if name != "all" else [(fmt.NOT_APPLICABLE, FAINT)],
+                     (lambda size, data=spark: charts.spark(data, min(size, SPARK_MOST),
+                                                            ctx.ascii, ctx.color))]
+            lines.append(table.row(cells, runtype_target(params, dim, kind.key, kind.label),
+                                   {"GPU-h": kind.gpu_hours, "name": kind.label}, key=kind.key))
+    status = [[("g", KEY), (" GPUs / job name / outcome", DIM)]]  # type: List[Any]
+    if stale(types_entry):
+        status.insert(0, "stale: %s %s" % (fmt.placeholder(types_entry.status),
+                                           types_entry.message))
+    who = "your" if view.kind == "me" else (params.get("user") or "") + "'s"
+    rows_shown = max(4, min(10, (ctx.height - 18) // 2))
+    return Pane("runs", "Where %s GPU-hours went · by %s · %s" % (who, DIM_WORDS[dim], name),
+                lines, table.header(), sorts=("GPU-h", "name"), natural="GPU-h",
+                status=status, grow=False, max_lines=rows_shown, min_lines=min(4, rows_shown))
+
+
+ROLE_BREAKDOWN_COLUMNS = (Column("role", 9, "<", 9),) + BREAKDOWN_COLUMNS
+
+
+def roles_breakdown_pane(ctx: Context, params: Dict[str, Any], group: Optional[str] = None
+                         ) -> Pane:
+    """The accounts, QOS and partitions the scope used in the range, by GPU-hours, with
+    their share and change; each opens that role's breakdown."""
+    name = ctx.range
+    groups = (("account",), ("qos",), ("partition",))
+    entry = range_report(ctx, params, groups)
+    report = value(entry)
+    filt = make_filter(params)
+    prev = None
+    if name != "all":
+        prev = value(ctx.hist(("previous", name, filt_key(params), groups),
+                              lambda r=name, f=filt: ctx.data.previous(r, f, groups)))
+    attempts = value(scope_attempts(ctx, params, name))
+    trends = {}  # type: Dict[Optional[str], List[float]]
+    if attempts is not None:
+        rows = attempts.rows
+        trends = breakdown.held_per_bin(rows, range_bins(ctx, name, rows), int(ctx.now),
+                                        lambda row: "\0".join((row.account, row.qos,
+                                                                 row.partition)))
+    by_role = {}  # type: Dict[Tuple[str, str], List[float]]
+    for joined, bins in trends.items():
+        for role, part in zip(("account", "qos", "partition"), (joined or "").split("\0")):
+            have = by_role.get((role, part))
+            by_role[(role, part)] = bins if have is None else [a + b for a, b in zip(have, bins)]
+    table = Table(ROLE_BREAKDOWN_COLUMNS, ctx.width - 2)
+    lines = []
+    if report is None:
+        lines.append(text_line("history: %s" % ("computing…" if busy(entry)
+                                                else missing(entry)), DIM))
+    else:
+        total = report.total.gpu_seconds or 0
+        for role in ("account", "qos", "partition"):
+            before = {key[0]: stats for key, stats in prev.group(role).items()} \
+                if prev is not None and prev.complete else None
+            first = True
+            for key, stats in report.ranked(role):
+                if not stats.gpu_seconds:
+                    continue
+                share = stats.gpu_seconds / total if total else None
+                old = before.get(key[0]) if before is not None else None
+                change = delta_cell(stats.gpu_hours, old.gpu_hours if old is not None else
+                                    (0 if before is not None else None), before is not None) \
+                    if name != "all" else [(fmt.NOT_APPLICABLE, FAINT)]
+                cells = [(DIM_WORDS[role] if first else "", DIM), (key[0], RESOURCE),
+                         fmt.hours(stats.gpu_hours),
+                         (lambda size, f=share: share_cell(f, ctx, max(3, size - 7))), change,
+                         (lambda size, data=by_role.get((role, key[0])): charts.spark(
+                             data, min(size, SPARK_MOST), ctx.ascii, ctx.color))]
+                first = False
+                lines.append(table.row(cells, runtype_target(params, role, key[0], key[0]),
+                                       {"GPU-h": stats.gpu_seconds, "name": key[0]},
+                                       key=role + ":" + key[0]))
+        if not lines:
+            lines.append(text_line("no GPU-hours in this range", FAINT))
+    return Pane("roles", "Roles · accounts, QOS, partitions · " + name, lines,
+                table.header(), group=group, tab="Roles")
+
+
+# -- one kind of run in detail ---------------------------------------------------------
+
+def kind_words(dim: str, label: str) -> str:
+    """'x4 runs', 'job name train_<n>', 'outcome failed', 'account vision'."""
+    if dim == "gpu_count":
+        return label + " runs"
+    return "%s %s" % (DIM_WORDS.get(dim, dim), label)
+
+
+def runtype_target(params: Dict[str, Any], dim: str, key: str, label: str) -> Target:
+    scope = {k: params[k] for k in SCOPE_ROLES if params.get(k)}
+    return Target("runtype", dict(scope, dim=dim, key=key, label=label),
+                  "%s · %s" % (scope_name(scope) or "cluster", kind_words(dim, label)))
+
+
+def runtype(ctx: Context, view: View) -> List[Pane]:
+    """One kind of run (x4 GPU runs, a job-name family, an outcome, an account, a QOS or
+    a partition) for a person or an account: its GPU-hours over the range, its share,
+    outcomes, runtime and wait, and what it is made of. j lists its jobs."""
+    p = view.params
+    params = {k: p[k] for k in SCOPE_ROLES if p.get(k)}
+    dim, key = p["dim"], p["key"]
+    label = p.get("label") or hd.type_label(dim, key)
+    name = ctx.range
+    filt = make_filter(params)
+    data = ctx.data
+    kinds_entry = ctx.hist(("runtypes", name, filt_key(params), dim),
+                           lambda r=name, f=filt, d=dim: data.run_types(r, f, d))
+    kinds = value(kinds_entry)
+    kind = next((k for k in kinds or () if k.key == key), None)
+    local = kind.rows if kind is not None else None
+
+    def load(r: str = name, f: Any = filt, d: str = dim, k: str = key, ready: Any = local
+             ) -> Any:
+        if ready is not None:
+            return ready  # computed from the attempts list (no history run types)
+        win = hd.window(r, data.clock())
+        page = data.history.jobs(win, f, by="attempt", run_type=(d, k), sort="start",
+                                 descending=True, limit=hd.ATTEMPT_LIMIT,
+                                 cancel=getattr(data, "_cancel", None))
+        return page.rows
+    rows_entry = ctx.hist(("runtype-rows", name, filt_key(params), dim, key), load)
+    rows = value(rows_entry)
+    by_people = bool(params.get("account")) and not params.get("user")
+    info = breakdown.detail(rows, "user" if by_people else "family") if rows is not None \
+        else None
+    chart = None
+    if rows is not None:
+        edges = range_bins(ctx, name, rows)
+        held = breakdown.held_per_bin(rows, edges, int(ctx.now)).get(None) \
+            or [0.0] * (len(edges) - 1)
+        if any(held):
+            values = [h / float(edges[i + 1] - edges[i]) if edges[i + 1] > edges[i] else 0.0
+                      for i, h in enumerate(held)]
+            span = float(max(1, edges[-1] - edges[0]))
+            chart = plot.Chart(values, edges, hd.bin_unit(name, edges[0], edges[-1]), None,
+                               None, sum(held) / span, None, ctx.now, "GPUs")
+    who = scope_name(params) or "cluster"
+    heads = []  # type: List[List[Tuple[str, str]]]
+    if kind is not None:
+        heads.append([(("" if kind.complete else "≥") + fmt.hours(kind.gpu_hours),
+                       bold(BRIGHT)), (" GPU-h", DIM)])
+        if kind.share is not None:
+            heads.append([(fmt.pct(kind.share), bold(BRIGHT)), (" of %s's GPU-h" % who, DIM)])
+        heads.append([(fmt.num(kind.attempts), PLAIN), (" attempts / ", DIM),
+                      (fmt.num(kind.jobs), PLAIN), (" jobs", DIM)])
+        if kind.failure is not None:
+            heads.append([(fmt.pct(kind.failure), BAD if kind.failure >= 0.25 else PLAIN),
+                          (" failed", DIM)])
+    elif kinds is not None:
+        heads.append([("none of these runs in this range", FAINT)])
+    else:
+        heads.append([("computing…" if busy(kinds_entry) else "history " + missing(kinds_entry),
+                       FAINT)])
+
+    def draw(canvas: Any, top: int, height: int, width: int, state: Any, focused: bool,
+             shown: List[Line]) -> List[Tuple[int, ...]]:
+        inner = width - 4
+        row, col = top, 2
+        for option in hd.RANGE_NAMES:
+            text = " %s " % option.capitalize()
+            end = canvas.put(row, col, text, TAB if option == name else DIM)
+            ctx.app.click_targets.append((row, col, end, ("range", option)))
+            col = end + 1
+        row += 1
+        line = []  # type: List[Tuple[str, str]]
+        for item in heads:
+            add = ([("  ·  ", FAINT)] if line else []) + item
+            if charts.width(line) + charts.width(add) > inner:
+                break
+            line += add
+        canvas.segments(row, 2, line, inner)
+        row += 1
+        if info is not None and info.attempts and height >= 10:
+            split = breakdown.outcome_split(info.outcomes)
+            total = float(sum(n for _, n in split)) or 1.0
+            bar = max(10, min(40, inner // 3))
+            seg = [(fmt.fit("outcomes", 10), DIM)]  # type: List[Tuple[str, str]]
+            for (outcome, count), size in zip(split, breakdown.proportional(
+                    [n for _, n in split], bar)):
+                if size:
+                    seg.append((("#" if ctx.ascii else "█") * size,
+                                OUTCOME_STYLE.get(outcome, PLAIN)))
+            seg.append(("  ", PLAIN))
+            for outcome, count in split:
+                seg += [(outcome, OUTCOME_STYLE.get(outcome, PLAIN)),
+                        (" %s  " % fmt.pct(count / total), DIM)]
+            canvas.segments(row, 2, seg, inner)
+            row += 1
+            canvas.segments(row, 2, [
+                (fmt.fit("runtime", 10), DIM), ("median ", DIM),
+                (fmt.duration(info.runtime[0]), PLAIN), ("  p90 ", DIM),
+                (fmt.duration(info.runtime[1]), PLAIN), ("     wait  ", DIM), ("median ", DIM),
+                (fmt.duration(info.wait[0]), PLAIN), ("  p90 ", DIM),
+                (fmt.duration(info.wait[1]), PLAIN)], inner)
+            row += 1
+        if chart is None and rows is not None:
+            canvas.put(row, 2, "no GPUs held by these runs in this range", FAINT, limit=inner)
+            return []
+        draw_chart(canvas, row, top + height - row, ctx, chart, rows_entry, inner, "GPUs", name)
+        return []
+
+    below = runtype_breakdown(ctx, params, dim, key, label, info, rows_entry, by_people)
+    most = 3 if ctx.height < 30 else max(3, min(10, (ctx.height - 10) // 3))
+    body = max(8, ctx.height - 3 - 1 - 2 - max(1, min(most, len(below.lines))))
+    status = [[("j", KEY), (" its jobs", DIM)]]  # type: List[Any]
+    if rows is None and busy(rows_entry):
+        status.insert(0, [("computing…", DIM)])
+    elif rows is not None and len(rows) >= hd.ATTEMPT_LIMIT:
+        status.insert(0, [("newest %s attempts" % fmt.num(len(rows)), WARN)])
+    chart_pane = Pane("chart", "GPUs in use · %s · %s" % (who, kind_words(dim, label)),
+                      [text_line(name)], grow=False, draw=draw, fixed=body, focusable=False,
+                      status=status, min_lines=body, max_lines=body)
+    return [chart_pane, below]
+
+
+def runtype_jobs_target(view: View) -> Target:
+    """``j`` on a run-type breakdown: its jobs, as a list."""
+    p = view.params
+    scope = {k: p[k] for k in SCOPE_ROLES if p.get(k)}
+    return Target("jobs", dict(scope, run_type=(p["dim"], p["key"])),
+                  "%s · jobs" % view.title)
+
+
+def runtype_breakdown(ctx: Context, params: Dict[str, Any], dim: str, key: str, label: str,
+                      info: Any, entry: Entry, by_people: bool) -> Pane:
+    """What the kind of run is made of: job-name families (or, for an account, people),
+    largest first; each opens its own breakdown."""
+    columns = (Column("Name", 14, "<", 10, flex=True, most=40), Column("GPU-h", 6, ">", 9),
+               Column("share", 12, ">", 8, flex=True, most=30), Column("att", 5, ">", 5),
+               Column("fail", 5, ">", 6))
+    table = Table(columns, ctx.width - 2)
+    lines = []
+    if info is None:
+        lines.append(text_line("history: %s" % ("computing…" if busy(entry)
+                                                else missing(entry)), DIM))
+    else:
+        total = info.gpu_seconds
+        for group in info.groups:
+            share = group.gpu_seconds / total if total else None
+            if by_people:  # this person's runs of the same kind
+                target = runtype_target(dict(params, user=group.key), dim, key, label)
+                name = (group.key, USER)
+            else:
+                target = runtype_target(params, "name_family", group.key, group.key)
+                name = (group.key, PLAIN)
+            fail = group.failure
+            lines.append(table.row(
+                [name, fmt.hours(group.gpu_seconds / 3600.0),
+                 (lambda size, f=share: share_cell(f, ctx, max(3, size - 7))),
+                 fmt.num(group.attempts),
+                 (fmt.pct(fail), BAD if fail >= 0.25 else PLAIN) if fail is not None
+                 else (fmt.NOT_APPLICABLE, FAINT)], target,
+                {"GPU-h": group.gpu_seconds, "name": group.key, "attempts": group.attempts},
+                key=group.key))
+        if not lines:
+            lines.append(text_line("no attempts in this range", FAINT))
+    return Pane("parts", "People" if by_people else "Job names", lines, table.header(),
+                sorts=("GPU-h", "attempts", "name"), natural="GPU-h")
 
 
 def column_chart(values: Sequence[float], size: int, rows: int, ascii_only: bool,
@@ -2067,77 +2452,173 @@ def jobs_list(ctx: Context, view: View) -> List[Pane]:
 
 # -- Timeline ----------------------------------------------------------------
 
+LANE_WORDS = {"user": "person", "account": "account", "qos": "QOS", "partition": "partition"}
+
+
+class Lanes:
+    """The timeline's data: per lane (a person, account, QOS or partition), the GPUs
+    (or CPUs) it held on average in each column, and four shade levels from the data."""
+
+    def __init__(self, start: int, end: int, lanes: List[Tuple[str, List[float], float, float,
+                                                                int]],
+                 bounds: List[float]) -> None:
+        self.start, self.end = start, end
+        self.lanes = lanes  # (key, average held per column, held-seconds, peak, peak column)
+        self.bounds = bounds  # upper bounds of shade levels 1-3; level 4 is above
+
+
+def lane_bounds(values: Sequence[float]) -> List[float]:
+    """Three increasing bounds that split what the lanes held into four shades: the
+    quartiles of every non-empty cell, rounded (whole GPUs from 1 up)."""
+    held = sorted(v for v in values if v > 0)
+    if not held:
+        return [1.0, 2.0, 4.0]
+    out = []  # type: List[float]
+    for fraction in (0.25, 0.5, 0.75):
+        value = held[min(len(held) - 1, int(fraction * len(held)))]
+        value = float(max(1, int(round(value)))) if value >= 0.75 else round(value, 1) or 0.1
+        if out and value <= out[-1]:
+            value = out[-1] + (1 if out[-1] >= 1 else 0.1)
+        out.append(value)
+    return out
+
+
+def lane_level(value: float, bounds: Sequence[float]) -> int:
+    """0 (nothing held), else 1-4."""
+    if value <= 0:
+        return 0
+    for level, bound in enumerate(bounds, 1):
+        if value <= bound:
+            return level
+    return 4
+
+
+def compute_lanes(report: Any, cols: int) -> Lanes:
+    """Hourly per-key usage (``report.keyed_values``, seconds held per hour) averaged
+    into ``cols`` columns over the report's span."""
+    start, end = report.start, report.end
+    span = float(max(1, end - start))
+    size = span / cols
+    edges = report.edges
+    lanes = []
+    every = []  # type: List[float]
+    for key, seconds in (report.keyed_values or {}).items():
+        held = [0.0] * cols  # seconds held, per column
+        for hour, amount in enumerate(seconds):
+            if not amount:
+                continue
+            a, b = max(edges[hour], start), min(edges[hour + 1], end)
+            if b <= a:
+                continue
+            rate = amount / float(edges[hour + 1] - edges[hour])
+            first = max(0, int((a - start) / size))
+            last = min(cols - 1, int((b - start - 1e-9) / size))
+            for col in range(first, last + 1):
+                lo, hi = start + col * size, start + (col + 1) * size
+                overlap = min(b, hi) - max(a, lo)
+                if overlap > 0:
+                    held[col] += rate * overlap
+        average = [h / size for h in held]
+        total = sum(held)
+        if total <= 0:
+            continue
+        peak_col = max(range(cols), key=lambda c: (average[c], c))
+        lanes.append((key, average, total, average[peak_col], peak_col))
+        every += average
+    lanes.sort(key=lambda lane: (-lane[2], lane[0]))
+    return Lanes(start, end, lanes, lane_bounds(every))
+
+
+def lanes_entry(ctx: Context, range_name: str, by: str, metric: str, cols: int) -> Entry:
+    data = ctx.data
+
+    def load(name: str = range_name, b: str = by, m: str = metric, c: int = cols) -> Lanes:
+        report = data.history.query(hd.window(name, data.clock()), None, series_by=b,
+                                    series_metric=m, efficiency=False,
+                                    cancel=getattr(data, "_cancel", None))
+        return compute_lanes(report, c)
+    return ctx.hist(("lanes", range_name, by, metric, cols), load)
+
+
+def _held(value: float) -> str:
+    return plot._figure(round(value, 1) if value < 10 else round(value))
+
+
+def lane_legend(lanes: Lanes, what: str, ascii_only: bool, color: bool) -> List[Any]:
+    """'░ ≤4 ▒ ≤16 ▓ ≤32 █ >32 GPUs': what each shade means, from the data."""
+    shades = charts.ASCII_SHADES if ascii_only else charts.SHADES
+    out = []  # type: List[Tuple[str, str]]
+    for level in range(1, 5):
+        if out:
+            out.append((" ", PLAIN))
+        bound = lanes.bounds[level - 1] if level < 4 else lanes.bounds[-1]
+        text = ("≤" if level < 4 else ">") + _held(bound)
+        out += [(shades[level - 1], LANE_STYLES[level] if color else PLAIN), (text, DIM)]
+    return out + [(" " + what + " held on average", DIM)]
+
+
+LANE_STYLES = {1: "heat2", 2: "heat3", 3: "heat4", 4: "heat5"}
+
+
 def timeline(ctx: Context, view: View) -> List[Pane]:
+    """Who held the GPUs when: one lane per person, account, QOS or partition (``g``),
+    each cell shaded by how many GPUs (or CPUs) the lane held on average then. A lane
+    opens its range detail: its chart, figures and breakdown."""
     by = view.extra.get("lanes", "user")
-    zoom = view.extra.get("zoom", 1)
     gpus_now = ctx.snap.totals.gpus.total if ctx.snap is not None else None
     metric = view.extra.get("metric") or ("gpu" if gpus_now != 0 else "cpu")
-    entry = ctx.hist(("lanes", ctx.range, by, metric),
-                     lambda name=ctx.range, b=by, m=metric: lanes_report(ctx, name, b, m))
-    report = value(entry)
-    if report is None:
-        return [Pane("timeline", "Timeline", [text_line("history: %s %s" % (
-            missing(entry), entry.message), DIM)])]
+    what = "GPUs" if metric == "gpu" else "CPUs"
     label_width = min(16, max(8, ctx.width // 6))
-    bins = max(10, ctx.width - label_width - 4)
-    span = max(1, report.end - report.start)
-    shown = max(bins, span // zoom)
-    pan = view.extra.get("pan", 0.0)  # 0 = ends at the window's end
-    end = report.end - int(pan * shown)
-    end = max(report.start + shown, min(report.end, end))
-    start = end - shown
-    size = shown / float(bins)
-    cursor = max(0, min(bins - 1, view.extra.get("bin", bins - 1)))
-    view.extra["bin"] = cursor
-    view.extra["bins"] = (start, size, bins)
-    axis = timeline_axis(start, size, bins, shown)
-    header = Line([(fmt.fit(by, label_width) + " ", DIM), ("".join(axis), DIM)])
-    glyph = "▄"
+    cols = max(10, ctx.width - label_width - 4)
+    title = ("%s in use per %s over time · %s" if ctx.width >= 120 else "%s per %s · %s") % (
+        what, LANE_WORDS[by], ctx.range)  # short when narrow: the shade scale must fit
+    entry = lanes_entry(ctx, ctx.range, by, metric, cols)
+    found = value(entry)
+    if found is None:
+        return [Pane("timeline", title, [text_line("history: %s %s" % (
+            missing(entry), entry.message), DIM)])]
+    shown = found.end - found.start
+    size = shown / float(cols)
+    axis = timeline_axis(found.start, size, cols, shown)
+    header = Line([(fmt.fit(LANE_WORDS[by], label_width) + " ", DIM), ("".join(axis), DIM)])
+    shades = charts.ASCII_SHADES if ctx.ascii else charts.SHADES
+    style = USER if by == "user" else RESOURCE
     lines = []
-    for lane in report.lanes:
-        cover = [0.0] * bins
-        total = 0
-        for a, b in lane.intervals:
-            total += b - a
-            if b <= start or a >= end:
-                continue
-            a, b = max(a, start), min(b, end)
-            first, last = int((a - start) / size), min(bins - 1, int((b - start - 1) / size))
-            for i in range(first, last + 1):
-                lo, hi = start + i * size, start + (i + 1) * size
-                cover[i] += max(0.0, min(b, hi) - max(a, lo)) / size
-        cells = charts.heat_cells([min(1.0, c) for c in cover], ctx.ascii, ctx.color, glyph)
-        flat = [(ch, style) for text, style in cells for ch in text]
-        here = flat[cursor]
-        flat[cursor] = ((here[0], bold(ACCENT)) if here[0] != " " else ("┊", ACCENT))
-        style = USER if by == "user" else RESOURCE
-        bin_start = int(start + cursor * size)
-        bin_end = int(start + (cursor + 1) * size) + 1
-        parts = [(fmt.fit(lane.key, label_width) + " ", style)] + charts._join(flat)
-        params = {by: lane.key, "window": (bin_start, bin_end)}
-        lines.append(Line(parts, Target("jobs", params, "%s %s · jobs in the bin at %s" % (
-            by, lane.key, fmt.when(bin_start, ctx.now))),
-                          {"busy": total, "name": lane.key}, key=lane.key))
-    lines.sort(key=lambda l: -l.sort["busy"])
-    status = "bin %s · %s → %s" % (fmt.duration(size), fmt.when(start + cursor * size, ctx.now),
-                                   fmt.when(start + (cursor + 1) * size, ctx.now))
-    shade = [("%s held " % ("GPUs" if metric == "gpu" else "CPUs"), DIM)] + charts.legend(
-        ctx.ascii, ctx.color, glyph)
-    # the bin first: the legend is dropped whole on a narrow screen, never cut mid-word
-    return [Pane("timeline", "Timeline · %s lanes by %s · %s · zoom %dx" % (
-        "GPU" if metric == "gpu" else "CPU", by, ctx.range, zoom),
-                 lines, header, sorts=("busy", "name"), status=(status, shade),
-                 select_width=label_width + 1)]
-
-
-def lanes_report(ctx: Context, range_name: str, by: str, metric: str) -> Any:
-    """Lanes from attempts holding the metric's resource (GPU view: GPU jobs only), so a
-    CPU-only partition is not drawn solid on the GPU view."""
-    try:
-        return ctx.data.report(range_name, None, lanes_by=by, efficiency=False,
-                               lanes_metric=metric)
-    except TypeError:  # a history layer without per-metric lanes
-        return ctx.data.report(range_name, None, lanes_by=by, efficiency=False)
+    for key, average, total, peak, peak_col in found.lanes:
+        cells = []  # type: List[Tuple[str, str]]
+        for held in average:
+            level = lane_level(held, found.bounds)
+            if not level:
+                cells.append((" ", PLAIN))
+            else:
+                cells.append((shades[level - 1], LANE_STYLES[level] if ctx.color else PLAIN))
+        parts = [(fmt.fit(key, label_width) + " ", style)] + charts._join(cells)
+        params = {by: key}
+        lines.append(Line(parts, range_target(ctx.range, params),
+                          {"busy": total, "name": key, "peak": peak,
+                           "peak_at": found.start + (peak_col + 0.5) * size}, key=key))
+    if not lines:
+        lines.append(text_line("no %s held in this range" % what, FAINT))
+    # the status names the selected lane: what it held on average and at its busiest
+    state = view.panes.get("timeline") if isinstance(view.panes, dict) else None
+    cursor = state.cursor if state is not None else 0
+    # the selected lane in the title row; the shade scale on a row of its own under the
+    # lanes, so a long title never pushes it out
+    status = []  # type: List[Any]
+    selected = [l for l in lines if l.sort]
+    if selected:
+        chosen = selected[max(0, min(len(selected) - 1, cursor))]
+        info = chosen.sort
+        status.append([(info["name"], style), (" avg ", DIM),
+                       (_held(info["busy"] / float(max(1, shown))), PLAIN),
+                       (" · peak ", DIM), (_held(info["peak"]), PLAIN),
+                       (" " + time.strftime("%b %d %H:%M", time.localtime(info["peak_at"])), DIM),
+                       ("  ↵ chart", DIM)])
+    scale = Line([(fmt.fit("shade =", label_width) + " ", DIM)]
+                 + lane_legend(found, what, ctx.ascii, ctx.color))
+    return [Pane("timeline", title, lines, header, sorts=("busy", "name"),
+                 status=status, select_width=label_width + 1, click_opens=True,
+                 footer=scale)]
 
 
 def timeline_axis(start: float, size: float, bins: int, shown: float) -> List[str]:
@@ -2496,7 +2977,7 @@ def job(ctx: Context, view: View) -> List[Pane]:
 HELP = [
     ("Navigation", HEAD),
     ("  o m n j p a t   Overview, Me, Nodes, Queue (jobs), People, Roles (accounts), Timeline", PLAIN),
-    ("  ← →             previous / next tab (in Timeline: move the bin cursor)", PLAIN),
+    ("  ← →             previous / next tab", PLAIN),
     ("  ↑ ↓ PgUp PgDn   move in the focused pane (PgUp/PgDn a page);  Home/End  first/last", PLAIN),
     ("  Tab Shift-Tab   next / previous pane", PLAIN),
     ("  Enter           drill into the row (›);  Esc / Backspace  back up the breadcrumb", PLAIN),
@@ -2506,11 +2987,12 @@ HELP = [
     ("                  in the header)", PLAIN),
     ("  ↵ on a range    Overview tiles, Trend rows: that range in detail — GPUs in use over time", PLAIN),
     ("                  against capacity and the previous period, who used it;  ← → [ ] step", PLAIN),
-    ("                  through the ranges there, g GPUs or CPUs", PLAIN),
+    ("                  through the ranges there, g GPUs or CPUs, v previous period on/off", PLAIN),
     ("  g               Roles: account/QOS/partition;  Person: run types by GPUs, nodes, job name,", PLAIN),
     ("                  account, QOS, partition, outcome;", PLAIN),
-    ("                  Timeline: lanes by user/account/QOS/partition", PLAIN),
-    ("  + - , .  c      Timeline zoom and pan;  c: GPU or CPU lanes", PLAIN),
+    ("                  Timeline: lanes by person/account/QOS/partition; ↵ or a click on a", PLAIN),
+    ("                  lane opens its range detail (chart, figures, who used it)", PLAIN),
+    ("  c               Timeline: GPU or CPU lanes", PLAIN),
     ("  l e b u         Job: stdout tail, stderr tail, batch script, submit line (on request only)", PLAIN),
     ("  E               load efficiency (step usage) for the current range and person", PLAIN),
     ("  r  ?  q         refresh now, this help, quit", PLAIN),
@@ -2554,15 +3036,17 @@ HELP = [
     ("  stranded GPUs         free GPUs that cannot start: no free core or memory left on the node", PLAIN),
     ("  largest block         the most GPUs free on one node: the biggest job that could start now", PLAIN),
     ("  mem n/a/size          Nodes: Slurm does not track memory allocation there; the size is shown", PLAIN),
-    ("  lanes                 Timeline: each cell is one bin, shaded by the part of it with GPUs", PLAIN),
-    ("                        (or CPUs) held", PLAIN),
+    ("  lanes                 Timeline: each cell is a slice of the range, shaded by the GPUs (or", PLAIN),
+    ("                        CPUs) the lane held on average then; the scale on the border is", PLAIN),
+    ("                        the quartiles of all cells, so each shade is about as common", PLAIN),
     ("  paths                 Job: as Slurm recorded them; checked with os.stat, never read", PLAIN),
     ("  share                 part of the cluster's allocated GPU-hours in the same range;", PLAIN),
     ("                        of acct / of QOS / of part / of user: part of that one's GPU-hours", PLAIN),
     ("  members               Overview: users with an association or usage in the account", PLAIN),
     ("  GPUs in use           Range detail: allocated GPU-hours per bin ÷ the bin's hours (the", PLAIN),
     ("                        average held); bins: day hourly, week 3-hourly, month daily, year", PLAIN),
-    ("                        weekly; the dashed line is the same offset in the previous period", PLAIN),
+    ("                        weekly; the amber line is the previous period at the same offsets;", PLAIN),
+    ("                        peak = the busiest bin's average; now = GPUs held this moment", PLAIN),
     ("  active                Roles: users with jobs now or usage in the range", PLAIN),
     ("  visible               how much of an account's history you can see: full, own only,", PLAIN),
     ("                        denied, or no accounting", PLAIN),
@@ -2622,15 +3106,16 @@ def me(ctx: Context, view: View) -> List[Pane]:
 SCREENS = {
     "overview": overview, "me": me, "person": person, "nodes": nodes, "queue": queue,
     "people": people, "roles": roles, "timeline": timeline, "job": job, "jobs": jobs_list,
-    "help": help_screen, "range": range_detail,
+    "help": help_screen, "range": range_detail, "runtype": runtype,
 }
 
 FOOTERS = {
     "overview": [("↵", "open")],
-    "range": [("←→", "range"), ("g", "GPU/CPU")],
-    "me": [("g", "run types"), ("E", "efficiency")],
-    "person": [("g", "run types"), ("E", "efficiency")],
+    "range": [("←→", "range"), ("g", "GPU/CPU"), ("v", "prev")],
+    "me": [("g", "GPUs/name/outcome"), ("E", "efficiency")],
+    "person": [("g", "GPUs/name/outcome"), ("E", "efficiency")],
+    "runtype": [("j", "jobs"), ("←→", "range")],
     "roles": [("g", "group")],
-    "timeline": [("g", "lanes"), ("←→", "bin"), ("+-", "zoom"), (",.", "pan")],
+    "timeline": [("↵", "lane chart"), ("g", "lanes"), ("c", "GPU/CPU")],
     "job": [("l e b u", "fetch")],
 }

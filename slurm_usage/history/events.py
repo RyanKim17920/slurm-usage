@@ -8,8 +8,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from .errors import Cancelled, canceller
-from .records import OUTCOMES
-from .select import Filter, Selection, resolve
+from .records import OUTCOMES, outcome_of
+from .select import Filter, Selection, resolve, unresolved
+from .store import OPEN_STOP
 from .timeline import DAY, HOUR, Window, local_date, local_midnight
 
 KINDS = ("largest_allocation", "longest_run", "preemption_run", "failure_burst", "idle_gap",
@@ -66,6 +67,15 @@ def find_events(store: Any, as_of: int, window: Optional[Window], where: Optiona
                 covered_from: Optional[int], cancel: Any = None,
                 limit: int = 200) -> List[Event]:
     """Chronological. Baselines use everything loaded before the window."""
+    if getattr(store, "has_agg", False):
+        return _find_events_sql(store, as_of, window, where, covered_from, cancel, limit)
+    return find_events_scan(store, as_of, window, where, covered_from, cancel, limit)
+
+
+def find_events_scan(store: Any, as_of: int, window: Optional[Window], where: Optional[Filter],
+                     covered_from: Optional[int], cancel: Any = None,
+                     limit: int = 200) -> List[Event]:
+    """find_events() by reading every row up to the window's end, in Python."""
     window, where, cancelled = window or Window(), where or Filter(), canceller(cancel)
     events = []  # type: List[Event]
     with store.lock:
@@ -150,6 +160,17 @@ def find_events(store: Any, as_of: int, window: Optional[Window], where: Optiona
         if cover is not None and cover < high and high - cover > 0:
             gaps.append((max(cover, low), high))
 
+    return _conclude(where, low, high, has_prior, top, longest, prior_max_gpus,
+                     prior_max_cpus, prior_max_run, chains, prior_fail_days, failures,
+                     prior_gaps, gaps, firsts, limit)
+
+
+def _conclude(where: Filter, low: int, high: int, has_prior: bool, top: Any, longest: Any,
+              prior_max_gpus: int, prior_max_cpus: int, prior_max_run: int,
+              chains: Dict[Tuple[int, Any], List[tuple]], prior_fail_days: Dict[Any, int],
+              failures: Dict[Tuple[Any, str], List[tuple]], prior_gaps: List[int],
+              gaps: List[Tuple[int, int]], firsts: List[Event], limit: int) -> List[Event]:
+    events = []  # type: List[Event]
     if top is not None and (top[0][0] or top[0][1]):
         (gpus, cpus), begun, label, roles = top
         record = has_prior and (gpus > prior_max_gpus if gpus else cpus > prior_max_cpus)
@@ -224,6 +245,102 @@ def find_events(store: Any, as_of: int, window: Optional[Window], where: Optiona
     events.extend(firsts)
     events.sort(key=lambda e: (e.time, KINDS.index(e.kind)))
     return events[:limit]
+
+
+
+
+def _find_events_sql(store: Any, as_of: int, window: Optional[Window], where: Optional[Filter],
+                     covered_from: Optional[int], cancel: Any = None,
+                     limit: int = 200) -> List[Event]:
+    """find_events_scan()'s results with the baselines from before the window computed by
+    SQLite: only the rows that started inside the window are read here."""
+    window, where, cancelled = window or Window(), where or Filter(), canceller(cancel)
+    with store.lock:
+        dims = store.dims()
+        chosen = Selection(dims, {}, where)
+        first = store.first_start(chosen.dim_ids)
+        span = resolve(window, as_of, first)
+        low, high = span.start, span.end
+        whole = resolve(Window(None, high), as_of, first)
+        has_prior = prior_loaded(covered_from, low, high - low)
+        picked = set(dims) if chosen.dim_ids is None else set(chosen.dim_ids) & set(dims)
+        outcomes = where.outcome
+        finished = {d for d in picked
+                    if outcomes is None or outcome_of(dims[d].state, True) in outcomes}
+        running = {d for d in picked
+                   if outcomes is None or outcome_of(dims[d].state, False) in outcomes}
+        skip = [r[0] for r in store.open_rows()
+                if r[2] in dims and unresolved(dims[r[2]].state, None, r[8])]
+        everything = chosen.dim_ids is None and outcomes is None
+        rows = store.event_rows(high, whole.end, as_of, None if everything else finished,
+                                None if everything else running, skip)
+        failed = {d for d in finished if outcome_of(dims[d].state, True) in _FAILED}
+        chained = {d for d in finished
+                   if outcome_of(dims[d].state, True) in ("preempted", "requeued")}
+        prior, ends, found_gaps, cover, chain_rows = store.event_prior(rows, low, failed,
+                                                                       chained)
+
+        prior_max_gpus = max([r[1] or 0 for r in prior] or [0])
+        prior_max_cpus = max([r[2] or 0 for r in prior] or [0])
+        prior_max_run = max([r[3] for r in prior if r[3] is not None] or [0])
+        seen_accounts = {dims[r[0]].account for r in prior}
+        seen_qos = {dims[r[0]].qos for r in prior}
+        prior_fail_days = {}  # type: Dict[Any, int]
+        for ended in ends:
+            day = local_date(ended)
+            prior_fail_days[day] = prior_fail_days.get(day, 0) + 1
+        prior_gaps = []  # type: List[int]
+        gaps = []  # type: List[Tuple[int, int]]
+        for begun, before in found_gaps:
+            if begun <= low:
+                prior_gaps.append(begun - before)
+            else:
+                gaps.append((max(before, low), begun))
+        if cover is not None and cover < high and high - cover > 0:
+            gaps.append((max(cover, low), high))
+        chains = {}  # type: Dict[Tuple[int, Any], List[tuple]]
+        for begun, real_stop, job, dim, gpus, suspended, stop in chain_rows:
+            roles = dims[dim]
+            outcome = outcome_of(roles.state, stop < OPEN_STOP)
+            if outcome in ("preempted", "requeued") or (job, roles.uid) in chains:
+                chains.setdefault((job, roles.uid), []).append(
+                    (begun, real_stop, outcome, gpus * max(0, real_stop - begun - suspended)))
+
+        if cancelled():
+            raise Cancelled()
+        # inside the window: the largest, the longest, firsts and failures, from SQLite
+        biggest, long_row, first_rows, failed_rows = store.event_inside(rows, low, failed)
+        top = longest = None  # type: Optional[tuple]
+        if biggest is not None:
+            gpus, cpus, begun, job, dim = biggest
+            top = ((gpus, cpus), begun, str(job), dims[dim])
+        if long_row is not None:
+            runtime, begun, ended, job, gpus = long_row
+            longest = (runtime, begun, ended, str(job), gpus)
+        firsts = []  # type: List[Event]
+        if has_prior:
+            for dim, begun, job in sorted(first_rows, key=lambda r: r[1]):
+                roles = dims[dim]
+                label = str(job)
+                if roles.account not in seen_accounts:
+                    seen_accounts.add(roles.account)
+                    firsts.append(Event("first_account", begun, None,
+                                        "First use of account %s" % roles.account,
+                                        {"account": roles.account},
+                                        where.replace(account=roles.account),
+                                        Window(begun, high), label))
+                if roles.qos not in seen_qos:
+                    seen_qos.add(roles.qos)
+                    firsts.append(Event("first_qos", begun, None,
+                                        "First use of QOS %s" % roles.qos, {"qos": roles.qos},
+                                        where.replace(qos=roles.qos), Window(begun, high), label))
+        failures = {}  # type: Dict[Tuple[Any, str], List[tuple]]
+        for begun, ended, job, code in failed_rows:
+            key = (local_date(ended or begun), code or "?")
+            failures.setdefault(key, []).append((begun, ended or begun, str(job)))
+    return _conclude(where, low, high, has_prior, top, longest, prior_max_gpus,
+                     prior_max_cpus, prior_max_run, chains, prior_fail_days, failures,
+                     prior_gaps, gaps, firsts, limit)
 
 
 def add_period_events(events: List[Event], days: List[Tuple[int, int, int]],

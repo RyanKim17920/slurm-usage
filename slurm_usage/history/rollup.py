@@ -14,10 +14,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from .aggregate import usage_ratios
+from .aggregate import start_counts, usage_ratios
 from .errors import Cancelled, Progress, ProgressFn, canceller
 from .select import Filter, Selection, Span, effective
-from .store import OPEN_STOP
+from .store import AGG_VERSION, OPEN_STOP
 from .timeline import DAY, HOUR
 
 CHUNK = 7 * DAY
@@ -144,9 +144,14 @@ def build(store: Any, as_of: int, progress: ProgressFn = None, cancel: Any = Non
     """Bring the rollup up to date, newest first. Returns hours rebuilt."""
     cancelled = canceller(cancel)
     settled = floor_hour(as_of)
+    agg = getattr(store, "has_agg", False)
     with store.lock:
         last = store.get_meta("rollup_until")
         dirty = store.get_meta("dirty")
+        if agg and store.get_meta("agg") != AGG_VERSION:
+            last = None  # a cache from before these aggregates: build everything once
+            store.agg_reset()
+            store.set_meta("agg", AGG_VERSION)
         if last is None:
             first = store.first_start()
             dirty = None if first is None else [first, settled]
@@ -169,8 +174,8 @@ def build(store: Any, as_of: int, progress: ProgressFn = None, cancel: Any = Non
         if cancelled():
             raise Cancelled()
         begin = max(low, high - CHUNK)
-        rows = _chunk(store, chosen, begin, high, as_of)
-        store.rollup_replace(begin, high, rows, None if begin <= low else [low, begin])
+        rows, extra = _chunk(store, chosen, begin, high, as_of, agg)
+        store.rollup_replace(begin, high, rows, None if begin <= low else [low, begin], extra)
         done += (high - begin) // HOUR
         high = begin
         if progress:
@@ -178,9 +183,12 @@ def build(store: Any, as_of: int, progress: ProgressFn = None, cancel: Any = Non
     return done
 
 
-def _chunk(store: Any, chosen: Selection, low: int, high: int, as_of: int) -> List[tuple]:
+def _chunk(store: Any, chosen: Selection, low: int, high: int, as_of: int,
+           agg: bool = False) -> Tuple[List[tuple], Optional[tuple]]:
     span = Span(low, high, low, high, as_of)
     sums = {}  # type: Dict[Tuple[int, int], list]
+    exact = {}  # type: Dict[Tuple[int, int], list]  # finished allocations only
+    starts = {}  # type: Dict[Tuple[int, int], list]
     rows = store.scan(low, high, usage=True, ordered=False,
                       by_start=store.cheaper_by_start(low, high))
     try:
@@ -191,17 +199,44 @@ def _chunk(store: Any, chosen: Selection, low: int, high: int, as_of: int) -> Li
             dim, begun, suspended = row[2], row[6], row[8]
             gpus, cpus, mem = part.gpus or 0, part.cpus or 0, part.mem or 0
             ratios = usage_ratios(row) if row[7] is not None else (None, None, None)
+            # what the exact aggregates hold: allocations that ended, and not before they began
+            finished = agg and row[7] is not None and row[7] >= begun
             duration = part.real_stop - begun
             held = min(suspended, duration)
             hour, p = floor_hour(part.start), part.start
+            size = -1 if row[10] is None else row[10]  # GPUs per allocation, -1 unknown
             if part.starts_here:
                 key = (floor_hour(begun), dim)
                 sums.setdefault(key, [0] * 10)[3] += 1
+                if finished:
+                    counts = start_counts(row, part.outcome, ratios)
+                    key = key + (size,)
+                    found = starts.get(key)
+                    if found is None:
+                        starts[key] = list(counts)
+                    else:
+                        for at, value in enumerate(counts):
+                            if at == 7:
+                                if value is not None and (found[7] is None or value > found[7]):
+                                    found[7] = value
+                            else:
+                                found[at] += value
             while p < part.stop:
                 q = min(part.stop, hour + HOUR)
                 seconds = (effective(q - begun, duration, held) - effective(p - begun, duration,
                                                                              held)
                            if held else q - p)
+                if finished:
+                    e = exact.get((hour, dim, size))
+                    if e is None:
+                        e = exact[(hour, dim, size)] = ([0, 0, 0, 0, 0, 0.0, 0, 0.0, 0, 0.0]
+                                                        + [None] * 8)
+                    for at, held_now in ((10, True), (12, gpus), (14, cpus), (16, mem)):
+                        if held_now:
+                            if e[at] is None or p < e[at]:
+                                e[at] = p
+                            if e[at + 1] is None or q > e[at + 1]:
+                                e[at + 1] = q
                 if seconds:
                     entry = sums.setdefault((hour, dim), [0] * 10)
                     entry[0] += gpus * seconds
@@ -217,10 +252,28 @@ def _chunk(store: Any, chosen: Selection, low: int, high: int, as_of: int) -> Li
                     if gpu is not None and gpus:
                         entry[8] += gpus * seconds
                         entry[9] += min(gpu, 1.0) * gpus * seconds
+                    if finished:
+                        e[0] += gpus * seconds
+                        e[1] += cpus * seconds
+                        e[2] += mem * seconds
+                        e[3] += seconds
+                        if cpu is not None and cpus:
+                            e[4] += cpus * seconds
+                            e[5] += cpu * cpus * seconds
+                        if rss is not None and mem:
+                            e[6] += mem * seconds
+                            e[7] += rss * mem * seconds
+                        if gpu is not None and gpus:
+                            e[8] += gpus * seconds
+                            e[9] += min(gpu, 1.0) * gpus * seconds
                 p, hour = q, hour + HOUR
     finally:
         rows.close()
-    return [(hour, dim) + tuple(values) for (hour, dim), values in sums.items()]
+    out = [(hour, dim) + tuple(values) for (hour, dim), values in sums.items()]
+    if not agg:
+        return out, None
+    return out, ([key + tuple(values) for key, values in exact.items()],
+                 [key + tuple(values) for key, values in starts.items()])
 
 
 def _sum(store: Any, low: int, high: int, dims: Dict[int, Any]
@@ -235,6 +288,58 @@ def _sum(store: Any, low: int, high: int, dims: Dict[int, Any]
         accounts.setdefault(roles.account, Amounts()).add(amounts)
         users.setdefault((roles.account, roles.user), Amounts()).add(amounts)
     return total, accounts, users
+
+
+def _segments(store: Any, end: int, earliest: Optional[int], ranges: Any,
+              dims: Dict[int, Any]) -> Any:
+    """_sum() for the spans the ranges need, from one grouped read of the rollup."""
+    if not hasattr(store, "rollup_segments"):
+        return lambda low, high: _sum(store, low, high, dims)
+    bounds = {end - length for _, length in ranges if length is not None}
+    bounds |= {end - 2 * length for _, length in ranges if length is not None}
+    if earliest is not None:
+        bounds.add(earliest)
+    bounds.add(end)
+    order = sorted(bounds, reverse=True)  # order[0] == end: segment 0 is empty
+    width = 11
+    per_dim = {}  # type: Dict[int, List[list]]
+    for row in store.rollup_segments(order, end):
+        dim, segment = row[0], row[1]
+        found = per_dim.get(dim)
+        if found is None:
+            found = per_dim[dim] = [[0] * width for _ in range(len(order) + 1)]
+        found[segment] = [value or 0 for value in row[2:]]
+    position = {bound: at for at, bound in enumerate(order)}
+    # cumulative[dim][k]: hours from order[k] up to end, i.e. segments 1..k
+    cumulative = {}  # type: Dict[int, List[tuple]]
+    for dim, parts in per_dim.items():
+        running, out = [0] * width, []
+        for at, part in enumerate(parts):
+            if at:
+                running = [a + b for a, b in zip(running, part)]
+            out.append(tuple(running))
+        cumulative[dim] = out
+
+    def summed(low: int, high: int) -> Tuple[Amounts, Dict[str, Amounts],
+                                              Dict[Tuple[str, str], Amounts]]:
+        a, b = position.get(low), position.get(high)
+        if a is None or b is None or a < b:
+            return _sum(store, low, high, dims)
+        total, accounts, users = Amounts(), {}, {}  # type: Amounts, Dict[str, Amounts], Dict
+        for dim, values in cumulative.items():
+            roles = dims.get(dim)
+            if roles is None:
+                continue
+            upper, lower = values[a], values[b]
+            if upper[10] == lower[10]:
+                continue  # no rollup row in the span
+            amounts = Amounts(tuple(x - y for x, y in zip(upper[:10], lower[:10])))
+            total.add(amounts)
+            accounts.setdefault(roles.account, Amounts()).add(amounts)
+            users.setdefault((roles.account, roles.user), Amounts()).add(amounts)
+        return total, accounts, users
+
+    return summed
 
 
 def overview(store: Any, as_of: int, covered_from: Optional[int], visibility: str,
@@ -291,12 +396,13 @@ def overview(store: Any, as_of: int, covered_from: Optional[int], visibility: st
     if any(length is not None and length <= 7 * DAY for length in lengths):
         binned(end - max(length for length in lengths if length and length <= 7 * DAY), HOUR)
 
+    summed = _segments(store, end, earliest, ranges, dims)
     for name, length in ranges:
         start = (earliest if earliest is not None else end) if length is None else end - length
-        total, accounts, users = _sum(store, start, end, dims)
+        total, accounts, users = summed(start, end)
         previous = previous_accounts = None
         if length is not None:
-            previous, previous_accounts, _ = _sum(store, start - length, start, dims)
+            previous, previous_accounts, _ = summed(start - length, start)
         span = util_span(start if length is not None else min(start, floor or start), end,
                          floor)
         loaded = covered_from is not None and (covered_from == 0 or covered_from <= (

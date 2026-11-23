@@ -1,6 +1,7 @@
 """The drill-down lists: jobs in a window, and the attempts of one job."""
 
 import heapq
+import itertools
 from dataclasses import dataclass, field
 from typing import Any, Iterator, List, NamedTuple, Optional, Tuple
 
@@ -159,10 +160,37 @@ def list_jobs(store: Any, as_of: int, window: Optional[Window] = None,
         span = resolve(window, as_of, first)
         repeated = store.repeated_jobs() if by == "job" else set()
 
+        extra = run_type is not None or bool(needle)
+        # Finished jobs with one attempt, sorted by a column SQLite can compute, come
+        # from SQLite already ranked; the rest (unfinished rows, requeued jobs) from here.
+        quick = (sort in ("gpu", "cpu", "start") and run_type is None
+                 and not needle and not chosen.need_nodes
+                 and callable(getattr(store, "top_finished", None)))
+        ranked = []  # type: List[_Entry]
+        if quick:
+            dims, outcomes = chosen.dims, chosen.where.outcome
+            picked = chosen.dim_ids
+            if outcomes is not None:
+                picked = {d for d in (picked if picked is not None else dims)
+                          if d in dims and outcome_of(dims[d].state, True) in outcomes}
+            counted, keys = store.top_finished(span.low, span.high, span.start, span.end,
+                                               picked, sort, descending, offset + limit,
+                                               by == "job")
+            page.total += counted
+            for part in chosen.parts(store.rows_of(keys), span):
+                s = part.seconds
+                ranked.append(_Entry(part, _times(part.gpus, s), _times(part.cpus, s),
+                                     _times(part.mem, s), 1, part.row[6]))
+
         def entries() -> Iterator[_Entry]:
             merged = {}  # only jobs with several attempts are held
-            rows = store.scan(span.low, span.high, chosen.dim_ids, usage=True, ordered=False,
-                              extra=run_type is not None or bool(needle))
+            # measured usage is read for the rows shown only (usage_of below)
+            if quick:
+                rows = store.scan_special(span.low, span.high, chosen.dim_ids, extra,
+                                          by == "job")
+            else:
+                rows = store.scan(span.low, span.high, chosen.dim_ids, usage=False,
+                                  ordered=False, extra=extra)
             try:
                 for number, part in enumerate(chosen.parts(rows, span)):
                     if not number % 1024 and cancelled():
@@ -204,11 +232,17 @@ def list_jobs(store: Any, as_of: int, window: Optional[Window] = None,
             return value, entry.part.row[6], entry.part.row[0]
 
         pick = heapq.nlargest if descending else heapq.nsmallest
-        best = pick(offset + limit, entries(), key=order)[offset:]
+        found = entries()
+        if ranked:
+            found = itertools.chain(ranked, found)
+        best = pick(offset + limit, found, key=order)[offset:]
         info = store.info([entry.part.row[0] for entry in best])
+        measured = store.usage_of([entry.part.row[0] for entry in best])
         for entry in best:
             part = entry.part
-            job = make_row(part.row, part.roles, info.get(part.row[0]),
+            row = part.row
+            row = row[:14] + measured.get(row[0], (None, None, None, False)) + tuple(row[18:])
+            job = make_row(row, part.roles, info.get(part.row[0]),
                            nodesets.get(part.row[3], ""), part.outcome, part.problem,
                            part.real_stop)
             job.gpu_seconds, job.cpu_seconds, job.mem_byte_seconds = entry.gpu, entry.cpu, entry.mem

@@ -1,6 +1,7 @@
 """Range detail: the binned series, the overview's hero and tiles, and every way into a
 range (mouse and keys) at the sizes people use."""
 
+import itertools
 import time
 import unittest
 
@@ -169,7 +170,7 @@ class ChartTest(unittest.TestCase):
         out = plot.area_chart(self.chart(), 90, 10, ascii_only=True, color=False)
         text = "\n".join("".join(t for t, _ in line) for line in out)
         self.assertTrue(all(ord(c) < 128 for c in text), text)
-        for word in ("capacity 12", "avg 4", "now 6", "peak 8"):
+        for word in ("capacity 12", "avg 4", "now 6 (live)", "peak hour avg 8"):
             self.assertIn(word, text)
         self.assertIn("=", text)  # capacity
         self.assertIn("#", text)  # the area
@@ -196,6 +197,109 @@ class ChartTest(unittest.TestCase):
         self.assertTrue(out[-1][1][0].rstrip().endswith("now"))
         self.assertEqual(plot.nice_top(56 * 1.04), (20, 60))
         self.assertEqual(plot.nice_top(0.4)[1], 0.4)
+
+    def test_previous_period_is_one_connected_line(self):
+        """The overlay is a line that steps between levels, never scattered dashes."""
+        edges = [i * DAY for i in range(31)]
+        previous = [float((i * 7) % 23 + 2) for i in range(30)]
+        values = [float((i * 5) % 31) for i in range(30)]  # bars above and below it
+        for (width, rows), bars in itertools.product(((120, 30), (80, 50), (60, 12), (200, 8)),
+                                                     ([0.0] * 30, values)):
+            chart = plot.Chart(bars, edges, "day", previous=previous, clock=30 * DAY)
+            out = plot.area_chart(chart, width, rows)
+            grid = []
+            for line in out[:-1]:
+                cells = []
+                for text, style in line:
+                    cells += [(char, style) for char in text]
+                grid.append(cells)
+            past = lambda style: style.startswith("past")
+            cols = [c for c in range(width) if any(past(row[c][1]) for row in grid)]
+            self.assertTrue(cols)
+            self.assertEqual(cols, list(range(cols[0], cols[-1] + 1)), "a gap in the line")
+            for col in cols:
+                rows_here = [r for r in range(rows) if past(grid[r][col][1])]
+                self.assertEqual(rows_here, list(range(rows_here[0], rows_here[-1] + 1)))
+                glyphs = "".join(grid[r][col][0] for r in rows_here)
+                if len(rows_here) == 1:
+                    self.assertEqual(glyphs, "─", (width, col))
+                else:  # a step: a corner at each end, a stroke between
+                    self.assertIn(glyphs[0], "╭╮")
+                    self.assertIn(glyphs[-1], "╯╰")
+                    self.assertTrue(set(glyphs[1:-1]) <= {"│"}, glyphs)
+                if col + 1 in cols:  # it leaves this column on the row the next one starts
+                    leave = rows_here[0] if grid[rows_here[0]][col][0] in "╭─" and \
+                        grid[rows_here[-1]][col][0] in "╯─" else rows_here[-1]
+                    nxt = [r for r in range(rows) if past(grid[r][col + 1][1])]
+                    starts = {r for r in nxt if grid[r][col + 1][0] in "─╯╮"}
+                    self.assertIn(leave, starts, (width, rows, col))
+
+    def test_previous_line_is_drawn_over_the_bars(self):
+        """Last period lower than this one: the line runs through the bars, in bright
+        amber on the bar's own color, and is never hidden behind them."""
+        edges = [i * DAY for i in range(31)]
+        chart = plot.Chart([40.0] * 30, edges, "day", previous=[20.0] * 30, clock=30 * DAY)
+        out = plot.area_chart(chart, 100, 20)
+        over = [(t, s) for line in out for t, s in line if s.startswith("pastover")]
+        text = "".join(t for t, _ in over)
+        self.assertGreaterEqual(len(text), 60)  # along the whole width, bars and gaps
+        self.assertTrue(set(text) <= set("─╭╮╰╯│"), text)
+        self.assertTrue(any(s == "pastover@bar" for _, s in over))  # the bar stays behind
+        mono = plot.area_chart(chart, 100, 20, color=False)  # bold across the bars
+        self.assertTrue(any("─" in t for line in mono for t, s in line if s == "+b"))
+
+    def test_previous_line_steps_in_the_gaps_between_bars(self):
+        edges = [i * DAY for i in range(11)]
+        chart = plot.Chart([1.0] * 10, edges, "day", previous=[5.0, 9.0] * 5, clock=10 * DAY)
+        text = "\n".join("".join(t for t, _ in line) for line in plot.area_chart(chart, 80, 20))
+        for glyph in "─╭╮╰╯│":
+            self.assertIn(glyph, text)
+        self.assertNotIn("╌", text)
+        ascii_text = "\n".join("".join(t for t, _ in line)
+                               for line in plot.area_chart(chart, 80, 20, ascii_only=True))
+        self.assertTrue(all(ord(c) < 128 for c in ascii_text))
+
+    def test_axis_holds_capacity_now_and_previous(self):
+        edges = [i * DAY for i in range(31)]
+        values = [float(20 + i % 29) for i in range(30)]  # peak 48
+        for capacity, now, prev in ((64, 52, 30), (64, 70, 30), (30, 20, 90), (56, 40, 40)):
+            chart = plot.Chart(values, edges, "day", previous=[float(prev)] * 30,
+                               capacity=float(capacity), now=float(now), clock=30 * DAY)
+            for rows in (6, 12, 30, 55):
+                step, top = plot.axis_top(chart, rows)
+                self.assertGreaterEqual(top, max(capacity, now, prev, 48))
+                self.assertEqual(top % step, 0)
+                self.assertIn(step, (1, 2, 2.5, 5, 10, 20, 25, 50, 100))
+                out = plot.area_chart(chart, 100, rows)
+                text = "\n".join("".join(t for t, _ in line) for line in out)
+                ticks = [l.split("┤")[0].strip() for l in text.split("\n") if "┤" in l]
+                self.assertGreaterEqual(float(ticks[0]), capacity)
+                if capacity > 48:  # above the bars: the capacity line is in sight
+                    self.assertIn("┈", text)
+        # 64 GPUs: the tall chart's top is a round 70, not 60 and not a wasteful 80
+        chart = plot.Chart(values, edges, "day", capacity=64.0, now=52.0)
+        self.assertEqual(plot.axis_top(chart, 47)[1], 70)
+
+    def test_now_and_peak_labels_say_what_they_are(self):
+        edges = [i * DAY for i in range(31)]
+        values = [float(20 + i % 29) for i in range(30)]
+        chart = plot.Chart(values, edges, "day", capacity=64.0, now=52.0, mean=23.0,
+                           clock=30 * DAY)
+        text = "\n".join("".join(t for t, _ in line) for line in plot.area_chart(chart, 100, 30))
+        self.assertIn("now 52 (live)", text)
+        self.assertIn("peak day avg 48", text)
+        self.assertIn("capacity 64", text)
+        self.assertNotIn("▾ peak 48", text)
+        for width in (24, 40, 60, 80, 120, 200):
+            row = plot.legend(chart, "month", width=width)
+            self.assertEqual(sum(fmt.width(t) for t, _ in row), width)
+        full = "".join(t for t, _ in plot.legend(chart, "month", width=120))
+        self.assertIn("GPUs in use · daily average", full)
+        self.assertIn("now (live)", full)
+        week = plot.Chart(values, edges, "3hour", previous=values, capacity=64.0)
+        narrow = "".join(t for t, _ in plot.legend(week, "week", width=50))
+        self.assertIn("prev", narrow)
+        self.assertIn("3-hourly", narrow)
 
     def test_big_slash_and_percent_are_drawn_not_smeared(self):
         rows = plot.big_rows("/%")
@@ -241,6 +345,32 @@ class RoutingTest(unittest.TestCase):
                 self.app.key("ESC")
                 draw(self.app, width, height)
                 self.app.key("RIGHT")
+
+    def test_roles_rows_open_the_row_clicked_in_every_grouping(self):
+        """A click selects, a second click on the same row opens it: the same for the
+        first row as for any other, in each grouping, and Esc comes back to it."""
+        for width, height in ((120, 34), (80, 60)):
+            for groups in (0, 1, 2):
+                self.app.go_tab("roles")
+                for _ in range(groups):
+                    self.app.key("g")
+                for index in (0, 1):
+                    canvas = draw(self.app, width, height)
+                    pane, state, lines = self.app._focused()
+                    name = lines[index].key
+                    row, col = find(canvas, name, range(2, height))
+                    self.app.click(col + 1, row)
+                    self.assertEqual(self.app.view.kind, "roles", (width, groups, index))
+                    draw(self.app, width, height)
+                    self.app.click(col + 1, row)
+                    self.assertEqual(self.app.view.kind, "people", (width, groups, name))
+                    self.assertIn(name, self.app.view.title)
+                    self.app.key("ESC")
+                    draw(self.app, width, height)
+                    _, state, lines = self.app._focused()
+                    self.assertEqual(lines[state.cursor].key, name)
+                    self.app.view.panes.clear()  # nothing picked: a fresh pane
+                self.app.view.extra.pop("group", None)
 
     def test_header_ranges_are_clickable_everywhere(self):
         for width, height in ((80, 24), (120, 34)):
@@ -398,13 +528,24 @@ class RobustTest(unittest.TestCase):
         state = PaneState()
         lines = [Line([("a", "")], key="a"), Line([("b", "")], key="b"),
                  Line([("c", "")], key="c")]
-        state.cursor, state.mark = 1, (1, "b")
+        state.cursor, state.mark, state.chosen = 1, (1, "b"), True
         reordered = [lines[1], lines[0], lines[2]][::-1]  # c a b
         keep_selection(pane, state, reordered)
         self.assertEqual(reordered[state.cursor].key, "b")
         state.cursor, state.mark = 2, (1, "b")  # moved by a key since: left alone
         keep_selection(pane, state, lines)
         self.assertEqual(state.cursor, 2)
+
+    def test_selection_stays_on_top_while_rows_load(self):
+        """Nothing picked yet (a new grouping, rows still loading): a reorder leaves the
+        cursor on the first row instead of chasing whatever row sat there before."""
+        pane = Pane("p", "p")
+        state = PaneState()
+        lines = [Line([(k, "")], key=k) for k in ("high", "normal", "low", "debug")]
+        state.cursor, state.mark = 0, (0, "high")
+        loaded = [lines[1], lines[2], lines[0], lines[3]]
+        keep_selection(pane, state, loaded)
+        self.assertEqual(state.cursor, 0)
 
     def test_mouse_states(self):
         from slurm_usage.ui import terminal

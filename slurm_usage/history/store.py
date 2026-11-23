@@ -77,7 +77,25 @@ CREATE TABLE IF NOT EXISTS rollup(
   attempts INTEGER,
   cpu_cov INTEGER, cpu_used REAL, mem_cov INTEGER, mem_used REAL, gpu_cov INTEGER,
   gpu_used REAL, PRIMARY KEY(hour, dim)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS jobs_long ON jobs(start) WHERE stop - start > 172800;
+CREATE INDEX IF NOT EXISTS jobs_odd ON jobs(start) WHERE stop < start;
+CREATE INDEX IF NOT EXISTS jobs_dim_cov ON jobs(dim, start, stop, gpus, cpus, susp, job);
+CREATE TABLE IF NOT EXISTS agg_hour(
+  hour INTEGER, dim INTEGER, gpus INTEGER, gpu INTEGER, cpu INTEGER, mem_mib INTEGER, mem_rest INTEGER,
+  secs INTEGER, cpu_cov INTEGER, cpu_used REAL, mcov_mib INTEGER, mcov_rest INTEGER,
+  mem_used REAL, gpu_cov INTEGER, gpu_used REAL,
+  f_any INTEGER, l_any INTEGER, f_gpu INTEGER, l_gpu INTEGER, f_cpu INTEGER, l_cpu INTEGER,
+  f_mem INTEGER, l_mem INTEGER, PRIMARY KEY(hour, dim, gpus)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS agg_start(
+  hour INTEGER, dim INTEGER, gpus INTEGER, attempts INTEGER, cpu_known INTEGER, mem_known INTEGER,
+  gpu_known INTEGER, susp INTEGER, wait_count INTEGER, wait_total INTEGER, wait_max INTEGER,
+  limit_count INTEGER, limit_used INTEGER, limit_requested INTEGER, over100 INTEGER,
+  unchecked INTEGER, PRIMARY KEY(hour, dim, gpus)) WITHOUT ROWID;
 """
+# Rows longer than this are found through the partial index jobs_long; all others overlap
+# a moment only if they started at most this long before it.
+LONG = 172800
+AGG_VERSION = 3  # of the exact aggregates (agg_hour, agg_start): a change rebuilds them
 _COLUMNS = ("j.k,j.job,j.dim,j.nodes,j.submit,j.eligible,j.start,"
             "NULLIF(j.stop,%d),j.susp,j.cpus,j.gpus,j.mem,j.lim,j.flag" % OPEN_STOP)
 _MAX_SQL_IDS = 5000
@@ -253,13 +271,23 @@ class SqliteStore(_Base):
             self._dirty(db, low, high)
 
     def rollup_replace(self, low: int, high: int, rows: Iterable[tuple],
-                       dirty: Optional[Tuple[int, int]]) -> None:
-        """Replace hours [low, high) and record what is still dirty."""
+                       dirty: Optional[Tuple[int, int]], agg: Optional[tuple] = None) -> None:
+        """Replace hours [low, high) and record what is still dirty. ``agg`` is
+        (hour rows, start rows) for the exact aggregates (see aggregate.py)."""
         def work(db):
             db.execute("DELETE FROM rollup WHERE hour>=? AND hour<?", (low, high))
             # byte-seconds outgrow SQLite's 64-bit sums, so memory is kept as MiB + rest
             db.executemany("INSERT INTO rollup VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            [r[:4] + (r[4] >> 20, r[4] & _MIB_MASK) + tuple(r[5:]) for r in rows])
+            if agg is not None:
+                hours, starts = agg
+                db.execute("DELETE FROM agg_hour WHERE hour>=? AND hour<?", (low, high))
+                db.execute("DELETE FROM agg_start WHERE hour>=? AND hour<?", (low, high))
+                # (hour, dim, gpus, gpu, cpu, mem, secs, cpu_cov, cpu_used, mem_cov, ...)
+                db.executemany("INSERT INTO agg_hour VALUES(%s)" % ",".join("?" * 23),
+                               [r[:5] + (r[5] >> 20, r[5] & _MIB_MASK) + r[6:9]
+                                + (r[9] >> 20, r[9] & _MIB_MASK) + r[10:] for r in hours])
+                db.executemany("INSERT INTO agg_start VALUES(%s)" % ",".join("?" * 16), starts)
             if dirty is None:
                 db.execute("DELETE FROM meta WHERE k='dirty'")
             else:
@@ -275,6 +303,19 @@ class SqliteStore(_Base):
             "FROM rollup WHERE hour>=? AND hour<? GROUP BY dim", (low, high))
         return [r[:3] + (((r[3] or 0) << 20) + (r[4] or 0),) + tuple(r[5:]) for r in found]
 
+    def rollup_segments(self, bounds: Sequence[int], high: int) -> List[tuple]:
+        """rollup_sum()'s columns and a row count per (dim, segment) for hours before
+        ``high``: segment i
+        holds the hours from bounds[i] (descending) up to the previous bound, or ``high``;
+        segment len(bounds) holds everything older."""
+        case = "CASE %s ELSE %d END" % (" ".join("WHEN hour>=%d THEN %d" % (int(b), i)
+                                                 for i, b in enumerate(bounds)), len(bounds))
+        found = self._select(
+            "SELECT dim,%s,sum(gpu),sum(cpu),sum(mem_mib),sum(mem_rest),sum(attempts),"
+            "sum(cpu_cov),sum(cpu_used),total(mem_cov),total(mem_used),sum(gpu_cov),"
+            "sum(gpu_used),count(*) FROM rollup WHERE hour<? GROUP BY 1,2" % case, (high,))
+        return [r[:4] + (((r[4] or 0) << 20) + (r[5] or 0),) + tuple(r[6:]) for r in found]
+
     def rollup_series(self, low: int, high: int, step: int) -> List[Tuple[int, int, int]]:
         """(bins back from ``high``, gpu, cpu) for hours in [low, high); bin 0 ends at high."""
         return self._select(
@@ -284,6 +325,291 @@ class SqliteStore(_Base):
     def rollup_activity(self) -> List[Tuple[int, int, int]]:
         """(dim, first hour, last hour) with any usage."""
         return self._select("SELECT dim,min(hour),max(hour) FROM rollup GROUP BY dim")
+
+    # -- exact aggregates of finished allocations (aggregate.py's fast path) ---------
+
+    has_agg = True
+
+    @staticmethod
+    def _dims_sql(dim_ids: Optional[Set[int]], column: str = "dim") -> str:
+        if dim_ids is None:
+            return ""
+        return " AND %s IN (%s)" % (column, ",".join(str(int(i)) for i in dim_ids))
+
+    def agg_reset(self) -> None:
+        """Empty the exact aggregates, made again in the current layout."""
+        def work(db):
+            db.execute("DROP TABLE IF EXISTS agg_hour")
+            db.execute("DROP TABLE IF EXISTS agg_start")
+            for statement in _TABLES.split(";"):
+                if "agg_" in statement:
+                    db.execute(statement)
+
+        self._write(work)
+
+    def agg_busy(self, low: int, high: int, dim_ids: Optional[Set[int]], metric: Optional[str]
+                 ) -> List[Tuple[int, int, int, int]]:
+        """(hour, dim, first, last): when finished allocations (holding ``metric``, if
+        given) were first and last held within each hour of [low, high)."""
+        column = metric or "any"
+        return self._select(
+            "SELECT hour,dim,min(f_%s),max(l_%s) FROM agg_hour WHERE hour>=? AND hour<? AND "
+            "f_%s IS NOT NULL%s GROUP BY hour,dim ORDER BY hour" % (
+                column, column, column, self._dims_sql(dim_ids)), (low, high))
+
+    def agg_sums(self, low: int, high: int, dim_ids: Optional[Set[int]],
+                 by_gpus: bool = False) -> Tuple[Dict[Any, tuple], Dict[Any, tuple]]:
+        """Per dim (or (dim, GPUs per allocation, None if unknown)) over hours [low, high):
+        (gpu, cpu, mem, secs, cpu_cov, cpu_used, mem_cov, mem_used, gpu_cov, gpu_used) of
+        finished allocations, and the per-attempt counts of those that started then
+        (agg_start's columns)."""
+        where = self._dims_sql(dim_ids)
+        key = "dim,gpus" if by_gpus else "dim,NULL"
+
+        def name(r: tuple) -> Any:
+            return (r[0], None if r[1] == -1 else r[1]) if by_gpus else r[0]
+        hours = {}
+        for r in self._select(
+                "SELECT " + key + ",sum(gpu),sum(cpu),sum(mem_mib),sum(mem_rest),sum(secs),sum(cpu_cov),"
+                "total(cpu_used),sum(mcov_mib),sum(mcov_rest),total(mem_used),sum(gpu_cov),"
+                "total(gpu_used) FROM agg_hour WHERE hour>=? AND hour<?%s GROUP BY 1,2" % where,
+                (low, high)):
+            k, r = name(r), r[1:]
+            hours[k] = (r[1] or 0, r[2] or 0, ((r[3] or 0) << 20) + (r[4] or 0), r[5] or 0,
+                        r[6] or 0, r[7], ((r[8] or 0) << 20) + (r[9] or 0), r[10],
+                        r[11] or 0, r[12])
+        starts = {}
+        for r in self._select(
+                "SELECT " + key + ",sum(attempts),sum(cpu_known),sum(mem_known),sum(gpu_known),sum(susp),"
+                "sum(wait_count),sum(wait_total),max(wait_max),sum(limit_count),sum(limit_used),"
+                "sum(limit_requested),sum(over100),sum(unchecked) FROM agg_start "
+                "WHERE hour>=? AND hour<?%s GROUP BY 1,2" % where, (low, high)):
+            starts[name(r)] = tuple(r[2:])
+        return hours, starts
+
+    def agg_series(self, low: int, high: int, dim_ids: Optional[Set[int]], by_dim: bool
+                   ) -> List[tuple]:
+        """(hour, dim or None, gpu, cpu, mem) per hour in [low, high)."""
+        where = self._dims_sql(dim_ids)
+        if by_dim:
+            return [(r[0], r[1], r[2], r[3], (r[4] << 20) + r[5]) for r in self._select(
+                "SELECT hour,dim,sum(gpu),sum(cpu),sum(mem_mib),sum(mem_rest) FROM agg_hour "
+                "WHERE hour>=? AND hour<?%s GROUP BY hour,dim" % where, (low, high))]
+        return [(r[0], None, r[1] or 0, r[2] or 0, ((r[3] or 0) << 20) + (r[4] or 0))
+                for r in self._select(
+                    "SELECT hour,sum(gpu),sum(cpu),sum(mem_mib),sum(mem_rest) FROM agg_hour "
+                    "WHERE hour>=? AND hour<?%s GROUP BY hour" % where, (low, high))]
+
+    def agg_waits(self, low: int, high: int, dim_ids: Optional[Set[int]],
+                  keyed: bool = False) -> List[Any]:
+        """Queue waits of finished allocations that started and ended in [low, high);
+        keyed: (dim, gpus, wait)."""
+        found = self._select(
+            "SELECT dim,gpus,start-eligible FROM jobs WHERE start>=? AND start<? AND stop<? "
+            "AND stop>=start AND eligible<=start%s" % self._dims_sql(dim_ids), (low, high, high))
+        return found if keyed else [r[2] for r in found]
+
+    def runtimes(self, low: Optional[int], high: int, start: int, end: int,
+                 dim_ids: Optional[Set[int]]) -> List[Tuple[int, Optional[int], int]]:
+        """(dim, gpus, run time less suspension, never negative) of the finished rows a
+        window counts (as Selection.parts does)."""
+        rs = "max(stop,start)"
+        p, q = "max(start,%d)" % start, "min(%s,%d)" % (rs, end)
+        here = "start<%d" % int(high) + ("" if low is None else " AND start>=%d" % int(low))
+        where = "start<%d AND stop<%d%s AND (%s>%s OR (%s=start AND %s))" % (
+            int(high), OPEN_STOP, "" if low is None else " AND stop>=%d" % int(low), q, p, rs,
+            here)
+        return self._select("SELECT dim,gpus,max(0,stop-start-susp) FROM jobs WHERE %s%s" % (
+            where, self._dims_sql(dim_ids)))
+
+    def type_medians(self, low: Optional[int], high: int, start: int, end: int, as_of: int,
+                     finished: Optional[Set[int]], running: Optional[Set[int]],
+                     skip: Sequence[str], keys: Optional[Dict[int, Tuple[str, str]]]
+                     ) -> Tuple[Dict[Any, int], Dict[Any, int], Dict[Any, str]]:
+        """Lower medians per kind, and the name of the earliest row, of the run times (finished rows) and queue waits (rows
+        that started in the window) of the rows a window counts, less ``skip``. Kinds are
+        GPUs per allocation (-1 unknown) or, with ``keys``, keys[dim] (finished, unfinished)."""
+        with self.lock:
+            if keys is not None:
+                self._db.execute("CREATE TEMP TABLE IF NOT EXISTS kinds(dim INTEGER PRIMARY KEY, "
+                                 "kind TEXT, open TEXT)")
+                self._db.execute("DELETE FROM temp.kinds")
+                self._db.executemany("INSERT INTO temp.kinds VALUES(?,?,?)",
+                                     [(d,) + tuple(k) for d, k in keys.items()])
+                self._db.commit()
+            rs = "(CASE WHEN j.stop=%d THEN max(%d,j.start) ELSE max(j.stop,j.start) END)" % (
+                OPEN_STOP, int(as_of))
+            p, q = "max(j.start,%d)" % int(start), "min(%s,%d)" % (rs, int(end))
+            here = "j.start<%d" % int(high) + ("" if low is None else " AND j.start>=%d" % int(low))
+            fin = "j.stop<%d" % OPEN_STOP + ("" if finished is None else
+                                            self._dims_sql(finished, "j.dim"))
+            run = "j.stop=%d" % OPEN_STOP + ("" if running is None else
+                                            self._dims_sql(running, "j.dim"))
+            where = ["j.start<%d" % int(high), "((%s) OR (%s))" % (fin, run),
+                     "(%s>%s OR (%s=j.start AND %s))" % (q, p, rs, here)]
+            if low is not None:
+                where.append("j.stop>=%d" % int(low))
+            if skip:
+                where.append("j.k NOT IN (%s)" % ",".join(
+                    "'%s'" % k.replace("'", "''") for k in skip))
+            kind = "coalesce(j.gpus,-1)" if keys is None else \
+                "(CASE WHEN j.stop=%d THEN t.open ELSE t.kind END)" % OPEN_STOP
+            join = "" if keys is None else " JOIN temp.kinds t ON t.dim=j.dim"
+            base = "FROM jobs j%s WHERE %s" % (join, " AND ".join(where))
+
+            found = self._select(
+                "SELECT %s,CASE WHEN j.stop<%d THEN max(0,j.stop-j.start-j.susp) END,"
+                "CASE WHEN %s AND j.eligible<=j.start THEN j.start-j.eligible END,j.start %s" % (
+                    kind, OPEN_STOP, here, base))
+            runs, waited = {}, {}  # type: Dict[Any, List[int]], Dict[Any, List[int]]
+            first = {}  # type: Dict[Any, int]
+            for key, runtime, wait, begun in found:
+                if runtime is not None:
+                    runs.setdefault(key, []).append(runtime)
+                if wait is not None:
+                    waited.setdefault(key, []).append(wait)
+                if begun < first.get(key, begun + 1):
+                    first[key] = begun
+            names = {}  # type: Dict[Any, str]
+            for key, begun in first.items():
+                row = self._select("SELECT j.name %s AND j.start=? AND %s=? LIMIT 1" % (
+                    base, kind), (begun, key))
+                names[key] = (row[0][0] if row else "") or ""
+
+        def lower_median(values: List[int]) -> int:
+            values.sort()
+            return values[(len(values) - 1) // 2]
+        runtimes = {key: lower_median(values) for key, values in runs.items()}
+        waits = {key: lower_median(values) for key, values in waited.items()}
+        return runtimes, waits, names
+
+    def scan_edges(self, start: int, low: int, high: int, until: int,
+                   dim_ids: Optional[Set[int]] = None, usage: bool = False) -> Iterator[Row]:
+        """The rows a window [start, until) needs besides the aggregates of [low, high):
+        every allocation that overlaps [start, low) or [high, until), runs across ``high``,
+        has no end, or ends before it starts. Unordered; each row once."""
+        if dim_ids is not None and not dim_ids:
+            return
+        check = None
+        dims = ""
+        if dim_ids is not None:
+            if len(dim_ids) <= _MAX_SQL_IDS:
+                dims = self._dims_sql(dim_ids, "dim")
+            else:
+                check = dim_ids
+        long_ = "stop - start > %d" % LONG
+        pieces = [
+            ("start>=? AND start<? AND stop>=?", (start - LONG, low, start)),
+            (long_ + " AND start<? AND stop>=?", (low, start)),
+            ("start>=? AND start<? AND stop>=?", (max(low, high - LONG), high, high)),
+            (long_ + " AND start>=? AND start<? AND stop>=?", (low, high, high)),
+            ("start>=? AND start<?", (high, until)),
+            ("stop < start AND start>=? AND start<?", (low, high)),
+        ]
+        keys = " UNION ".join("SELECT k FROM jobs WHERE %s%s" % (sql, dims) for sql, _ in pieces)
+        args = [a for _, values in pieces for a in values]
+        sql = "SELECT %s%s FROM jobs j%s WHERE j.k IN (%s)" % (
+            _COLUMNS, ",u.cpu,u.rss,u.util,u.k IS NOT NULL" if usage else ",NULL,NULL,NULL,0",
+            " LEFT JOIN usage u ON u.k=j.k" if usage else "", keys)
+        for row in self._select(sql, args):
+            if check is None or row[2] in check:
+                yield row  # type: ignore
+
+    def scan_started(self, low: int, high: int, dim_ids: Optional[Set[int]] = None
+                     ) -> Iterator[Row]:
+        """Allocations that started in [low, high), by start, with (name, exit)."""
+        if dim_ids is not None and not dim_ids:
+            return
+        dims = self._dims_sql(dim_ids, "j.dim") if dim_ids is not None and \
+            len(dim_ids) <= _MAX_SQL_IDS else ""
+        for row in self._select(
+                "SELECT %s,NULL,NULL,NULL,0,j.name,j.ex FROM jobs j WHERE j.start>=? AND "
+                "j.start<?%s ORDER BY j.start" % (_COLUMNS, dims), (low, high)):
+            if dim_ids is None or row[2] in dim_ids:
+                yield row  # type: ignore
+
+    def event_rows(self, high: int, end: int, as_of: int, finished: Optional[Set[int]],
+                   running: Optional[Set[int]], skip: Sequence[str]) -> str:
+        """The FROM/WHERE of the rows events.py counts: started before ``high`` (and
+        before ``end`` unless they took no time), finished in ``finished`` dims or
+        unfinished in ``running`` dims (None = any), never the keys in ``skip``. Columns:
+        start, rs (the end as counted: now while running, never before the start),
+        job, dim, gpus, cpus, susp, stop."""
+        where = ["start<%d" % int(high)]
+        fin = "stop<%d" % OPEN_STOP + ("" if finished is None else self._dims_sql(finished))
+        run = "stop=%d" % OPEN_STOP + ("" if running is None else self._dims_sql(running))
+        where.append("((%s) OR (%s))" % (fin, run))
+        if skip:
+            where.append("k NOT IN (%s)" % ",".join("'%s'" % k.replace("'", "''") for k in skip))
+        rs = "(CASE WHEN stop=%d THEN max(%d,start) ELSE max(stop,start) END)" % (
+            OPEN_STOP, int(as_of))
+        where.append("(start<%d OR %s=start)" % (int(end), rs))
+        return ("(SELECT start,%s AS rs,job,dim,coalesce(gpus,0) AS gpus,coalesce(cpus,0) "
+                "AS cpus,susp,stop,ex FROM jobs WHERE %s)" % (rs, " AND ".join(where)))
+
+    def event_inside(self, rows: str, low: int, failed: Set[int]) -> Tuple[
+            Optional[tuple], Optional[tuple], List[tuple], List[tuple]]:
+        """From event_rows(), the rows that started at ``low`` or later: the largest
+        (gpus, cpus, start, job, dim), the longest finished (run time, start, stop, job,
+        gpus), each dim's first (dim, start, job) and the rows in ``failed`` dims (start,
+        stop, job, ex), earliest first where it matters."""
+        with self.lock:
+            top = self._select("SELECT gpus,cpus,start,job,dim FROM %s WHERE start>=? "
+                               "ORDER BY gpus DESC,cpus DESC,start LIMIT 1" % rows, (low,))
+            longest = self._select(
+                "SELECT rs-start-susp AS run,start,stop,job,gpus FROM %s WHERE start>=? AND "
+                "stop<%d ORDER BY run DESC,start LIMIT 1" % (rows, OPEN_STOP), (low,))
+            firsts = self._select(
+                "SELECT dim,min(start),job FROM %s WHERE start>=? GROUP BY dim" % rows, (low,))
+            failures = self._select(
+                "SELECT start,stop,job,ex FROM %s WHERE start>=? AND stop<%d%s ORDER BY start"
+                % (rows, OPEN_STOP, self._dims_sql(failed)), (low,)) if failed else []
+        return (top[0] if top else None, longest[0] if longest else None, firsts, failures)
+
+    def event_prior(self, rows: str, low: int, failed: Set[int], chained: Set[int]
+                    ) -> Tuple[List[tuple], List[int], List[Tuple[int, int]], Optional[int],
+                               List[tuple]]:
+        """From event_rows(): per dim before ``low`` (dim, max gpus, max cpus, longest
+        finished run); the ends of failed allocations before ``low`` (``failed`` dims);
+        the gaps in coverage (start of the next allocation, coverage before it) and the
+        coverage at the end; and the rows of jobs that have a finished row in a ``chained``
+        dim, by start (start, rs, job, dim, gpus, susp, stop)."""
+        with self.lock:
+            prior = self._select(
+                "SELECT dim,max(gpus),max(cpus),max(CASE WHEN stop<%d THEN rs-start-susp END) "
+                "FROM %s WHERE start<? GROUP BY dim" % (OPEN_STOP, rows), (low,))
+            ends = [r[0] for r in self._select(
+                "SELECT stop FROM %s WHERE start<? AND stop<%d%s" % (
+                    rows, OPEN_STOP, self._dims_sql(failed)), (low,))] if failed else []
+            gaps, cover = [], None  # type: List[Tuple[int, int]], Optional[int]
+            try:
+                ordered = self._db.execute("SELECT start,rs FROM %s ORDER BY start" % rows)
+                for begun, end in ordered:
+                    if cover is None:
+                        cover = end
+                        continue
+                    if begun > cover:
+                        gaps.append((begun, cover))
+                    if end > cover:
+                        cover = end
+            except sqlite3.Error as error:
+                raise HistoryError("error", "history cache: %s" % error)
+            chains = self._select(
+                "SELECT start,rs,job,dim,gpus,susp,stop FROM %s WHERE job IN (SELECT job FROM %s "
+                "WHERE stop<%d%s) ORDER BY start" % (rows, rows, OPEN_STOP,
+                                                     self._dims_sql(chained))) if chained else []
+        return prior, ends, gaps, cover, chains
+
+    def repeated_rows(self, low: int, high: int, dim_ids: Optional[Set[int]]
+                      ) -> List[Tuple[int, int, int, int, Optional[int]]]:
+        """(start, stop, job, dim, gpus) of the finished rows of jobs with several rows
+        that started and ended in [low, high)."""
+        with self.lock:
+            self._repeated_table()
+            return self._select(
+                "SELECT start,stop,job,dim,gpus FROM jobs WHERE start>=? AND start<? AND stop<? "
+                "AND stop>=start AND job IN (SELECT job FROM temp.repeated)%s" % self._dims_sql(
+                    dim_ids), (low, high, high))
 
     def count_by_dim(self) -> Dict[int, int]:
         return dict(self._select("SELECT dim,count(*) FROM jobs GROUP BY dim"))
@@ -384,6 +710,94 @@ class SqliteStore(_Base):
                 out[k] = Info(label, name, restarts)
         return out
 
+    _REPEATED = "SELECT job FROM temp.repeated"
+
+    def _repeated_table(self) -> None:
+        """temp.repeated: repeated_jobs() as a table, for the queries that exclude them."""
+        if getattr(self, "_rep_table", None) == self.version:
+            return
+        jobs = self.repeated_jobs()
+        self._db.execute("CREATE TEMP TABLE IF NOT EXISTS repeated(job INTEGER PRIMARY KEY)")
+        self._db.execute("DELETE FROM temp.repeated")
+        self._db.executemany("INSERT INTO temp.repeated VALUES(?)", [(j,) for j in jobs])
+        self._db.commit()  # never leave a transaction open between calls
+        self._rep_table = self.version
+
+    def scan_special(self, low: Optional[int], high: int, dim_ids: Optional[Set[int]],
+                     extra: bool = False, repeated: bool = True) -> Iterator[Row]:
+        """scan()'s rows that have no end or (``repeated``) belong to a job with several
+        rows."""
+        if dim_ids is not None and not dim_ids:
+            return
+        with self.lock:
+            self._repeated_table()
+        where, args = "j.start<?", [high]  # type: str, List[Any]
+        if low is not None:
+            where += " AND j.stop>=?"
+            args.append(low)
+        dims = self._dims_sql(dim_ids, "j.dim") if dim_ids is not None and \
+            len(dim_ids) <= _MAX_SQL_IDS else ""
+        for row in self._select(
+                "SELECT %s,NULL,NULL,NULL,0%s FROM jobs j WHERE %s%s AND (j.stop=%d%s)" % (
+                    _COLUMNS, ",j.name,j.ex" if extra else "", where, dims, OPEN_STOP,
+                    " OR j.job IN (%s)" % self._REPEATED if repeated else ""), args):
+            if dim_ids is None or row[2] in dim_ids:
+                yield row  # type: ignore
+
+    def rows_of(self, keys: Sequence[str], extra: bool = False) -> List[Row]:
+        out = []  # type: List[Row]
+        for i in range(0, len(keys), 500):
+            part = keys[i:i + 500]
+            out += self._select("SELECT %s,NULL,NULL,NULL,0%s FROM jobs j WHERE j.k IN (%s)" % (
+                _COLUMNS, ",j.name,j.ex" if extra else "", ",".join("?" * len(part))), part)
+        return out
+
+    def top_finished(self, low: Optional[int], high: int, start: int, end: int,
+                     dim_ids: Optional[Set[int]], sort: str, descending: bool, count: int,
+                     single: bool = True) -> Tuple[int, List[str]]:
+        """Finished rows (of jobs with one row, if ``single``), as listing.list_jobs counts
+        them: how many
+        have usage in the window, and the keys of the first ``count`` by ``sort``
+        (gpu, cpu, mem: amount in the window; start), ties by later start, then key."""
+        rs = "max(j.stop,j.start)"
+        p, q = "max(j.start,%d)" % start, "min(%s,%d)" % (rs, end)
+        held = "min(j.susp,%s-j.start)" % rs
+        secs = ("(CASE WHEN %(q)s<=%(p)s THEN 0 WHEN %(h)s>0 THEN (%(q)s-j.start)-%(h)s*(%(q)s-"
+                "j.start)/(%(rs)s-j.start)-((%(p)s-j.start)-%(h)s*(%(p)s-j.start)/(%(rs)s-j.start)"
+                ") ELSE %(q)s-%(p)s END)" % {"q": q, "p": p, "h": held, "rs": rs})
+        value = {"gpu": "j.gpus*" + secs, "cpu": "j.cpus*" + secs, "mem": "j.mem*" + secs,
+                 "start": "j.start"}[sort]
+        where = ["j.start<%d" % int(high), "j.stop<%d" % OPEN_STOP]
+        here = "j.start<%d" % int(high)
+        if low is not None:
+            where.append("j.stop>=%d" % int(low))
+            here += " AND j.start>=%d" % int(low)
+        where.append("(%s>%s OR (%s=j.start AND %s))" % (q, p, rs, here))
+        if single:
+            where.append("j.job NOT IN (%s)" % self._REPEATED)
+        sql = " AND ".join(where) + (self._dims_sql(dim_ids, "j.dim") if dim_ids is not None
+                                     else "")
+        with self.lock:
+            self._repeated_table()
+            total = self._select("SELECT count(*) FROM jobs j WHERE " + sql)[0][0]
+            order = "DESC" if descending else "ASC"
+            # unknown amounts last either way, as list_jobs sorts them
+            keys = [r[0] for r in self._select(
+                "SELECT j.k FROM jobs j WHERE %s ORDER BY (%s) IS NULL, (%s) %s, j.start %s, "
+                "j.k %s LIMIT ?" % (sql, value, value, order, order, order), (count,))]
+        return total, keys
+
+    def usage_of(self, keys: Sequence[str]) -> Dict[str, tuple]:
+        """(cpu, rss, util, True) of the rows of ``keys`` whose steps were read."""
+        out = {}
+        for i in range(0, len(keys), 500):
+            part = keys[i:i + 500]
+            for k, cpu, rss, util in self._select(
+                    "SELECT k,cpu,rss,util FROM usage WHERE k IN (%s)" % ",".join("?" * len(part)),
+                    part):
+                out[k] = (cpu, rss, util, True)
+        return out
+
     def by_job(self, job_id: str) -> List[Row]:
         column, value = "label", job_id  # type: str, Any
         if job_id.isascii() and job_id.isdigit() and int(job_id) < 2 ** 63:
@@ -427,8 +841,14 @@ class SqliteStore(_Base):
         self._write(work)
 
     def mark_checked(self, keys: Iterable[str]) -> None:
-        self._write(lambda db: db.executemany("INSERT OR IGNORE INTO usage(k) VALUES(?)",
-                                              [(k,) for k in keys]))
+        keys = list(keys)
+
+        def work(db):
+            fresh = [k for k in keys if db.execute("INSERT OR IGNORE INTO usage(k) VALUES(?)",
+                                                   (k,)).rowcount]
+            self._dirty_keys(db, fresh)  # what is measured changes the aggregates
+
+        self._write(work)
 
     def unchecked(self, low: Optional[int], high: int) -> List[Tuple[str, int, int, int]]:
         """(key, dim, start, end) of finished allocations whose steps were never read."""
@@ -439,7 +859,8 @@ class SqliteStore(_Base):
 
     def clear(self) -> None:
         def work(db):
-            for table in ("jobs", "usage", "dims", "nodesets", "meta", "rollup"):
+            for table in ("jobs", "usage", "dims", "nodesets", "meta", "rollup", "agg_hour",
+                          "agg_start"):
                 db.execute("DELETE FROM %s" % table)
 
         self._write(work)
@@ -463,8 +884,13 @@ class MemoryStore(_Base):
             if row and row[6] is not None:
                 self._dirty_span(row[6], OPEN_STOP if row[7] is None else row[7])
 
+    has_agg = False
+
+    def agg_reset(self) -> None:
+        pass
+
     def rollup_replace(self, low: int, high: int, rows: Iterable[tuple],
-                       dirty: Optional[Tuple[int, int]]) -> None:
+                       dirty: Optional[Tuple[int, int]], agg: Optional[tuple] = None) -> None:
         with self.lock:
             for key in [key for key in self._rollup if low <= key[0] < high]:
                 del self._rollup[key]
@@ -614,6 +1040,10 @@ class MemoryStore(_Base):
     def info(self, keys: Sequence[str]) -> Dict[str, Info]:
         with self.lock:
             return {k: Info(*self._rows[k][14:17]) for k in keys if k in self._rows}
+
+    def usage_of(self, keys: Sequence[str]) -> Dict[str, tuple]:
+        with self.lock:
+            return {k: self._usage[k] for k in keys if k in self._usage}
 
     def by_job(self, job_id: str) -> List[Row]:
         numeric = int(job_id) if job_id.isascii() and job_id.isdigit() else None

@@ -25,8 +25,10 @@ FAINT = "faint"          # borders, rules, placeholders: recedes further than DI
 ACCENT = "accent"        # focus and the cursor
 KEY = "key"              # a key in a hint (bold accent)
 BRIGHT = "bright"        # the biggest figures
+PAST = "past"            # dim amber: the previous period on a chart
+PAST_OVER = "pastover"   # bright amber: the same line where it crosses the bars
 STYLES = (PLAIN, RESOURCE, USER, GOOD, WARN, BAD, DIM, HEAD, SELECTED, TAB, FAINT, ACCENT,
-          KEY, BRIGHT)
+          KEY, BRIGHT, PAST, PAST_OVER)
 SEL = "sel"              # the background of the selected row
 
 

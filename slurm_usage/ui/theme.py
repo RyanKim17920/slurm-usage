@@ -39,6 +39,8 @@ USER = Color((215, 140, 220), 176, 13, 5)
 GOOD = Color((130, 210, 140), 114, 2, 2)
 WARN = Color((222, 178, 96), 179, 3, 3)
 BAD = Color((255, 105, 105), 203, 9, 1)
+PAST = Color((170, 128, 64), 137, 3, 3, True)  # dim amber: last period on a chart
+PAST_OVER = Color((255, 205, 110), 221, 11, 3)  # bright amber: the same line over the bars
 BRIGHT = Color((235, 240, 245), 255, 15, 7)
 INK = Color((16, 19, 25), 234, 0, 0)  # text on an accent pill
 SEL_BG = Color((38, 50, 72), 237, 4, 4)
@@ -70,13 +72,17 @@ ROLES = {
     "good": Role(GOOD),
     "warn": Role(WARN, bold=False),
     "bad": Role(BAD, bold=True, underline=True),
+    "past": Role(PAST, dim=True),
+    "pastover": Role(PAST_OVER, bold=True),
     "selected": Role(),
     "tab": Role(INK, bold=True),
     "heat1": Role(HEAT[0], dim=True), "heat2": Role(HEAT[1], dim=True), "heat3": Role(HEAT[2]),
     "heat4": Role(HEAT[3]), "heat5": Role(HEAT[4], bold=True),
 }  # type: Dict[str, Role]
 
-BACKGROUNDS = {"sel": SEL_BG, "pill": ACCENT, "band": BAND_BG}
+BACKGROUNDS = {"sel": SEL_BG, "pill": ACCENT, "band": BAND_BG,
+               # a chart's bar body and crest, behind a line drawn across them
+               "bar": HEAT[2], "crest": HEAT[4]}
 # styles that carry their own background
 IMPLIED_BG = {"selected": "sel", "tab": "pill"}
 HEAT_STYLES = ("heat1", "heat2", "heat3", "heat4", "heat5")

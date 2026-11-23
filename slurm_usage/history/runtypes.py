@@ -5,11 +5,15 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
-from .aggregate import _Pass, usage_ratios
+from .aggregate import LAZY_FIELDS, LazyStats, _fast_pass, _fast_span, _Pass, usage_ratios
 from .errors import Cancelled, canceller
-from .select import Filter, Part, Selection, resolve
+from .records import outcome_of
+from .select import Filter, Part, Selection, resolve, unresolved
 from .stats import Stats
-from .timeline import Window
+from .timeline import Window, hour_edges
+
+# kinds the exact aggregates can tell apart: by GPUs per allocation, or by role
+_FAST = ("gpu_count", "account", "qos", "partition", "outcome")
 
 TYPE_ROLES = ("gpu_count", "name_family", "account", "qos", "partition", "outcome",
               "node_count")
@@ -87,12 +91,111 @@ def _median(values: List[int]) -> Optional[int]:
     return values[(len(values) - 1) // 2]
 
 
+def _key(by: str, roles: Any, outcome: str, gpus: Optional[int]) -> str:
+    if by == "gpu_count":
+        return "unknown" if gpus is None else str(gpus)
+    if by == "outcome":
+        return outcome
+    return getattr(roles, by)
+
+
+def _fast_types(store: Any, as_of: int, window: Window, where: Filter, by: str, metric: str,
+                gpu_tracked: Optional[bool], cancelled: Any, cancel: Any
+                ) -> Optional[List[RunType]]:
+    """run_types() from the exact aggregates, or None where they cannot answer."""
+    if by not in _FAST or where.node is not None or not getattr(store, "has_agg", False):
+        return None
+    with store.lock:
+        chosen = Selection(store.dims(), {}, where)
+        first = store.first_start(chosen.dim_ids) if window.start is None else None
+        span = resolve(window, as_of, first)
+        edges = hour_edges(span.start, span.end)
+        hours = _fast_span(store, span, edges)
+        if hours is None:
+            return None
+        groups = {}  # type: Dict[str, Tuple[LazyStats, Dict[str, Stats]]]
+
+        def targets_of(roles: Any, outcome: str, gpus: Optional[int]) -> List[Stats]:
+            key = _key(by, roles, outcome, gpus)
+            found = groups.get(key)
+            if found is None:
+                found = groups[key] = (LazyStats(gpu_tracked), {})
+            stats, outcomes = found
+            if outcome not in outcomes:
+                outcomes[outcome] = Stats(gpu_tracked)
+            return [stats, outcomes[outcome]]
+
+        state = _Pass([("outcome",)], gpu_tracked, edges, None, "gpu", None, 1)
+        _fast_pass(store, chosen, span, state, hours, store.repeated_jobs(), True, cancelled,
+                   None, targets_of, skip_problem=True)
+        dims, outcomes_wanted = chosen.dims, where.outcome
+        finished = None  # type: Any
+        if chosen.dim_ids is not None or outcomes_wanted is not None:
+            finished = {d for d in (chosen.dim_ids if chosen.dim_ids is not None else dims)
+                        if d in dims and (outcomes_wanted is None or
+                                          outcome_of(dims[d].state, True) in outcomes_wanted)}
+        # medians and one real name per kind, from SQLite
+        live = None  # type: Any
+        if chosen.dim_ids is not None or outcomes_wanted is not None:
+            live = {d for d in (chosen.dim_ids if chosen.dim_ids is not None else dims)
+                    if d in dims and (outcomes_wanted is None or
+                                      outcome_of(dims[d].state, False) in outcomes_wanted)}
+        skip = [r[0] for r in store.open_rows()
+                if r[2] in dims and unresolved(dims[r[2]].state, None, r[8])]
+        # an unfinished row's outcome is not its dim's finished one
+        kinds = None if by == "gpu_count" else {
+            d: (_key(by, roles, outcome_of(roles.state, True), None),
+                _key(by, roles, outcome_of(roles.state, False), None))
+            for d, roles in dims.items()}
+        runtimes, waits, first_names = store.type_medians(
+            span.low, span.high, span.start, span.end, as_of, finished, live, skip, kinds)
+        lookup = (lambda key: -1 if key == "unknown" else int(key)) if by == "gpu_count" \
+            else (lambda key: key)
+    total = 0
+    out = []
+    for key, (stats, outcomes) in groups.items():
+        stats.finish()
+        if not stats.attempts:
+            continue
+        total += stats.amount(metric) or 0
+    for key, (stats, outcomes) in groups.items():
+        if not stats.attempts:
+            continue
+        amount = stats.amount(metric)
+        out.append(RunType(key, by, stats, amount / total if total and amount is not None
+                           else None, {o: s.attempts for o, s in outcomes.items() if s.attempts},
+                           runtimes.get(lookup(key)), waits.get(lookup(key)),
+                           first_names.get(lookup(key), "")))
+
+    members = [item.stats for item in out]
+
+    def resolve_lazy() -> None:
+        full = {item.key: item.stats for item in run_types(
+            store, as_of, window, where, by, metric, gpu_tracked, cancel, exact=True)}
+        for stats in members:
+            stats._resolver = None
+        for item in out:
+            source = full.get(item.key) or Stats()
+            for name in LAZY_FIELDS:
+                setattr(item.stats, name, getattr(source, name))
+
+    for stats in members:
+        stats._resolver = resolve_lazy
+    out.sort(key=lambda t: (-(t.stats.amount(metric) or 0), -t.stats.attempts, t.key))
+    return out
+
+
 def run_types(store: Any, as_of: int, window: Optional[Window], where: Optional[Filter],
               by: str, metric: str = "gpu", gpu_tracked: Optional[bool] = None,
-              cancel: Any = None) -> List[RunType]:
+              cancel: Any = None, exact: bool = False) -> List[RunType]:
     if by not in TYPE_ROLES:
         raise ValueError("by is one of %s" % ", ".join(TYPE_ROLES))
     window, where, cancelled = window or Window(), where or Filter(), canceller(cancel)
+    if not exact:
+        found = _fast_types(store, as_of, window, where, by, metric, gpu_tracked, cancelled,
+                            cancel)
+        if found is not None:
+            return found
     with store.lock:
         nodesets = store.nodesets()
         chosen = Selection(store.dims(), nodesets, where)

@@ -11,7 +11,7 @@ imports only from layers listed before it (`history` does not use `live`).
 | `runner` | the only place a subprocess is started. `policy.check(argv)` is the read-only allowlist; results carry a `Status` derived from exit code and stderr |
 | `live` | what the cluster looks like now (`LiveCollector.snapshot()`), plus one-job queries made on request (`ondemand`) and bounded log tails (`logs`) |
 | `history` | accounting history: incremental ingest into a disposable cache (`store`), queries over any window (`report`, `aggregate`, `series`), the hourly `rollup` behind the overview, run types, events, one job's detail |
-| `ui` | the terminal front end: `data` adapts history for screens and loads ranges in the background, `screens` builds panes, `widgets` lays them out in boxes and fits tables to the width, `charts` draws sparklines, gauges and heat cells, `plot` the large figures and the range detail's chart, `theme` holds the palette (truecolor, 256, 16, 8 colors or none) and glyph sets, `app` handles keys and the event loop, `text` renders `--once` / `--json`, `anonymize` wraps the collector and history with pseudonyms |
+| `ui` | the terminal front end: `data` adapts history for screens and loads ranges in the background, `screens` builds panes, `widgets` lays them out in boxes and fits tables to the width, `charts` draws sparklines, gauges and heat cells, `plot` the large figures and the range detail's chart, `breakdown` splits a list of attempts for the run-type breakdown and the Me page (GPU-seconds per bin, outcomes, runtime and wait quantiles, job-name families), `theme` holds the palette (truecolor, 256, 16, 8 colors or none) and glyph sets, `app` handles keys and the event loop, `text` renders `--once` / `--json`, `anonymize` wraps the collector and history with pseudonyms |
 | `cli` | argument parsing (removed options stop with what replaced them), environment (`NO_COLOR`, `SLURM_USAGE_CACHE`), detecting ASCII terminals, and choosing between the TUI and `--once` |
 
 ## Status values
@@ -47,6 +47,21 @@ and pieces already committed stay valid if a load is cancelled.
 `history/rollup.py` maintains hourly totals per role combination (user, account,
 QOS, partition, state) for the hours whose data changed, and serves the
 overview's per-range totals and trend series from them without touching Slurm.
+The same pass keeps exact aggregates of finished allocations (`agg_hour`: usage,
+allocation seconds, measured efficiency and first/last use per hour; `agg_start`:
+per-attempt counts, waits and time-limit use by start hour). `aggregate.py`
+answers a window from them for its whole hours and reads only the rows at its
+edges, those running across its end, unfinished ones and odd ones (ending before
+they start), so any range costs about the same as a day; the results equal a
+full pass (`build_report(exact=True)`), and the few fields that do not add up
+over hours (peak GPUs, active time, first/last use) come from one full pass the
+first time one of them is read. Lanes use the aggregates once their resolution is
+an hour or more. A cache from before the aggregates (or of another layout,
+`AGG_VERSION`) rebuilds them from the stored rows on the next rollup, without
+asking Slurm again. Events take their baselines (largest and longest before the
+window, gaps, preemption chains) from SQLite and read only the rows inside the
+window. Step usage for efficiency is read in pieces of about 3,000 attempts,
+three `sacct` at a time.
 
 ## Settings at run time
 

@@ -3,7 +3,7 @@
 ``big`` draws a number three rows tall (half blocks, or seven-segment strokes in
 ASCII). ``area_chart`` draws usage over a range: one bar per bin when bins are
 wide enough to read one by one (a day by the hour, a month by the day), else a
-filled area; the previous equal period as a dashed line over it, the capacity,
+filled area; the previous equal period as one connected line behind it, the capacity,
 the mean and "now" as labelled rows, and a time axis under it. Everything is
 plain data in, rows of ``(text, style)`` out: no clock, no curses.
 """
@@ -14,7 +14,7 @@ import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import fmt
-from .canvas import ACCENT, BRIGHT, DIM, FAINT, GOOD, PLAIN, WARN, bold
+from .canvas import ACCENT, BRIGHT, DIM, FAINT, GOOD, PAST, PAST_OVER, PLAIN, bold
 from .charts import EIGHTHS, _join, heat_style
 
 Segment = Tuple[str, str]
@@ -225,18 +225,33 @@ def time_axis(cols: int, start: int, end: int, unit: str, now: Optional[float] =
 
 CAP = "┈"
 MEAN = "┄"
-PREV = "╌"
 ASCII_PARTS = "..::++##"
-ASCII_CAP, ASCII_MEAN, ASCII_PREV = "=", "~", "-"
+ASCII_CAP, ASCII_MEAN = "=", "~"
+# the previous period: one connected line, a step where it changes level
+# (keys: straight, up-from, up-to, down-from, down-to, vertical)
+PREV_LINE = {"h": "─", "up_from": "╯", "up_to": "╭", "down_from": "╮", "down_to": "╰", "v": "│"}
+ASCII_PREV_LINE = {"h": "-", "up_from": "+", "up_to": "+", "down_from": "+", "down_to": "+",
+                   "v": "|"}
+PREV = PREV_LINE["h"]
+ASCII_PREV = ASCII_PREV_LINE["h"]
+# what one bar is the average over
+BIN_WORDS = {"hour": "hour", "3hour": "3-hour", "day": "day", "week": "week", "month": "month"}
+BIN_ADJECTIVES = {"hour": "hourly", "3hour": "3-hourly", "day": "daily", "week": "weekly",
+                  "month": "monthly"}
 
 
 class Chart:
-    """What area_chart draws; values are in the chart's unit (GPUs, CPUs)."""
+    """What area_chart draws; values are in the chart's unit (GPUs, CPUs).
+
+    Each value is the average held over its bin (a day's bar is that day's average);
+    ``now`` is the live count, ``capacity`` a ceiling named ``cap_label`` (the
+    cluster's capacity, an account's limit, or the cluster for a person)."""
 
     def __init__(self, values: Sequence[float], edges: Sequence[int], unit: str = "day",
                  previous: Optional[Sequence[float]] = None, capacity: Optional[float] = None,
                  mean: Optional[float] = None, now: Optional[float] = None,
-                 clock: Optional[float] = None, what: str = "GPUs") -> None:
+                 clock: Optional[float] = None, what: str = "GPUs",
+                 cap_label: str = "capacity") -> None:
         self.values = list(values)
         self.edges = list(edges)
         self.unit = unit
@@ -246,6 +261,23 @@ class Chart:
         self.now = now
         self.clock = clock
         self.what = what
+        self.cap_label = cap_label
+
+
+def bin_word(unit: str) -> str:
+    """'day' for daily bins: "peak day avg"."""
+    return BIN_WORDS.get(unit, unit)
+
+
+def axis_top(chart: Chart, rows: int) -> Tuple[float, float]:
+    """(step, top) of the y-axis: round, and always holding every value drawn: the
+    bars, the previous period, the capacity and now."""
+    values = chart.values
+    highest = max([max(values) if values else 0.0,
+                   max(chart.previous) if chart.previous else 0.0,
+                   chart.capacity or 0.0, chart.now or 0.0, chart.mean or 0.0])
+    ticks = 2 if rows < 6 else 4 if rows < 12 else 5 if rows < 24 else 7
+    return nice_top(highest * 1.04 if highest else 1.0, ticks)
 
 
 def _columns(values: Sequence[float], edges: Sequence[int], cols: int
@@ -304,29 +336,83 @@ def _line(values: Sequence[float], edges: Sequence[int], cols: int) -> List[Opti
     return out
 
 
+def _steps(values: Sequence[float], edges: Sequence[int], cols: int, bars: bool,
+           owner: Sequence[int]) -> List[Optional[float]]:
+    """The previous period per column. With bars each bin keeps one level across its
+    columns and its gap, so the line steps between bars; else time-weighted."""
+    if not bars:
+        return _line(values, edges, cols)
+    out = []  # type: List[Optional[float]]
+    last = None  # type: Optional[int]
+    for col in range(cols):
+        index = owner[col] if owner[col] >= 0 else last
+        if index is None:
+            index = next((o for o in owner[col:] if o >= 0), None)
+        out.append(values[index] if index is not None and index < len(values) else None)
+        if owner[col] >= 0:
+            last = owner[col]
+    return out
+
+
+def prev_cells(levels: Sequence[Optional[int]], ascii_only: bool = False
+               ) -> Dict[Tuple[int, int], str]:
+    """The previous period's line as cells {(row, col): glyph}: a straight run at each
+    level, joined to the next level in the column where it changes, so it never
+    breaks into separate dashes."""
+    glyphs = ASCII_PREV_LINE if ascii_only else PREV_LINE
+    cells = {}  # type: Dict[Tuple[int, int], str]
+    for col, row in enumerate(levels):
+        if row is None:
+            continue
+        following = levels[col + 1] if col + 1 < len(levels) else None
+        if following is None or following == row:
+            cells[(row, col)] = glyphs["h"]
+        elif following < row:  # rises: up from this row, into the higher one
+            cells[(row, col)] = glyphs["up_from"]
+            for between in range(following + 1, row):
+                cells[(between, col)] = glyphs["v"]
+            cells[(following, col)] = glyphs["up_to"]
+        else:
+            cells[(row, col)] = glyphs["down_from"]
+            for between in range(row + 1, following):
+                cells[(between, col)] = glyphs["v"]
+            cells[(following, col)] = glyphs["down_to"]
+    return cells
+
+
 def area_chart(chart: Chart, width: int, rows: int, ascii_only: bool = False,
                color: bool = True) -> List[List[Segment]]:
     """``rows`` rows of chart and one of time axis, each ``width`` cells: a y-axis in
     the chart's unit at the left, labels for capacity, the mean and now at the right."""
     values = chart.values
     peak = max(values) if values else 0.0
-    prev_peak = max(chart.previous) if chart.previous else 0.0
-    highest = max(peak, prev_peak, chart.capacity or 0.0, chart.now or 0.0)
-    step, top = nice_top(highest * 1.04 if highest else 1.0, 4 if rows >= 6 else 2)
+    rows = max(1, rows)
+    step, top = axis_top(chart, rows)
     labels = [fmt.num(step * k, 1 if step < 1 else 0) for k in range(int(round(top / step)) + 1)]
     gutter = max(fmt.width(t) for t in labels) + 1
-    # the right margin names the rows: "capacity 56", "avg 31.6", "now 44"
+
+    def names_for(live_word: bool) -> List[Tuple[float, str, str, int]]:
+        out = []  # type: List[Tuple[float, str, str, int]]
+        if chart.now is not None:
+            out.append((chart.now, "now " + _figure(chart.now) + (" (live)" if live_word
+                                                                  else ""), bold(GOOD), 0))
+        if chart.capacity:
+            out.append((chart.capacity, chart.cap_label + " " + _figure(chart.capacity),
+                        DIM, 1))
+        if chart.mean is not None and peak > 0:
+            out.append((chart.mean, "avg " + _figure(chart.mean), ACCENT, 2))
+        return out
+
+    # the right margin names the rows: "capacity 56", "avg 31.6", "now 44 (live)"
+    margin = 0
     names = []  # type: List[Tuple[float, str, str, int]]
-    if chart.now is not None:
-        names.append((chart.now, "now " + _figure(chart.now), bold(GOOD), 0))
-    if chart.capacity:
-        names.append((chart.capacity, "capacity " + _figure(chart.capacity), DIM, 1))
-    if chart.mean is not None and peak > 0:
-        names.append((chart.mean, "avg " + _figure(chart.mean), ACCENT, 2))
-    margin = max([fmt.width(text) for _, text, _, _ in names] + [0])
-    margin = margin + 2 if margin and width - gutter - margin - 2 >= 30 else 0
+    for live_word in (True, False):
+        names = names_for(live_word)
+        margin = max([fmt.width(text) for _, text, _, _ in names] + [0])
+        margin = margin + 2 if margin and width - gutter - margin - 2 >= 30 else 0
+        if margin or not names:
+            break
     cols = max(1, width - gutter - margin)
-    rows = max(1, rows)
 
     def level_of(value: float) -> int:
         """The row (0 = top) that holds ``value``."""
@@ -334,7 +420,8 @@ def area_chart(chart: Chart, width: int, rows: int, ascii_only: bool = False,
         return rows - 1 - max(0, min(rows - 1, level))
 
     filled, bars, owner = _columns(values, chart.edges, cols)
-    previous = _line(chart.previous, chart.edges, cols) if chart.previous else [None] * cols
+    previous = _steps(chart.previous, chart.edges, cols, bars, owner) if chart.previous \
+        else [None] * cols
     peak_col = None
     if values and peak > 0:
         best = max(range(len(values)), key=lambda i: (values[i], i))
@@ -371,21 +458,33 @@ def area_chart(chart: Chart, width: int, rows: int, ascii_only: bool = False,
         for col in range(cols):
             if free(row, col):
                 grid[row][col] = (glyph, style)
-    for col, value in enumerate(previous):
-        if value is None or value <= 0:
-            continue  # nothing then: no line along the floor
-        row = level_of(value)
+    # the previous period: one connected line over everything, so it is seen along its
+    # whole length: dim amber over the background, bright amber across a bar (on the
+    # bar's own color where the terminal has backgrounds, so the bar stays whole)
+    levels = [level_of(v) if v is not None else None for v in previous]
+    for (row, col), glyph in prev_cells(levels, ascii_only).items():
         if (row, col) in area:
-            continue  # under the area: this period covers it
-        grid[row][col] = (ASCII_PREV if ascii_only else PREV, WARN)
+            under, tone = grid[row][col]
+            if not color:
+                style = bold(PLAIN)
+            elif under == parts[-1]:  # a whole cell of bar: keep its color behind the line
+                style = PAST_OVER + "@" + ("crest" if tone.startswith("heat5") else "bar")
+            else:  # a bar's partial top: the line on the background
+                style = PAST_OVER
+            grid[row][col] = (glyph, style)
+        else:
+            grid[row][col] = (glyph, PAST if color else DIM)
     if peak_col is not None:
         row = level_of(peak) - 1
         if row >= 0:
-            label = ("v" if ascii_only else "▾") + " peak " + _figure(peak)
-            begin = max(0, min(cols - fmt.width(label), peak_col))
-            if begin + fmt.width(label) <= cols:
-                for offset, char in enumerate(label):
-                    grid[row][begin + offset] = (char, BRIGHT if offset else bold(BRIGHT))
+            mark = "v" if ascii_only else "▾"
+            for label in ("%s peak %s avg %s" % (mark, bin_word(chart.unit), _figure(peak)),
+                          "%s %s" % (mark, _figure(peak))):
+                begin = max(0, min(cols - fmt.width(label), peak_col))
+                if begin + fmt.width(label) <= cols:
+                    for offset, char in enumerate(label):
+                        grid[row][begin + offset] = (char, BRIGHT if offset else bold(BRIGHT))
+                    break
     if chart.now is not None:
         grid[level_of(chart.now)][cols - 1] = ("*" if ascii_only else "●", bold(GOOD))
 
@@ -424,17 +523,70 @@ def _figure(value: float) -> str:
     return fmt.num(value)
 
 
-def legend(chart: Chart, range_word: str, ascii_only: bool = False) -> List[Segment]:
-    """What the marks mean, for the chart's title row."""
+def legend(chart: Chart, range_word: str, ascii_only: bool = False,
+           width: Optional[int] = None, color: bool = True) -> List[Segment]:
+    """What the marks mean, as one row: what a bar is (the y-axis's unit), the previous
+    period, the average, the ceiling and now. With ``width`` it is shortened to fit
+    (and padded to it): the chart draws it under its time axis, so it stays in sight."""
     block = "#" if ascii_only else "█"
-    out = [(block, "heat4"), (" " + chart.what + " in use", DIM)]
+    adjective = BIN_ADJECTIVES.get(chart.unit, chart.unit)
+    prev = ASCII_PREV_LINE if ascii_only else PREV_LINE
+    items = [  # (forms, longest first; style of the mark; priority: lower is kept longer)
+        ([(block, "heat4" if color else PLAIN), (" %s in use · %s average" % (chart.what, adjective), DIM)],
+         [(block, "heat4" if color else PLAIN), (" %s avg" % adjective, DIM)],
+         [(block, "heat4" if color else PLAIN), (" " + adjective, DIM)], 0)]
     if chart.previous is not None:
-        out += [("  ", PLAIN), ((ASCII_PREV if ascii_only else PREV) * 2, WARN),
-                (" previous " + range_word, DIM)]
+        line = prev["h"] + prev["down_from"] if not ascii_only else "--"
+        items.append(([(line, PAST if color else DIM), (" previous " + range_word, DIM)],
+                      [(line, PAST if color else DIM), (" prev " + range_word, DIM)],
+                      [(line, PAST if color else DIM), (" prev", DIM)], 1))
     if chart.mean is not None:
-        out += [("  ", PLAIN), ((ASCII_MEAN if ascii_only else MEAN) * 2, ACCENT),
-                (" average", DIM)]
+        mean = (ASCII_MEAN if ascii_only else MEAN) * 2
+        items.append(([(mean, ACCENT), (" average", DIM)], [(mean, ACCENT), (" avg", DIM)],
+                      [(mean, ACCENT), (" avg", DIM)], 4))
     if chart.capacity:
-        out += [("  ", PLAIN), ((ASCII_CAP if ascii_only else CAP) * 2, DIM),
-                (" capacity", DIM)]
-    return out
+        cap = (ASCII_CAP if ascii_only else CAP) * 2
+        items.append(([(cap, DIM), (" " + chart.cap_label, DIM)],
+                      [(cap, DIM), (" " + chart.cap_label[:3], DIM)],
+                      [(cap, DIM), (" " + chart.cap_label[:3], DIM)], 3))
+    if chart.now is not None:
+        dot = "*" if ascii_only else "●"
+        items.append(([(dot, bold(GOOD)), (" now (live)", DIM)], [(dot, bold(GOOD)), (" now", DIM)],
+                      [(dot, bold(GOOD)), (" now", DIM)], 2))
+
+    def render(level: List[int], keep: List[bool], gap: str) -> List[Segment]:
+        out = []  # type: List[Segment]
+        for item, form, kept in zip(items, level, keep):
+            if not kept:
+                continue
+            if out:
+                out.append((gap, PLAIN))
+            out += item[form]
+        return out
+
+    level = [0] * len(items)
+    keep = [True] * len(items)
+    if width is None:
+        return render(level, keep, "  ")
+
+    def size(gap: str) -> int:
+        return sum(fmt.width(t) for t, _ in render(level, keep, gap))
+
+    gap = "   "
+    order = sorted(range(len(items)), key=lambda i: -items[i][3])  # least needed first
+    for form in (1, 2):
+        for index in order:
+            if size(gap) <= width:
+                break
+            gap = "  "
+            level[index] = form
+    for index in order:
+        if size(gap) <= width or sum(keep) == 1:
+            break
+        keep[index] = False
+    out = render(level, keep, gap)
+    used = sum(fmt.width(t) for t, _ in out)
+    if used > width:  # even one item does not fit: its text, cut
+        out = [(fmt.fit("".join(t for t, _ in out), width), DIM)]
+        used = width
+    return out + [(" " * (width - used), PLAIN)] if width > used else out

@@ -4,6 +4,7 @@ Step queries cost an order of magnitude more than allocation queries, so they
 run only when asked, only where a finished attempt has not been read yet.
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from ..model import Status
@@ -18,8 +19,9 @@ from .timeline import DAY, HOUR, Window
 
 USAGE_FIELDS = ("DBIndex", "JobIDRaw", "Cluster", "Submit", "End", "State", "TotalCPU",
                 "TRESUsageInTot")
-FEW_LINES, MANY_LINES = 20000, 60000
-FIRST_PIECE, SMALLEST_PIECE, LARGEST_PIECE = DAY, HOUR, 7 * DAY
+SMALLEST_PIECE, LARGEST_PIECE = HOUR, 7 * DAY
+PIECE_ATTEMPTS = 2000  # about 6,000 lines of sacct each
+WORKERS = 4  # step queries in flight at once
 TIMEOUT = 300.0
 _RSS_SANE, _UTIL_SANE = 2 ** 53, 100 * 4096
 
@@ -78,29 +80,54 @@ def load_efficiency(runner: Any, store: Any, env: Environment, as_of: int,
         if account != NONE and not account.startswith("-") and account.isascii():
             scope += ["-A", account]
 
-    piece, at, finished = FIRST_PIECE, 0, set()
+    # Pieces of at most PIECE_ATTEMPTS attempts and LARGEST_PIECE of time, read a few at
+    # a time: step queries are bound by slurmdbd's answer time, not by this process.
+    pieces, at = [], 0
     while at < len(todo):
         begin, upto = todo[at][3], at
-        while upto < len(todo) and todo[upto][3] < begin + piece:
+        while (upto < len(todo) and upto - at < PIECE_ATTEMPTS
+               and todo[upto][3] < begin + LARGEST_PIECE):
             upto += 1
-        wanted = [row[0] for row in todo[at:upto] if row[0] not in finished]
-        if wanted:
-            try:
-                lines = _fetch(runner, store, env, fields, begin, todo[upto - 1][3], as_of,
-                               scope, cancelled, finished)
-            except HistoryError as error:
-                if error.status != Status.TIMEOUT or piece <= SMALLEST_PIECE:
-                    raise
-                piece = max(SMALLEST_PIECE, piece // 4)
-                continue
-            store.mark_checked(wanted)  # nothing to read is an answer too
-            if lines > MANY_LINES:
-                piece = max(SMALLEST_PIECE, piece // 2)
-            elif lines < FEW_LINES:
-                piece = min(LARGEST_PIECE, piece * 2)
+        pieces.append(todo[at:upto])
         at = upto
+    finished, done = set(), 0  # type: set, int
+
+    def read(piece: list) -> list:
+        """Read one piece; a piece that timed out is read again in quarters."""
+        wanted = [row[0] for row in piece if row[0] not in finished]
+        if not wanted:
+            return piece
+        begin, end = piece[0][3], piece[-1][3]
+        try:
+            _fetch(runner, store, env, fields, begin, end, as_of, scope, cancelled, finished)
+        except HistoryError as error:
+            if error.status != Status.TIMEOUT or end - begin <= SMALLEST_PIECE or len(piece) < 2:
+                raise
+            step = max(1, len(piece) // 4)
+            for at in range(0, len(piece), step):
+                read(piece[at:at + step])
+            return piece
+        store.mark_checked(wanted)  # nothing to read is an answer too
+        return piece
+
+    if len(pieces) == 1:
+        read(pieces[0])
         if progress:
-            progress(Progress("efficiency", at, len(todo)))
+            progress(Progress("efficiency", len(todo), len(todo)))
+        return len(todo)
+    pool = ThreadPoolExecutor(max_workers=WORKERS)
+    try:
+        futures = [pool.submit(read, piece) for piece in pieces]
+        for future in as_completed(futures):
+            done += len(future.result())
+            if progress:
+                progress(Progress("efficiency", done, len(todo)))
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        raise
+    finally:
+        pool.shutdown(wait=True)
     return len(todo)
 
 

@@ -99,6 +99,33 @@ class DemoClusterTest(unittest.TestCase):
             finally:
                 history.close()
 
+    def test_history_never_exceeds_the_live_capacity(self):
+        """No hour of the demo's history holds more GPUs than the demo cluster has (an
+        invented cluster whose charts poke above capacity reads as a bug)."""
+        fake = load("fakeslurm")
+        capacity = sum(node[3] for node in fake.NODES)
+        cache = tempfile.mkdtemp(dir=self.scratch)
+        with self.as_alice:
+            history = History(self.runner, cache_dir=cache)
+            try:
+                history.info()
+                window = Window.last(30 * DAY)
+                history.refresh(window)
+                report = history.query(window)
+                edges, values = report.edges, report.values["gpu"]
+                held = [v / float(edges[i + 1] - edges[i]) for i, v in enumerate(values)]
+                self.assertLessEqual(max(held), capacity + 1e-6)
+                self.assertGreater(max(held), capacity * 0.8)  # and it does get busy
+            finally:
+                history.close()
+
+    def test_a_kept_cache_is_one_per_demo_day(self):
+        """The world is anchored to today's midnight: yesterday's cache must not mix in."""
+        fake = load("fakeslurm")
+        today = fake.world_id(1_800_000_000)
+        self.assertEqual(today, fake.world_id(1_800_000_000 + 60))
+        self.assertNotEqual(today, fake.world_id(1_800_000_000 + DAY))
+
 
 if __name__ == "__main__":
     unittest.main()

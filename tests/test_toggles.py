@@ -307,13 +307,18 @@ class AnonymizeToggleTest(unittest.TestCase):
         app = make_app()
         open_person(app, "alice")
         draw(app)
-        app.key("g")
         app.key("g")  # run types by job name
         self.assertEqual(app.view.extra["dim"], "name_family")
         draw(app)
         self.focus_pane(app, "runs")
-        app.key("ENTER")  # the jobs of one job-name family
+        app.key("DOWN")
+        app.key("ENTER")  # one job-name family in detail
+        self.assertEqual(app.view.kind, "runtype")
         draw(app)
+        app.key("j")  # its jobs
+        self.assertEqual(app.view.kind, "jobs")
+        draw(app)
+        app.key("ESC")
         app.key("ESC")
         draw(app)
         self.focus_pane(app, "jobs")
@@ -338,10 +343,11 @@ class AnonymizeToggleTest(unittest.TestCase):
         open_person(app, "alice")
         draw(app)
         app.key("g")
-        app.key("g")
         draw(app)
         self.focus_pane(app, "runs")
+        app.key("DOWN")
         app.key("ENTER")
+        app.key("j")
         title = app.view.title
         self.assertIn("job name", title)
         draw(app)
