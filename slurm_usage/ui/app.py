@@ -197,6 +197,51 @@ class App:
         if entry.value is not None and entry.value is not self._raw_snapshot:
             self._raw_snapshot = entry.value
             self._derive_snapshot()
+        if self.background:
+            self._prefetch_job()
+
+    PREFETCH_AFTER = 0.5  # seconds a job row stays selected before its detail is fetched
+    _dwell = ("", 0.0)  # type: Tuple[str, float]
+
+    def _prefetch_job(self) -> None:
+        """A job row that stays selected has its detail (sacct, and sstat while it runs)
+        fetched under the job screen's own keys, so Enter opens it filled in. Once per job
+        until the next refresh."""
+        last = getattr(self, "_last", None)
+        if last is None or getattr(self, "_last_view", None) is not self.view:
+            return
+        panes, states, shown = last
+        at = self.view.focus
+        if not 0 <= at < len(panes) or not shown[at]:
+            return
+        lines = shown[at]
+        target = lines[max(0, min(states[at].cursor, len(lines) - 1))].action
+        if target is None or target.kind != "job":
+            return
+        job_id = str(target.params.get("job_id"))
+        now = time.time()
+        if self._dwell[0] != job_id:
+            self._dwell = (job_id, now)
+            return
+        if now - self._dwell[1] < self.PREFETCH_AFTER:
+            return
+        done = self.__dict__.setdefault("_prefetched", {})
+        if done.get(job_id) == self.refreshes:
+            return
+        if len(done) > 500:
+            done.clear()
+        done[job_id] = self.refreshes
+        data, collector = self.data, self.collector
+        if not self.no_history:
+            self.loader.get(("h", "job_attempts", job_id), lambda: data.job_attempts(job_id),
+                            generation=(data.generation, None))
+            self.loader.get(("o", "detail", job_id), lambda: data.job_detail(job_id),
+                            generation=self.refreshes)
+        live = self.snapshot.job(job_id) if self.snapshot is not None else None
+        if live is not None and collector and (live.holds_resources
+                                               or live.state == "SUSPENDED"):
+            self.loader.get(("l", "steps", job_id), lambda: collector.steps(live),
+                            generation=self.snap_generation)
 
     def _derive_snapshot(self) -> None:
         raw = self._raw_snapshot
@@ -855,7 +900,7 @@ class App:
                                           else "the chosen range and shorter")
             if not self.background:
                 data.load_in_order(self.range)
-        self.loader.invalidate()
+        # what is on screen stays: switching changes what loads next, not what is cached
         self._wake.set()
 
     def set_anonymized(self, on: bool) -> None:

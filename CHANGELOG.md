@@ -36,6 +36,9 @@ All notable changes to this project are documented here. The format follows
   use and the utilization are both over the covered span (average / capacity is
   the utilization), the tile and the detail say "from Jul 25", and the chart
   starts at the data with finer bins.
+- The terminal redraws as soon as the last answer of a screen lands; it waited
+  for the next one-second tick, so most screens looked about a second slower than
+  their data.
 
 ### Changed
 
@@ -52,6 +55,15 @@ All notable changes to this project are documented here. The format follows
   attempts as tabs, efficiency columns appear once something is measured,
   secondary columns only when the width allows, and the explanatory notes that
   sat on screen moved to the `?` glossary.
+- Faster drill screens for people with many jobs: run types by job name come from
+  the hourly aggregates (now kept per job-name family; the first start after the
+  update rebuilds them from the cache, without asking Slurm), a run type's jobs and
+  attempts are narrowed and ranked in SQLite, the newest attempts are read newest
+  first, `/` searches are prefiltered by SQLite, events keep their gaps and
+  preemption chains until the data changes, tabs behind the one on show load after
+  it, the run-type breakdown is worked out once instead of on every frame, long
+  lists (thousands of job-name families) are laid out once per answer, and a
+  selected job's detail is fetched before Enter. Answers are unchanged.
 
 ## [0.1.0] - 2026-11-22
 

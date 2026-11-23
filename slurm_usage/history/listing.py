@@ -3,13 +3,13 @@
 import heapq
 import itertools
 from dataclasses import dataclass, field
-from typing import Any, Iterator, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 from .aggregate import usage_ratios
 from .errors import Cancelled, canceller
 from .records import NONE, UNLIMITED, outcome_of
 from .select import Filter, Part, Selection, resolve, unresolved
-from .store import Info, Row
+from .store import ANY, NEWEST, Info, Row
 from .timeline import Window
 
 SORTS = ("gpu", "cpu", "mem", "start", "end", "elapsed", "wait", "attempts")
@@ -71,7 +71,7 @@ class JobRow:
 @dataclass
 class JobPage:
     rows: List[JobRow] = field(default_factory=list)
-    total: int = 0  # matches before limit and offset
+    total: Optional[int] = 0  # matches before limit and offset; None: not counted
     complete: bool = True
 
 
@@ -137,10 +137,12 @@ def list_jobs(store: Any, as_of: int, window: Optional[Window] = None,
               where: Optional[Filter] = None, by: str = "job", sort: str = "gpu",
               descending: bool = True, limit: int = 200, offset: int = 0,
               cancel: Any = None, run_type: Optional[Tuple[str, str]] = None,
-              match: Optional[str] = None) -> JobPage:
+              match: Optional[str] = None, count: bool = True) -> JobPage:
     """Jobs (or attempts) with usage in the window. ``nodes`` filters count only their share.
 
-    run_type=(by, key) keeps only attempts of one types.run_types() row.
+    run_type=(by, key) keeps only attempts of one types.run_types() row. count=False
+    may leave page.total None (not counted): the newest attempts are then read newest
+    first and no further than the page.
     """
     from .runtypes import TYPE_ROLES, type_of
     if run_type is not None and run_type[0] not in TYPE_ROLES:
@@ -160,24 +162,50 @@ def list_jobs(store: Any, as_of: int, window: Optional[Window] = None,
         span = resolve(window, as_of, first)
         repeated = store.repeated_jobs() if by == "job" else set()
 
+        # what SQLite can rule out for a run type (the check below stays: this only
+        # narrows); for finished rows, which are never unresolved, it is exact
+        dim_ids, gpus, finished_ids = chosen.dim_ids, ANY, None  # type: Any, Any, Any
+        sql_type = run_type is None
+        if run_type is not None:
+            kind, key = run_type
+            dims = chosen.dims
+            pool = dims if dim_ids is None else dim_ids
+            if kind in ("account", "qos", "partition"):
+                dim_ids = {d for d in pool if d in dims and getattr(dims[d], kind) == key}
+                sql_type = True
+            elif kind == "outcome":
+                dim_ids = {d for d in pool if d in dims and key in (
+                    outcome_of(dims[d].state, True), outcome_of(dims[d].state, False))}
+                finished_ids = {d for d in dim_ids if outcome_of(dims[d].state, True) == key}
+                sql_type = True
+            elif kind == "gpu_count" and (key == "unknown" or key.isdigit()):
+                gpus = None if key == "unknown" else int(key)
+                sql_type = True
+            elif kind == "name_family" and getattr(store, "has_families", False):
+                sql_type = True
+        narrow = {} if gpus is ANY else {"gpus": gpus}  # type: Dict[str, Any]
+        if run_type is not None and run_type[0] == "name_family" and sql_type:
+            narrow["family"] = run_type[1]
         extra = run_type is not None or bool(needle)
+        newest = (not count and by == "attempt" and sort == "start" and descending
+                  and not chosen.need_nodes)
         # Finished jobs with one attempt, sorted by a column SQLite can compute, come
         # from SQLite already ranked; the rest (unfinished rows, requeued jobs) from here.
-        quick = (sort in ("gpu", "cpu", "start") and run_type is None
+        quick = (sort in ("gpu", "cpu", "start") and sql_type and not newest
                  and not needle and not chosen.need_nodes
                  and callable(getattr(store, "top_finished", None)))
         ranked = []  # type: List[_Entry]
         if quick:
             dims, outcomes = chosen.dims, chosen.where.outcome
-            picked = chosen.dim_ids
+            picked = dim_ids if finished_ids is None else finished_ids
             if outcomes is not None:
                 picked = {d for d in (picked if picked is not None else dims)
                           if d in dims and outcome_of(dims[d].state, True) in outcomes}
             counted, keys = store.top_finished(span.low, span.high, span.start, span.end,
                                                picked, sort, descending, offset + limit,
-                                               by == "job")
+                                               by == "job", **narrow)
             page.total += counted
-            for part in chosen.parts(store.rows_of(keys), span):
+            for part in chosen.parts(store.rows_of(keys, extra), span):
                 s = part.seconds
                 ranked.append(_Entry(part, _times(part.gpus, s), _times(part.cpus, s),
                                      _times(part.mem, s), 1, part.row[6]))
@@ -186,11 +214,14 @@ def list_jobs(store: Any, as_of: int, window: Optional[Window] = None,
             merged = {}  # only jobs with several attempts are held
             # measured usage is read for the rows shown only (usage_of below)
             if quick:
-                rows = store.scan_special(span.low, span.high, chosen.dim_ids, extra,
-                                          by == "job")
+                rows = store.scan_special(span.low, span.high, dim_ids, extra, by == "job",
+                                          **narrow)
             else:
-                rows = store.scan(span.low, span.high, chosen.dim_ids, usage=False,
-                                  ordered=False, extra=extra)
+                more = dict(narrow)
+                if needle and callable(getattr(store, "match_sql", None)):
+                    more["match"] = needle  # SQLite reads only the rows that may match
+                rows = store.scan(span.low, span.high, dim_ids, usage=False,
+                                  ordered=NEWEST if newest else False, extra=extra, **more)
             try:
                 for number, part in enumerate(chosen.parts(rows, span)):
                     if not number % 1024 and cancelled():
@@ -233,9 +264,14 @@ def list_jobs(store: Any, as_of: int, window: Optional[Window] = None,
 
         pick = heapq.nlargest if descending else heapq.nsmallest
         found = entries()
-        if ranked:
-            found = itertools.chain(ranked, found)
-        best = pick(offset + limit, found, key=order)[offset:]
+        if newest:  # already in this order: the first ones are the page
+            best = list(itertools.islice(found, offset + limit))[offset:]
+            found.close()
+            page.total = None  # type: ignore  # not counted
+        else:
+            if ranked:
+                found = itertools.chain(ranked, found)
+            best = pick(offset + limit, found, key=order)[offset:]
         info = store.info([entry.part.row[0] for entry in best])
         measured = store.usage_of([entry.part.row[0] for entry in best])
         for entry in best:

@@ -51,6 +51,7 @@ class Loader:
         self._lock = threading.Lock()
         self.on_done = on_done
         self.generation = 0  # bump to revalidate everything
+        self.finished = 0  # answers landed so far: a change means something to draw
 
     def invalidate(self) -> None:
         self.generation += 1
@@ -116,6 +117,7 @@ class Loader:
                 entry.state = FAILED
             entry.at = time.time()
             entry.future = None
+            self.finished += 1
         if failure is None and self.seed is not None:
             try:
                 self.seed.save(entry.key, value)

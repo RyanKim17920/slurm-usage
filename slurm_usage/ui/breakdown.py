@@ -6,6 +6,7 @@ Pure functions of rows (``history.JobRow``-shaped: start, end, gpus, gpu_seconds
 elapsed, wait, outcome, name, user, job_id); no clock, no I/O.
 """
 
+import heapq
 import math
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -125,21 +126,32 @@ def outcome_split(outcomes: Dict[str, int]) -> List[Tuple[str, int]]:
 
 def proportional(counts: Sequence[float], size: int) -> List[int]:
     """Cells per count, summing to ``size`` (largest remainders), each non-zero count
-    at least one cell when there is room."""
+    at least one cell when there is room. In O(n log n): a stacked bar of thousands of
+    job-name families is laid out at once."""
     total = float(sum(counts))
     if size <= 0 or total <= 0:
         return [0] * len(counts)
     exact = [c / total * size for c in counts]
     cells = [int(e) for e in exact]
+    have = sum(cells)
     for index in sorted(range(len(counts)), key=lambda i: -(exact[i] - cells[i])):
-        if sum(cells) >= size:
+        if have >= size:
             break
         cells[index] += 1
-    # a part too small to round up to a cell still shows, taken from the largest
-    for index, count in enumerate(counts):
-        if count > 0 and cells[index] == 0 and size >= len([c for c in counts if c > 0]):
-            largest = max(range(len(cells)), key=lambda i: cells[i])
-            if cells[largest] > 1:
-                cells[largest] -= 1
-                cells[index] = 1
+        have += 1
+    # a part too small to round up to a cell still shows, taken from the largest (the
+    # first of the largest, as max() picks it)
+    if size >= sum(1 for c in counts if c > 0):
+        largest = [(-cell, i) for i, cell in enumerate(cells)]
+        heapq.heapify(largest)
+        for index, count in enumerate(counts):
+            if count > 0 and cells[index] == 0:
+                while -largest[0][0] != cells[largest[0][1]]:  # an old entry
+                    heapq.heappop(largest)
+                top = largest[0][1]
+                if cells[top] > 1:
+                    cells[top] -= 1
+                    cells[index] = 1
+                    heapq.heappush(largest, (-cells[top], top))
+                    heapq.heappush(largest, (-1, index))
     return cells

@@ -370,14 +370,24 @@ def _add_hours(stats: Stats, sums: Sequence[Any], efficiency: bool) -> None:
 
 def _fast_pass(store: Any, chosen: Selection, span: Any, state: _Pass, hours: Tuple[int, int],
                repeated: Set[int], efficiency: bool, cancelled: Any, progress: ProgressFn,
-               targets_of: Any = None, skip_problem: bool = False) -> Tuple[int, Any]:
+               targets_of: Any = None, skip_problem: bool = False,
+               by_family: bool = False) -> Tuple[int, Any]:
     """The window from the aggregates of its whole hours plus the rows at its edges.
     Returns (finished attempts whose steps are unread, the sorted waits).
 
     targets_of(roles, outcome, gpus) -> [Stats] splits by GPUs per allocation as well
-    (run types); skip_problem leaves out attempts not counted up to now."""
+    (run types); with by_family, targets_of(roles, outcome, job-name family) instead;
+    skip_problem leaves out attempts not counted up to now."""
     low, high = hours
     by_gpus = targets_of is not None
+    if by_family:
+        from .families import name_family
+
+        def second(row: tuple) -> Any:
+            return name_family(row[18] or "")
+    else:
+        def second(row: tuple) -> Any:
+            return row[10]
     if targets_of is None:
         def targets_of(roles: Roles, outcome: str, gpus: Any) -> List[Stats]:
             return state.targets(roles, outcome)
@@ -389,7 +399,8 @@ def _fast_pass(store: Any, chosen: Selection, span: Any, state: _Pass, hours: Tu
                                            or outcome_of(dims[d].state, True) in outcomes)}
     unchecked = 0
     less = {}  # type: Dict[int, List[Any]]  # counts of rows the aggregates hold, done exactly
-    rows = store.scan_edges(span.start, low, high, span.high, chosen.dim_ids, usage=efficiency)
+    rows = store.scan_edges(span.start, low, high, span.high, chosen.dim_ids, usage=efficiency,
+                            **({"extra": True} if by_family else {}))
     for number, part in enumerate(chosen.parts(rows, span)):
         if not number % 1024 and cancelled():
             raise Cancelled()
@@ -418,11 +429,11 @@ def _fast_pass(store: Any, chosen: Selection, span: Any, state: _Pass, hours: Tu
             amount = _edge_seconds(part, low, high)
             if low <= row[6] < high:
                 counts = start_counts(row, outcome, ratios or (None, None, None))
-                found = less.setdefault((row[2], row[10]) if by_gpus else row[2], [0] * 13)
+                found = less.setdefault((row[2], second(row)) if by_gpus else row[2], [0] * 13)
                 for at, value in enumerate(counts):
                     if at != 7:
                         found[at] += value
-        state.take(part, targets_of(roles, outcome, row[10]), part.cpus, part.gpus, part.mem,
+        state.take(part, targets_of(roles, outcome, second(row)), part.cpus, part.gpus, part.mem,
                    repeat, wait, limit, ratios, amount)
         if q > p and not part.problem:
             if not held:
@@ -432,7 +443,8 @@ def _fast_pass(store: Any, chosen: Selection, span: Any, state: _Pass, hours: Tu
                     if b > a:
                         state.draw(part._replace(start=a, stop=b))
 
-    by_hour, by_start = store.agg_sums(low, high, finished_dims, by_gpus)
+    by_hour, by_start = store.agg_sums(low, high, finished_dims, by_gpus and not by_family,
+                                       **({"by_family": True} if by_family else {}))
     for key in set(by_hour) | set(by_start):
         dim, gpus = key if by_gpus else (key, None)
         roles = dims.get(dim)
@@ -457,11 +469,14 @@ def _fast_pass(store: Any, chosen: Selection, span: Any, state: _Pass, hours: Tu
                 _add_counts(stats, counts, efficiency)
 
     # distinct jobs: the attempts of jobs with several, inside the whole hours
-    for begun, stop, job, dim, gpus in store.repeated_rows(low, high, finished_dims):
+    for found in store.repeated_rows(low, high, finished_dims,
+                                     **({"names": True} if by_family else {})):
+        begun, stop, job, dim, gpus = found[:5]
         roles = dims.get(dim)
         if roles is None:
             continue
-        for stats in targets_of(roles, outcome_of(roles.state, True), gpus):
+        kind = name_family(found[5] or "") if by_family else gpus
+        for stats in targets_of(roles, outcome_of(roles.state, True), kind):
             stats.note_repeat((job, roles.uid))
 
     edges, by = state.edges, state.series_by

@@ -6,7 +6,7 @@ return loader entries that may still be pending (drawn as ``?``).
 
 import re
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from ..live import applicable_limits, group_by
 from ..model import Status
@@ -59,10 +59,16 @@ class Context:
         self.now = time.time()
         self.collector = app.collector
 
-    def hist(self, key: Tuple[Any, ...], fn: Callable[[], Any], version: Any = None) -> Entry:
+    def hist(self, key: Tuple[Any, ...], fn: Callable[[], Any], version: Any = None,
+             later: bool = False) -> Entry:
         """``version``: inputs that change the answer but should keep the old one on
-        screen while the new one is computed (a longer page, a search)."""
-        return self.app.loader.get(("h",) + key, fn, generation=(self.data.generation, version))
+        screen while the new one is computed (a longer page, a search). ``later``: for a
+        pane not on show (a tab behind another): asked for once nothing else is being
+        worked out, so what is on screen is answered first."""
+        loader = self.app.loader
+        if later and loader.busy and loader.peek(("h",) + key) is None:
+            return Entry()  # pending; the next frame asks again
+        return loader.get(("h",) + key, fn, generation=(self.data.generation, version))
 
     def live(self, key: Tuple[Any, ...], fn: Callable[[], Any]) -> Entry:
         return self.app.loader.get(("l",) + key, fn, generation=self.app.snap_generation)
@@ -93,6 +99,24 @@ def stale(entry: Optional[Entry]) -> bool:
 
 def busy(entry: Optional[Entry]) -> bool:
     return entry is not None and (entry.busy or entry.at is None)
+
+
+def kept_lines(ctx: Context, name: Tuple[Any, ...], inputs: Sequence[Any],
+               build: Callable[[], List[Line]]) -> List[Line]:
+    """Lines that depend only on ``inputs`` (answers, compared by identity) and the
+    layout: built once per answer, not on every frame (a list of thousands of job-name
+    families took longer to lay out than a frame lasts)."""
+    cache = ctx.app.__dict__.setdefault("_kept_lines", {})
+    layout = (ctx.width, ctx.ascii, ctx.color)
+    found = cache.get(name)
+    if (found is not None and found[0] == layout and len(found[1]) == len(inputs)
+            and all(a is b for a, b in zip(found[1], inputs))):
+        return found[2]
+    lines = build()
+    if len(cache) > 32:
+        cache.clear()
+    cache[name] = (layout, tuple(inputs), lines)
+    return lines
 
 
 SPARK_MOST = 28  # a trend wider than this is drawn this wide, against the right edge
@@ -1194,7 +1218,8 @@ def range_breakdown(ctx: Context, params: Dict[str, Any], name: str, series: Any
     if params:
         filt = make_filter(params)
         types = ctx.hist(("runtypes", name, filt_key(params), "gpu_count"),
-                         lambda r=name, f=filt: ctx.data.run_types(r, f, "gpu_count"))
+                         lambda r=name, f=filt: ctx.data.run_types(r, f, "gpu_count",
+                                                                   medians=False))
         kinds = value(types)
         table = Table(columns[:3] + columns[4:5], ctx.width - 2)
         lines = []
@@ -1876,9 +1901,11 @@ def person(ctx: Context, view: View) -> List[Pane]:
     panes.append(gpu_breakdown_pane(ctx, view, params))
     panes.append(roles_breakdown_pane(ctx, params, group=more))
 
-    # events
+    # events (the tabs behind the one on show are worked out after what is on screen)
+    shown = view.extra.get("tab:" + more, "roles")
     events_entry = ctx.hist(("events", range_name, user),
-                            lambda r=range_name, f=filt: ctx.data.events(r, f))
+                            lambda r=range_name, f=filt: ctx.data.events(r, f),
+                            later=shown != "events")
     found = value(events_entry)
     lines = []
     if found is not None:
@@ -1896,7 +1923,8 @@ def person(ctx: Context, view: View) -> List[Pane]:
                       tab="Events"))
 
     # jobs list: a page at a time; a search asks history, not only the rows loaded
-    jobs = paged_jobs(ctx, view, "Jobs · " + ctx.range, ("jobs", ctx.range, user, "gpu"), filt)
+    jobs = paged_jobs(ctx, view, "Jobs · " + ctx.range, ("jobs", ctx.range, user, "gpu"), filt,
+                      later=shown != "jobs")
     jobs.group, jobs.tab = more, jobs.title.replace(" · " + ctx.range, "")
     report_entry = range_report(ctx, params, (("account",), ("qos",), ("partition",)))
     activity = activity_pane(ctx, params, value(report_entry), report_entry)
@@ -1993,12 +2021,40 @@ def previous_types(ctx: Context, params: Dict[str, Any], name: str, dim: str) ->
 
 def range_bins(ctx: Context, name: str, rows: Sequence[Any]) -> List[int]:
     """The range's chart bins (for all of history, from the oldest attempt shown)."""
-    end = int(ctx.now)
+    return bins_at(name, rows, int(ctx.now))
+
+
+def bins_at(name: str, rows: Sequence[Any], end: int) -> List[int]:
     start = hd.window(name, end).start
     if start is None:
         starts = [r.start for r in rows if r.start is not None]
         start = min(starts) if starts else end - 86400
     return hd.bin_edges(int(start), end, hd.bin_unit(name, int(start), end))
+
+
+def family_trends(data: Any, name: str, filt: Any) -> Dict[Optional[str], List[float]]:
+    """GPU-seconds per chart bin for each job-name family of the scope's attempts
+    (newest first, up to a page): worked out off the UI thread, once per answer."""
+    rows = data.attempts(name, filt).rows
+    end = int(data.clock())
+    return breakdown.held_per_bin(rows, bins_at(name, rows, end), end,
+                                  lambda row: hd._key(row, "name_family"))
+
+
+class KindView(NamedTuple):
+    """What the run-type screen draws from its attempts, worked out once per answer
+    (off the UI thread): how many there are, their breakdown and GPUs held per bin."""
+    count: int
+    info: Any  # breakdown.Detail
+    edges: List[int]
+    held: List[float]
+
+
+def kind_view(rows: Sequence[Any], name: str, by_people: bool, end: int) -> KindView:
+    edges = bins_at(name, rows, end)
+    held = breakdown.held_per_bin(rows, edges, end).get(None) or [0.0] * (len(edges) - 1)
+    return KindView(len(rows), breakdown.detail(rows, "user" if by_people else "family"),
+                    edges, held)
 
 
 def gpu_breakdown_pane(ctx: Context, view: View, params: Dict[str, Any]) -> Pane:
@@ -2010,50 +2066,35 @@ def gpu_breakdown_pane(ctx: Context, view: View, params: Dict[str, Any]) -> Pane
     name = ctx.range
     filt = make_filter(params)
     types_entry = ctx.hist(("runtypes", name, filt_key(params), dim),
-                           lambda r=name, f=filt, d=dim: ctx.data.run_types(r, f, d))
+                           lambda r=name, f=filt, d=dim: ctx.data.run_types(r, f, d,
+                                                                            medians=False))
     kinds = value(types_entry)
     before = value(previous_types(ctx, params, name, dim)) if name != "all" else None
     trends = {}  # type: Dict[Optional[str], List[float]]
     exact = kind_trends(ctx, params, name, (dim,)) if dim != "name_family" else None
+    source = exact  # type: Any  # the answer the trends come from
     if exact is not None:
         trends = dict(exact.get(dim, {}))
-    elif dim == "name_family" or not ctx.data.has("kind_series"):
-        attempts = value(scope_attempts(ctx, params, name))
+    elif dim == "name_family":
+        source = value(ctx.hist(("family-trends", name, filt_key(params)),
+                                lambda r=name, f=filt: family_trends(ctx.data, r, f)))
+        trends = source or {}
+    elif not ctx.data.has("kind_series"):
+        attempts = source = value(scope_attempts(ctx, params, name))
         if attempts is not None:
             rows = attempts.rows
             trends = breakdown.held_per_bin(rows, range_bins(ctx, name, rows), int(ctx.now),
                                             lambda row, d=dim: hd._key(row, d))
     table = Table(BREAKDOWN_COLUMNS, ctx.width - 2)
-    lines = []
     if kinds is None:
-        lines.append(text_line("history: %s %s" % ("computing…" if busy(types_entry)
-                                                   else missing(types_entry),
-                                                   types_entry.message), DIM))
+        lines = [text_line("history: %s %s" % ("computing…" if busy(types_entry)
+                                               else missing(types_entry),
+                                               types_entry.message), DIM)]
     else:
-        kinds = [k for k in kinds if k.gpu_hours]
-        total = sum(k.gpu_hours or 0 for k in kinds)
-        if kinds:
-            # the whole bar is the scope's GPU-hours: it opens their chart
-            lines.append(Line(stacked_bar(ctx, [k.gpu_hours or 0 for k in kinds],
-                                          max(10, ctx.width - 6)), range_target(name, params),
-                              {"GPU-h": float("inf"), "name": ""}, key="(all)", pinned=True))
-        else:
-            lines.append(text_line("no GPU-hours in this range", FAINT))
-        for index, kind in enumerate(kinds):
-            share = (kind.gpu_hours or 0) / total if total else None
-            glyph, style = slice_style(index, ctx)
-            prev = before.get(kind.key, 0.0) if before is not None else None
-            spark = trends.get(kind.key)
-            # a swatch of its slice of the bar, so the bar reads without color too
-            cells = [[(glyph, style), (" " + kind.label, style if ctx.color else PLAIN)],
-                     ("" if kind.complete else "≥") + fmt.hours(kind.gpu_hours),
-                     (lambda size, f=share: share_cell(f, ctx, max(3, size - 7))),
-                     delta_cell(kind.gpu_hours, prev, before is not None)
-                     if name != "all" else [(fmt.NOT_APPLICABLE, FAINT)],
-                     (lambda size, data=spark: charts.spark(data, min(size, SPARK_MOST),
-                                                            ctx.ascii, ctx.color))]
-            lines.append(table.row(cells, runtype_target(params, dim, kind.key, kind.label),
-                                   {"GPU-h": kind.gpu_hours, "name": kind.label}, key=kind.key))
+        lines = kept_lines(ctx, ("runs", view.kind, name, filt_key(params), dim),
+                           (kinds, before, source),
+                           lambda: breakdown_lines(ctx, table, kinds, before, trends, name,
+                                                   params, dim))
     status = [[("g", KEY), (" GPUs / job name / outcome", DIM)]]  # type: List[Any]
     if stale(types_entry):
         status.insert(0, "stale: %s %s" % (fmt.placeholder(types_entry.status),
@@ -2063,6 +2104,38 @@ def gpu_breakdown_pane(ctx: Context, view: View, params: Dict[str, Any]) -> Pane
     return Pane("runs", "Where %s GPU-hours went · by %s · %s" % (who, DIM_WORDS[dim], name),
                 lines, table.header(), sorts=("GPU-h", "name"), natural="GPU-h",
                 status=status, grow=False, max_lines=rows_shown, min_lines=min(4, rows_shown))
+
+
+def breakdown_lines(ctx: Context, table: Table, kinds: Sequence[Any], before: Any,
+                    trends: Dict[Optional[str], List[float]], name: str,
+                    params: Dict[str, Any], dim: str) -> List[Line]:
+    """The stacked bar and a row per kind of run (see gpu_breakdown_pane)."""
+    lines = []  # type: List[Line]
+    kinds = [k for k in kinds if k.gpu_hours]
+    total = sum(k.gpu_hours or 0 for k in kinds)
+    if kinds:
+        # the whole bar is the scope's GPU-hours: it opens their chart
+        lines.append(Line(stacked_bar(ctx, [k.gpu_hours or 0 for k in kinds],
+                                      max(10, ctx.width - 6)), range_target(name, params),
+                          {"GPU-h": float("inf"), "name": ""}, key="(all)", pinned=True))
+    else:
+        lines.append(text_line("no GPU-hours in this range", FAINT))
+    for index, kind in enumerate(kinds):
+        share = (kind.gpu_hours or 0) / total if total else None
+        glyph, style = slice_style(index, ctx)
+        prev = before.get(kind.key, 0.0) if before is not None else None
+        spark = trends.get(kind.key)
+        # a swatch of its slice of the bar, so the bar reads without color too
+        cells = [[(glyph, style), (" " + kind.label, style if ctx.color else PLAIN)],
+                 ("" if kind.complete else "≥") + fmt.hours(kind.gpu_hours),
+                 (lambda size, f=share: share_cell(f, ctx, max(3, size - 7))),
+                 delta_cell(kind.gpu_hours, prev, before is not None)
+                 if name != "all" else [(fmt.NOT_APPLICABLE, FAINT)],
+                 (lambda size, data=spark: charts.spark(data, min(size, SPARK_MOST),
+                                                        ctx.ascii, ctx.color))]
+        lines.append(table.row(cells, runtype_target(params, dim, kind.key, kind.label),
+                               {"GPU-h": kind.gpu_hours, "name": kind.label}, key=kind.key))
+    return lines
 
 
 ROLE_BREAKDOWN_COLUMNS = (Column("role", 9, "<", 9),) + BREAKDOWN_COLUMNS
@@ -2161,30 +2234,29 @@ def runtype(ctx: Context, view: View) -> List[Pane]:
     filt = make_filter(params)
     data = ctx.data
     kinds_entry = ctx.hist(("runtypes", name, filt_key(params), dim),
-                           lambda r=name, f=filt, d=dim: data.run_types(r, f, d))
+                           lambda r=name, f=filt, d=dim: data.run_types(r, f, d, medians=False))
     kinds = value(kinds_entry)
     kind = next((k for k in kinds or () if k.key == key), None)
     local = kind.rows if kind is not None else None
-
-    def load(r: str = name, f: Any = filt, d: str = dim, k: str = key, ready: Any = local
-             ) -> Any:
-        if ready is not None:
-            return ready  # computed from the attempts list (no history run types)
-        win = hd.window(r, data.clock())
-        page = data.history.jobs(win, f, by="attempt", run_type=(d, k), sort="start",
-                                 descending=True, limit=hd.ATTEMPT_LIMIT,
-                                 cancel=getattr(data, "_cancel", None))
-        return page.rows
-    rows_entry = ctx.hist(("runtype-rows", name, filt_key(params), dim, key), load)
-    rows = value(rows_entry)
     by_people = bool(params.get("account")) and not params.get("user")
-    info = breakdown.detail(rows, "user" if by_people else "family") if rows is not None \
-        else None
+
+    def load(r: str = name, f: Any = filt, d: str = dim, k: str = key, ready: Any = local,
+             people: bool = by_people) -> KindView:
+        rows = ready  # computed from the attempts list (no history run types)
+        if rows is None:
+            win = hd.window(r, data.clock())
+            more = data.uncounted() if hasattr(data, "uncounted") else {}
+            rows = data.history.jobs(win, f, by="attempt", run_type=(d, k), sort="start",
+                                     descending=True, limit=hd.ATTEMPT_LIMIT,
+                                     cancel=getattr(data, "_cancel", None), **more).rows
+        return kind_view(rows, r, people, int(data.clock()))
+    rows_entry = ctx.hist(("runtype-view", name, filt_key(params), dim, key, by_people), load)
+    found = value(rows_entry)
+    rows = found  # None while loading
+    info = found.info if found is not None else None
     chart = None
-    if rows is not None:
-        edges = range_bins(ctx, name, rows)
-        held = breakdown.held_per_bin(rows, edges, int(ctx.now)).get(None) \
-            or [0.0] * (len(edges) - 1)
+    if found is not None:
+        edges, held = found.edges, found.held
         if any(held):
             values = [h / float(edges[i + 1] - edges[i]) if edges[i + 1] > edges[i] else 0.0
                       for i, h in enumerate(held)]
@@ -2262,8 +2334,8 @@ def runtype(ctx: Context, view: View) -> List[Pane]:
     status = [[("j", KEY), (" its jobs", DIM)]]  # type: List[Any]
     if rows is None and busy(rows_entry):
         status.insert(0, [("computing…", DIM)])
-    elif rows is not None and len(rows) >= hd.ATTEMPT_LIMIT:
-        status.insert(0, [("newest %s attempts" % fmt.num(len(rows)), WARN)])
+    elif found is not None and found.count >= hd.ATTEMPT_LIMIT:
+        status.insert(0, [("newest %s attempts" % fmt.num(found.count), WARN)])
     chart_pane = Pane("chart", "GPUs in use · %s · %s" % (who, kind_words(dim, label)),
                       [text_line(name)], grow=False, draw=draw, fixed=body, focusable=False,
                       status=status, min_lines=body, max_lines=body)
@@ -2286,33 +2358,42 @@ def runtype_breakdown(ctx: Context, params: Dict[str, Any], dim: str, key: str, 
                Column("share", 12, ">", 8, flex=True, most=30), Column("att", 5, ">", 5),
                Column("fail", 5, ">", 6))
     table = Table(columns, ctx.width - 2)
-    lines = []
     if info is None:
-        lines.append(text_line("history: %s" % ("computing…" if busy(entry)
-                                                else missing(entry)), DIM))
+        lines = [text_line("history: %s" % ("computing…" if busy(entry) else missing(entry)),
+                           DIM)]
     else:
-        total = info.gpu_seconds
-        for group in info.groups:
-            share = group.gpu_seconds / total if total else None
-            if by_people:  # this person's runs of the same kind
-                target = runtype_target(dict(params, user=group.key), dim, key, label)
-                name = (group.key, USER)
-            else:
-                target = runtype_target(params, "name_family", group.key, group.key)
-                name = (group.key, PLAIN)
-            fail = group.failure
-            lines.append(table.row(
-                [name, fmt.hours(group.gpu_seconds / 3600.0),
-                 (lambda size, f=share: share_cell(f, ctx, max(3, size - 7))),
-                 fmt.num(group.attempts),
-                 (fmt.pct(fail), BAD if fail >= 0.25 else PLAIN) if fail is not None
-                 else (fmt.NOT_APPLICABLE, FAINT)], target,
-                {"GPU-h": group.gpu_seconds, "name": group.key, "attempts": group.attempts},
-                key=group.key))
-        if not lines:
-            lines.append(text_line("no attempts in this range", FAINT))
+        lines = kept_lines(ctx, ("parts", filt_key(params), dim, key, by_people), (info,),
+                           lambda: parts_lines(ctx, table, params, dim, key, label, info,
+                                               by_people))
     return Pane("parts", "People" if by_people else "Job names", lines, table.header(),
                 sorts=("GPU-h", "attempts", "name"), natural="GPU-h")
+
+
+def parts_lines(ctx: Context, table: Table, params: Dict[str, Any], dim: str, key: str,
+                label: str, info: Any, by_people: bool) -> List[Line]:
+    """runtype_breakdown's rows: the job-name families (or people) of one kind of run."""
+    lines = []  # type: List[Line]
+    total = info.gpu_seconds
+    for group in info.groups:
+        share = group.gpu_seconds / total if total else None
+        if by_people:  # this person's runs of the same kind
+            target = runtype_target(dict(params, user=group.key), dim, key, label)
+            name = (group.key, USER)
+        else:
+            target = runtype_target(params, "name_family", group.key, group.key)
+            name = (group.key, PLAIN)
+        fail = group.failure
+        lines.append(table.row(
+            [name, fmt.hours(group.gpu_seconds / 3600.0),
+             (lambda size, f=share: share_cell(f, ctx, max(3, size - 7))),
+             fmt.num(group.attempts),
+             (fmt.pct(fail), BAD if fail >= 0.25 else PLAIN) if fail is not None
+             else (fmt.NOT_APPLICABLE, FAINT)], target,
+            {"GPU-h": group.gpu_seconds, "name": group.key, "attempts": group.attempts},
+            key=group.key))
+    if not lines:
+        lines.append(text_line("no attempts in this range", FAINT))
+    return lines
 
 
 def column_chart(values: Sequence[float], size: int, rows: int, ascii_only: bool,
@@ -2429,23 +2510,12 @@ def jobs_pane(ctx: Context, pane_id: str, title: str, rows: Optional[Sequence[An
     columns = [c._replace(name=hours, width=max(c.width, len(hours))) if c.name == "GPU-h"
                else c for c in JOB_COLUMNS]
     table = Table(columns, ctx.width - 2)
-    lines = []
     if rows is None:
         return Pane(pane_id, title, [text_line("history: %s %s" % (
             missing(entry), entry.message if entry else ""), DIM)])
-    for row in rows:
-        cells = [row.display_id, row.name, (row.user, USER),
-                 (row.outcome, OUTCOME_STYLE.get(row.outcome, PLAIN)),
-                 (fmt.when(row.start, ctx.now), DIM), fmt.duration(row.elapsed),
-                 fmt.num(row.gpus) if row.gpus is not None else fmt.NA,
-                 fmt.hours(row.gpu_seconds / 3600.0) if row.gpu_seconds is not None else fmt.NA,
-                 (fmt.duration(row.wait), DIM),
-                 (str(row.attempts), PLAIN if row.attempts > 1 else FAINT)]
-        lines.append(table.row(cells, Target("job", {"job_id": row.job_id, "row": row},
-                                             "job " + row.display_id),
-                               {"GPU-h": row.gpu_seconds, "start": row.start,
-                                "elapsed": row.elapsed, "wait": row.wait, "GPUs": row.gpus},
-                               key=row.key))
+    # laid out once per answer; the ages ("3 h ago") again every half minute
+    lines = kept_lines(ctx, ("jobs", pane_id, title, hours, int(ctx.now // 30)), (rows,),
+                       lambda: job_lines(ctx, table, rows))
     more = total is not None and total > len(rows)
     count = ("%s of %s" % (fmt.num(len(rows)), fmt.num(total)) if more
              else fmt.num(len(rows)))
@@ -2460,15 +2530,35 @@ def jobs_pane(ctx: Context, pane_id: str, title: str, rows: Optional[Sequence[An
                 sorts=("GPU-h", "start", "elapsed", "wait", "GPUs"), more=more, status=status)
 
 
+def job_lines(ctx: Context, table: Table, rows: Sequence[Any]) -> List[Line]:
+    lines = []  # type: List[Line]
+    for row in rows:
+        cells = [row.display_id, row.name, (row.user, USER),
+                 (row.outcome, OUTCOME_STYLE.get(row.outcome, PLAIN)),
+                 (fmt.when(row.start, ctx.now), DIM), fmt.duration(row.elapsed),
+                 fmt.num(row.gpus) if row.gpus is not None else fmt.NA,
+                 fmt.hours(row.gpu_seconds / 3600.0) if row.gpu_seconds is not None else fmt.NA,
+                 (fmt.duration(row.wait), DIM),
+                 (str(row.attempts), PLAIN if row.attempts > 1 else FAINT)]
+        lines.append(table.row(cells, Target("job", {"job_id": row.job_id, "row": row},
+                                             "job " + row.display_id),
+                               {"GPU-h": row.gpu_seconds, "start": row.start,
+                                "elapsed": row.elapsed, "wait": row.wait, "GPUs": row.gpus},
+                               key=row.key))
+    return lines
+
+
 def paged_jobs(ctx: Context, view: View, title: str, key: Tuple[Any, ...], filt: Any,
-               win: Any = None, run_type: Any = None, pane_id: str = "jobs") -> Pane:
+               win: Any = None, run_type: Any = None, pane_id: str = "jobs",
+               later: bool = False) -> Pane:
     """The first JOB_PAGE jobs, more as the cursor reaches the end (app.py raises
     view.extra["jobs_limit"]); the pane's / filter is also sent to history as a search."""
     state = view.panes.get(pane_id)
     match = (state.filter if state is not None else "").strip()
     limit = view.extra.get("jobs_limit", hd.JOB_PAGE)
     entry = ctx.hist(key, lambda r=ctx.range, f=filt, l=limit, m=match: ctx.data.jobs(
-        r, f, limit=l, win=win, run_type=run_type, match=m), version=(limit, match))
+        r, f, limit=l, win=win, run_type=run_type, match=m), version=(limit, match),
+        later=later)
     page = value(entry)
     total = getattr(page, "total", None) if page is not None else None
     return jobs_pane(ctx, pane_id, title, page.rows if page is not None else None, entry,

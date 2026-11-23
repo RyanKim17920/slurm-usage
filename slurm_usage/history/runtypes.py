@@ -1,52 +1,28 @@
 """Run types: usage split by what kind of run it was, for one person or any filter."""
 
-import re
-from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 from .aggregate import LAZY_FIELDS, LazyStats, _fast_pass, _fast_span, _Pass, usage_ratios
 from .errors import Cancelled, canceller
+from .families import name_family
 from .records import outcome_of
 from .select import Filter, Part, Selection, resolve, unresolved
 from .stats import Stats
+from .store import FAMILY_VERSION
 from .timeline import Window, hour_edges
 
-# kinds the exact aggregates can tell apart: by GPUs per allocation, or by role
-_FAST = ("gpu_count", "account", "qos", "partition", "outcome")
+# kinds the exact aggregates can tell apart: by GPUs per allocation, role or job-name family
+_FAST = ("gpu_count", "account", "qos", "partition", "outcome", "name_family")
 
 TYPE_ROLES = ("gpu_count", "name_family", "account", "qos", "partition", "outcome",
               "node_count")
 FAILURES = ("failed", "node_fail", "timeout")
 
-_UUID = re.compile(r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?"
-                   r"[0-9a-fA-F]{12}")
-_DATE = re.compile(r"(?<![0-9])(?:19|20)[0-9]{2}[-_.]?[01][0-9][-_.]?[0-3][0-9]"
-                   r"(?:[T_-]?[0-2][0-9][:_-]?[0-5][0-9](?:[:_-]?[0-5][0-9])?)?(?![0-9])")
-_HEX = re.compile(r"(?<![0-9A-Za-z])(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{6,}"
-                  r"(?![0-9A-Za-z])")
-_NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)?")
-_REPEAT = re.compile(r"(<n>)(?:[-_.x,]?<n>)+")
 
-
-@lru_cache(maxsize=65536)
-def name_family(name: str) -> str:
-    """"train_lr3e-4_seed2_20260101" -> "train_lr<n>e-<n>_seed<n>_<date>".
-
-    Dates, UUIDs, hex hashes and numbers (array indices, seeds, steps) become
-    placeholders, so reruns of one script group together.
-    """
-    text = name.strip()
-    if not text:
-        return "(no name)"
-    text = _UUID.sub("<id>", text)
-    text = _DATE.sub("<date>", text)
-    text = _HEX.sub("<hex>", text)
-    text = _NUMBER.sub("<n>", text)
-    return _REPEAT.sub("<n>", text)
-
-
+@lru_cache(maxsize=16384)
 def _node_count(nodes: str) -> int:
+    """Nodes in a host list (the same few lists come up again and again)."""
     from ..parse import expand_hostlist
     return len(expand_hostlist(nodes)) if nodes else 0
 
@@ -64,16 +40,80 @@ def type_of(by: str, part: Part, name: str, nodes: str) -> str:
     return getattr(part.roles, by)
 
 
-@dataclass
 class RunType:
-    key: str
-    by: str
-    stats: Stats  # attempts, jobs, GPU/CPU seconds, waits, time-limit use, efficiency
-    share: Optional[float]  # of the selection's total by the chosen metric
-    outcomes: Dict[str, int] = field(default_factory=dict)  # attempts per outcome
-    median_runtime: Optional[int] = None  # whole attempts, less suspension
-    median_wait: Optional[int] = None
-    example: str = ""  # one real name of this family
+    """One kind of run. The medians and the example name may be worked out on first
+    use (one query for every kind of the same answer): screens never read them."""
+
+    __slots__ = ("key", "by", "stats", "share", "outcomes", "_median_runtime",
+                 "_median_wait", "_example", "_later", "_set")
+
+    def __init__(self, key: str, by: str, stats: Stats, share: Optional[float],
+                 outcomes: Optional[Dict[str, int]] = None,
+                 median_runtime: Optional[int] = None, median_wait: Optional[int] = None,
+                 example: str = "", later: Any = None) -> None:
+        self.key, self.by, self.stats, self.share = key, by, stats, share
+        self.outcomes = {} if outcomes is None else outcomes  # attempts per outcome
+        self._median_runtime = median_runtime  # whole attempts, less suspension
+        self._median_wait = median_wait
+        self._example = example  # one real name of this family
+        self._later = later  # () -> None: fills the three in for every kind at once
+        self._set = ()  # type: Tuple[str, ...]  # assigned, so kept when they are filled in
+
+    def _settle(self) -> None:
+        later = self._later
+        if later is not None:
+            later()
+
+    @property
+    def median_runtime(self) -> Optional[int]:
+        self._settle()
+        return self._median_runtime
+
+    @median_runtime.setter
+    def median_runtime(self, value: Optional[int]) -> None:
+        self._set += ("median_runtime",)
+        self._median_runtime = value
+
+    @property
+    def median_wait(self) -> Optional[int]:
+        self._settle()
+        return self._median_wait
+
+    @median_wait.setter
+    def median_wait(self, value: Optional[int]) -> None:
+        self._set += ("median_wait",)
+        self._median_wait = value
+
+    @property
+    def example(self) -> str:
+        self._settle()
+        return self._example
+
+    @example.setter
+    def example(self, value: str) -> None:
+        self._set += ("example",)
+        self._example = value
+
+    def __getstate__(self) -> Any:
+        self._settle()
+        return {name: getattr(self, name) for name in self.__slots__
+                if name not in ("_later", "_set")}
+
+    def __setstate__(self, state: Any) -> None:
+        for name, value in state.items():
+            setattr(self, name, value)
+        self._later, self._set = None, ()
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, RunType):
+            return NotImplemented
+        return all(getattr(self, name) == getattr(other, name) for name in (
+            "key", "by", "stats", "share", "outcomes", "median_runtime", "median_wait",
+            "example"))
+
+    def __repr__(self) -> str:
+        return "RunType(key=%r, by=%r, share=%r, outcomes=%r)" % (
+            self.key, self.by, self.share, self.outcomes)
 
     @property
     def failure_rate(self) -> Optional[float]:
@@ -91,7 +131,10 @@ def _median(values: List[int]) -> Optional[int]:
     return values[(len(values) - 1) // 2]
 
 
-def _key(by: str, roles: Any, outcome: str, gpus: Optional[int]) -> str:
+def _key(by: str, roles: Any, outcome: str, gpus: Any) -> str:
+    """``gpus``: GPUs per allocation, or by name_family the family."""
+    if by == "name_family":
+        return gpus
     if by == "gpu_count":
         return "unknown" if gpus is None else str(gpus)
     if by == "outcome":
@@ -104,6 +147,10 @@ def _fast_types(store: Any, as_of: int, window: Window, where: Filter, by: str, 
                 ) -> Optional[List[RunType]]:
     """run_types() from the exact aggregates, or None where they cannot answer."""
     if by not in _FAST or where.node is not None or not getattr(store, "has_agg", False):
+        return None
+    family = by == "name_family"
+    if family and (not getattr(store, "has_families", False)
+                   or store.get_meta("agg_fam") != FAMILY_VERSION):
         return None
     with store.lock:
         chosen = Selection(store.dims(), {}, where)
@@ -127,7 +174,8 @@ def _fast_types(store: Any, as_of: int, window: Window, where: Filter, by: str, 
 
         state = _Pass([("outcome",)], gpu_tracked, edges, None, "gpu", None, 1)
         _fast_pass(store, chosen, span, state, hours, store.repeated_jobs(), True, cancelled,
-                   None, targets_of, skip_problem=True)
+                   None, targets_of, skip_problem=True,
+                   **({"by_family": True} if family else {}))
         dims, outcomes_wanted = chosen.dims, where.outcome
         finished = None  # type: Any
         if chosen.dim_ids is not None or outcomes_wanted is not None:
@@ -143,12 +191,12 @@ def _fast_types(store: Any, as_of: int, window: Window, where: Filter, by: str, 
         skip = [r[0] for r in store.open_rows()
                 if r[2] in dims and unresolved(dims[r[2]].state, None, r[8])]
         # an unfinished row's outcome is not its dim's finished one
-        kinds = None if by == "gpu_count" else {
+        kinds = None if by in ("gpu_count", "name_family") else {
             d: (_key(by, roles, outcome_of(roles.state, True), None),
                 _key(by, roles, outcome_of(roles.state, False), None))
             for d, roles in dims.items()}
-        runtimes, waits, first_names = store.type_medians(
-            span.low, span.high, span.start, span.end, as_of, finished, live, skip, kinds)
+        medians_of = (span.low, span.high, span.start, span.end, as_of, finished, live, skip,
+                      kinds) + ((name_family,) if family else ())
         lookup = (lambda key: -1 if key == "unknown" else int(key)) if by == "gpu_count" \
             else (lambda key: key)
     total = 0
@@ -163,10 +211,25 @@ def _fast_types(store: Any, as_of: int, window: Window, where: Filter, by: str, 
             continue
         amount = stats.amount(metric)
         out.append(RunType(key, by, stats, amount / total if total and amount is not None
-                           else None, {o: s.attempts for o, s in outcomes.items() if s.attempts},
-                           runtimes.get(lookup(key)), waits.get(lookup(key)),
-                           first_names.get(lookup(key), "")))
+                           else None, {o: s.attempts for o, s in outcomes.items() if s.attempts}))
 
+    def medians() -> None:
+        """Run times, waits and the first name of each kind: a read of every row, so
+        only when one of them is asked for."""
+        for item, _ in keyed:
+            item._later = None
+        runtimes, waits, first_names = store.type_medians(*medians_of)
+        for item, original in keyed:  # the key as made here (a wrapper may rename it)
+            key = lookup(original)
+            for name, value in (("median_runtime", runtimes.get(key)),
+                                ("median_wait", waits.get(key)),
+                                ("example", first_names.get(key, ""))):
+                if name not in item._set:
+                    setattr(item, "_" + name, value)
+
+    keyed = [(item, item.key) for item in out]
+    for item in out:
+        item._later = medians
     members = [item.stats for item in out]
 
     def resolve_lazy() -> None:

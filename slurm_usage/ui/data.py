@@ -270,8 +270,9 @@ def run_types(rows: Sequence[Any], dimension: str) -> List[RunType]:
     return sort_types(out, dimension)
 
 
-def from_history_type(item: Any, dimension: str) -> RunType:
-    """history.RunType -> RunType."""
+def from_history_type(item: Any, dimension: str, medians: bool = True) -> RunType:
+    """history.RunType -> RunType. ``medians``: read the median run time and wait (a pass
+    over every row the first time; no screen shows them)."""
     stats = item.stats
     gpu_eff = _efficiency(stats, "gpu") or (None, None)
     cpu_eff = _efficiency(stats, "cpu") or (None, None)
@@ -280,7 +281,8 @@ def from_history_type(item: Any, dimension: str) -> RunType:
     except (AttributeError, ValueError):
         complete = True
     return RunType(dimension, type_label(dimension, item.key), stats.attempts, stats.jobs,
-                   stats.gpu_hours, item.share, item.median_runtime, item.median_wait,
+                   stats.gpu_hours, item.share, item.median_runtime if medians else None,
+                   item.median_wait if medians else None,
                    stats.time_limit_used, gpu_eff[0], gpu_eff[1], cpu_eff[0], cpu_eff[1],
                    item.failure_rate, None, item.key, complete)
 
@@ -1107,12 +1109,15 @@ class HistoryData:
             window(range_name, self.clock()), filt, kinds=kinds, cancel=self._cancel,
             make_bins=lambda start, end: bin_edges(start, end, bin_unit(range_name, start, end)))
 
-    def run_types(self, range_name: str, filt: Any, dimension: str) -> List[RunType]:
-        """By the history layer when it can; else from the attempts list."""
+    def run_types(self, range_name: str, filt: Any, dimension: str,
+                  medians: bool = True) -> List[RunType]:
+        """By the history layer when it can; else from the attempts list. ``medians``
+        False leaves the median run time and wait out (None) where they cost a pass."""
         win = window(range_name, self.clock())
         if self.has("run_types"):
             found = self.history.run_types(win, filt, by=dimension, cancel=self._cancel)
-            return sort_types([from_history_type(item, dimension) for item in found], dimension)
+            return sort_types([from_history_type(item, dimension, medians) for item in found],
+                              dimension)
         page = self.attempts(range_name, filt)
         return run_types(page.rows, dimension)
 
@@ -1134,10 +1139,27 @@ class HistoryData:
     def capacity(self) -> List[Any]:
         return self.history.capacity() if self.has("capacity") else []
 
+    def uncounted(self) -> Dict[str, Any]:
+        """history.jobs() keywords that skip counting every match (page.total), when this
+        history takes them: the newest attempts are then read no further than the page."""
+        found = self.__dict__.get("_uncounted")
+        if found is None:
+            try:
+                import inspect
+                params = inspect.signature(self.history.jobs).parameters
+                takes = "count" in params or any(p.kind == p.VAR_KEYWORD
+                                                 for p in params.values())
+            except (TypeError, ValueError):
+                takes = False
+            found = self.__dict__["_uncounted"] = {"count": False} if takes else {}
+        return found
+
     def attempts(self, range_name: str, filt: Any = None, limit: int = ATTEMPT_LIMIT,
                  win: Any = None, sort: str = "start") -> Any:
+        """The newest attempts (page.total may be None: not counted)."""
         return self.history.jobs(win or window(range_name, self.clock()), filt, by="attempt",
-                                 sort=sort, descending=True, limit=limit, cancel=self._cancel)
+                                 sort=sort, descending=True, limit=limit, cancel=self._cancel,
+                                 **self.uncounted())
 
     def jobs(self, range_name: str, filt: Any = None, sort: str = "gpu", limit: int = 0,
              win: Any = None, run_type: Optional[Tuple[str, str]] = None,

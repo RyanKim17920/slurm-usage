@@ -16,8 +16,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .aggregate import start_counts, usage_ratios
 from .errors import Cancelled, Progress, ProgressFn, canceller
+from .families import name_family
 from .select import Filter, Selection, Span, effective
-from .store import AGG_VERSION, OPEN_STOP
+from .store import AGG_VERSION, FAMILY_VERSION, OPEN_STOP
 from .timeline import DAY, HOUR
 
 CHUNK = 7 * DAY
@@ -151,10 +152,14 @@ def build(store: Any, as_of: int, progress: ProgressFn = None, cancel: Any = Non
     with store.lock:
         last = store.get_meta("rollup_until")
         dirty = store.get_meta("dirty")
-        if agg and store.get_meta("agg") != AGG_VERSION:
+        families = agg and getattr(store, "has_families", False)
+        if agg and (store.get_meta("agg") != AGG_VERSION or
+                    families and store.get_meta("agg_fam") != FAMILY_VERSION):
             last = None  # a cache from before these aggregates: build everything once
             store.agg_reset()
             store.set_meta("agg", AGG_VERSION)
+            if families:
+                store.set_meta("agg_fam", FAMILY_VERSION)
         if last is None:
             first = store.first_start()
             dirty = None if first is None else [first, settled]
@@ -192,8 +197,9 @@ def _chunk(store: Any, chosen: Selection, low: int, high: int, as_of: int,
     sums = {}  # type: Dict[Tuple[int, int], list]
     exact = {}  # type: Dict[Tuple[int, int], list]  # finished allocations only
     starts = {}  # type: Dict[Tuple[int, int], list]
+    families = getattr(store, "has_families", False)  # the aggregates by job-name family
     rows = store.scan(low, high, usage=True, ordered=False,
-                      by_start=store.cheaper_by_start(low, high))
+                      by_start=store.cheaper_by_start(low, high), extra=families)
     try:
         for part in chosen.parts(rows, span):
             if part.problem or part.stop <= part.start and not part.starts_here:
@@ -208,12 +214,13 @@ def _chunk(store: Any, chosen: Selection, low: int, high: int, as_of: int,
             held = min(suspended, duration)
             hour, p = floor_hour(part.start), part.start
             size = -1 if row[10] is None else row[10]  # GPUs per allocation, -1 unknown
+            family = name_family(row[18] or "") if families else None
             if part.starts_here:
                 key = (floor_hour(begun), dim)
                 sums.setdefault(key, [0] * 10)[3] += 1
                 if finished:
                     counts = start_counts(row, part.outcome, ratios)
-                    key = key + (size,)
+                    key = key + (size, family)
                     found = starts.get(key)
                     if found is None:
                         starts[key] = list(counts)
@@ -230,10 +237,10 @@ def _chunk(store: Any, chosen: Selection, low: int, high: int, as_of: int,
                                                                              held)
                            if held else q - p)
                 if finished:
-                    e = exact.get((hour, dim, size))
+                    e = exact.get((hour, dim, size, family))
                     if e is None:
-                        e = exact[(hour, dim, size)] = ([0, 0, 0, 0, 0, 0.0, 0, 0.0, 0, 0.0]
-                                                        + [None] * 8)
+                        e = exact[(hour, dim, size, family)] = (
+                            [0, 0, 0, 0, 0, 0.0, 0, 0.0, 0, 0.0] + [None] * 8)
                     for at, held_now in ((10, True), (12, gpus), (14, cpus), (16, mem)):
                         if held_now:
                             if e[at] is None or p < e[at]:
@@ -275,8 +282,50 @@ def _chunk(store: Any, chosen: Selection, low: int, high: int, as_of: int,
     out = [(hour, dim) + tuple(values) for (hour, dim), values in sums.items()]
     if not agg:
         return out, None
-    return out, ([key + tuple(values) for key, values in exact.items()],
-                 [key + tuple(values) for key, values in starts.items()])
+    # kept by (hour, dim, GPUs per allocation) and, apart, by (hour, dim, family)
+    hours, by_family = {}, {}  # type: Dict[tuple, list], Dict[tuple, list]
+    for (hour, dim, size, family), values in exact.items():
+        found = hours.get((hour, dim, size))
+        if found is None:
+            hours[(hour, dim, size)] = list(values)
+        else:
+            for at in range(10):
+                found[at] += values[at]
+            for at in range(10, 18, 2):  # first and last use
+                if values[at] is not None and (found[at] is None or values[at] < found[at]):
+                    found[at] = values[at]
+                if values[at + 1] is not None and (found[at + 1] is None
+                                                   or values[at + 1] > found[at + 1]):
+                    found[at + 1] = values[at + 1]
+        if families:
+            found = by_family.get((hour, dim, family))
+            if found is None:
+                by_family[(hour, dim, family)] = values[:10]
+            else:
+                for at in range(10):
+                    found[at] += values[at]
+    begun, begun_family = {}, {}  # type: Dict[tuple, list], Dict[tuple, list]
+    for (hour, dim, size, family), counts in starts.items():
+        for into, key in ((begun, (hour, dim, size)), (begun_family, (hour, dim, family))):
+            if into is begun_family and not families:
+                continue
+            found = into.get(key)
+            if found is None:
+                into[key] = list(counts)
+                continue
+            for at, value in enumerate(counts):
+                if at == 7:
+                    if value is not None and (found[7] is None or value > found[7]):
+                        found[7] = value
+                else:
+                    found[at] += value
+    ids = store.family_ids({key[2] for key in by_family} | {key[2] for key in begun_family}) \
+        if families else {}
+    return out, ([key + tuple(values) for key, values in hours.items()],
+                 [key + tuple(values) for key, values in begun.items()],
+                 [key[:2] + (ids[key[2]],) + tuple(values) for key, values in by_family.items()],
+                 [key[:2] + (ids[key[2]],) + tuple(values)
+                  for key, values in begun_family.items()])
 
 
 def _sum(store: Any, low: int, high: int, dims: Dict[int, Any]

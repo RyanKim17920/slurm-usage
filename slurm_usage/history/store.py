@@ -8,6 +8,7 @@ Every public method is safe to call from any thread.
 """
 
 import hashlib
+from bisect import bisect_left
 import json
 import os
 import stat
@@ -24,6 +25,9 @@ except ImportError:  # some Python builds have no sqlite3
 
 SCHEMA = 4  # 4: 64 KiB pages
 OPEN_STOP = 2 ** 40  # "stop" of a row with no end; later than any real time
+
+ANY = object()  # scan(gpus=ANY): any number of GPUs
+NEWEST = "newest"  # scan(ordered=NEWEST): newest first
 
 # jobs.flag, only meaningful while a row has no end
 FLAG_NONE, FLAG_RUNAWAY, FLAG_STALE, FLAG_CONFIRMED = 0, 1, 2, 3
@@ -91,11 +95,32 @@ CREATE TABLE IF NOT EXISTS agg_start(
   gpu_known INTEGER, susp INTEGER, wait_count INTEGER, wait_total INTEGER, wait_max INTEGER,
   limit_count INTEGER, limit_used INTEGER, limit_requested INTEGER, over100 INTEGER,
   unchecked INTEGER, PRIMARY KEY(hour, dim, gpus)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS agg_hour_dim ON agg_hour(dim, hour);
+CREATE INDEX IF NOT EXISTS agg_start_dim ON agg_start(dim, hour);
+CREATE TABLE IF NOT EXISTS agg_fhour(
+  hour INTEGER, dim INTEGER, fam INTEGER, gpu INTEGER, cpu INTEGER, mem_mib INTEGER,
+  mem_rest INTEGER, secs INTEGER, cpu_cov INTEGER, cpu_used REAL, mcov_mib INTEGER,
+  mcov_rest INTEGER, mem_used REAL, gpu_cov INTEGER, gpu_used REAL,
+  PRIMARY KEY(hour, dim, fam)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS agg_fstart(
+  hour INTEGER, dim INTEGER, fam INTEGER, attempts INTEGER, cpu_known INTEGER, mem_known INTEGER,
+  gpu_known INTEGER, susp INTEGER, wait_count INTEGER, wait_total INTEGER, wait_max INTEGER,
+  limit_count INTEGER, limit_used INTEGER, limit_requested INTEGER, over100 INTEGER,
+  unchecked INTEGER, PRIMARY KEY(hour, dim, fam)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS agg_fhour_dim ON agg_fhour(dim, hour);
+CREATE INDEX IF NOT EXISTS agg_fstart_dim ON agg_fstart(dim, hour);
+CREATE TABLE IF NOT EXISTS fams(id INTEGER PRIMARY KEY, v TEXT UNIQUE NOT NULL);
+CREATE TABLE IF NOT EXISTS famnames(name TEXT PRIMARY KEY, fam INTEGER NOT NULL) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS famnames_fam ON famnames(fam);
+CREATE INDEX IF NOT EXISTS jobs_name ON jobs(name);
 """
 # Rows longer than this are found through the partial index jobs_long; all others overlap
 # a moment only if they started at most this long before it.
 LONG = 172800
 AGG_VERSION = 3  # of the exact aggregates (agg_hour, agg_start): a change rebuilds them
+# the same by job-name family (agg_fhour, agg_fstart; fam is fams.id, and famnames maps
+# each stored name to its family's id): a change of these rebuilds them all too
+FAMILY_VERSION = 1
 _COLUMNS = ("j.k,j.job,j.dim,j.nodes,j.submit,j.eligible,j.start,"
             "NULLIF(j.stop,%d),j.susp,j.cpus,j.gpus,j.mem,j.lim,j.flag" % OPEN_STOP)
 _MAX_SQL_IDS = 5000
@@ -118,6 +143,8 @@ class _Base:
         self._dim_ids = {}  # type: Dict[Roles, int]
         self._set_ids = {}  # type: Dict[str, int]
         self._repeated = (-1, set())  # type: Tuple[int, Set[int]]
+        self._fam_text = None  # type: Optional[Dict[int, str]]
+        self._names_at = None  # type: Optional[int]  # version famnames was completed at
 
     def repeated_jobs(self) -> Set[int]:
         """Job ids with more than one row: the only ones a distinct count must remember."""
@@ -131,6 +158,24 @@ class _Base:
 
     def close(self) -> None:
         pass
+
+
+def _newest_first(rows: Iterable[tuple]) -> Iterator[tuple]:
+    """Rows by start, newest first, as SQLite gives them: the same order with rows that
+    start together by key, newest first (as ORDER BY start DESC, k DESC)."""
+    group = []  # type: List[tuple]
+    for row in rows:
+        if group and row[6] != group[0][6]:
+            if len(group) > 1:
+                group.sort(key=lambda r: r[0], reverse=True)
+            for held in group:
+                yield held
+            group = []
+        group.append(row)
+    if len(group) > 1:
+        group.sort(key=lambda r: r[0], reverse=True)
+    for held in group:
+        yield held
 
 
 class SqliteStore(_Base):
@@ -178,7 +223,9 @@ class SqliteStore(_Base):
             except sqlite3.Error as error:
                 raise HistoryError("error", "history cache: %s" % error)
 
-    def _write(self, work, quiet: bool = False) -> None:
+    def _write(self, work, quiet: bool = False, same: bool = False) -> None:
+        """``same``: what is written changes no answer (an index of names), so the
+        version that answers depend on stays."""
         with self.lock:
             try:
                 # One transaction from the first read on: otherwise each SELECT takes and
@@ -198,7 +245,8 @@ class SqliteStore(_Base):
                 self._db.rollback()
                 self._forget()
                 raise
-            self.version += 1
+            if not same:
+                self.version += 1
 
     def get_meta(self, key: str, default: Any = None) -> Any:
         found = self._select("SELECT v FROM meta WHERE k=?", (key,))
@@ -300,14 +348,22 @@ class SqliteStore(_Base):
             db.executemany("INSERT INTO rollup VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            [r[:4] + (r[4] >> 20, r[4] & _MIB_MASK) + tuple(r[5:]) for r in rows])
             if agg is not None:
-                hours, starts = agg
                 db.execute("DELETE FROM agg_hour WHERE hour>=? AND hour<?", (low, high))
                 db.execute("DELETE FROM agg_start WHERE hour>=? AND hour<?", (low, high))
+                hours, starts = agg[:2]
                 # (hour, dim, gpus, gpu, cpu, mem, secs, cpu_cov, cpu_used, mem_cov, ...)
                 db.executemany("INSERT INTO agg_hour VALUES(%s)" % ",".join("?" * 23),
                                [r[:5] + (r[5] >> 20, r[5] & _MIB_MASK) + r[6:9]
                                 + (r[9] >> 20, r[9] & _MIB_MASK) + r[10:] for r in hours])
                 db.executemany("INSERT INTO agg_start VALUES(%s)" % ",".join("?" * 16), starts)
+                if len(agg) > 2:  # by family: (hour, dim, fam, gpu, ... gpu_used)
+                    db.execute("DELETE FROM agg_fhour WHERE hour>=? AND hour<?", (low, high))
+                    db.execute("DELETE FROM agg_fstart WHERE hour>=? AND hour<?", (low, high))
+                    db.executemany("INSERT INTO agg_fhour VALUES(%s)" % ",".join("?" * 15),
+                                   [r[:5] + (r[5] >> 20, r[5] & _MIB_MASK) + r[6:9]
+                                    + (r[9] >> 20, r[9] & _MIB_MASK) + r[10:] for r in agg[2]])
+                    db.executemany("INSERT INTO agg_fstart VALUES(%s)" % ",".join("?" * 16),
+                                   agg[3])
             if dirty is None:
                 db.execute("DELETE FROM meta WHERE k='dirty'")
             else:
@@ -358,11 +414,84 @@ class SqliteStore(_Base):
             return ""
         return " AND %s IN (%s)" % (column, ",".join(str(int(i)) for i in dim_ids))
 
+    # -- job-name families ---------------------------------------------------------
+
+    has_families = True
+
+    def families(self) -> Dict[int, str]:
+        """fams.id -> family, as interned so far."""
+        with self.lock:
+            found = getattr(self, "_fam_text", None)
+            if found is None:
+                found = self._fam_text = dict(self._select("SELECT id,v FROM fams"))
+                self._fam_ids = {v: k for k, v in found.items()}
+            return found
+
+    def family_ids(self, texts: Iterable[str], intern: bool = True) -> Dict[str, int]:
+        """Each family's id; new ones interned (unless not ``intern``: left out)."""
+        texts = set(texts)
+        with self.lock:
+            self.families()
+            new = sorted(t for t in texts if t not in self._fam_ids)
+            if new and intern:
+                def work(db):
+                    db.executemany("INSERT OR IGNORE INTO fams(v) VALUES(?)",
+                                   [(t,) for t in new])
+                self._write(work, quiet=True, same=True)
+                for at in range(0, len(new), 500):  # only the new ones are read back
+                    part = new[at:at + 500]
+                    for fam, text in self._select("SELECT id,v FROM fams WHERE v IN (%s)"
+                                                  % ",".join("?" * len(part)), part):
+                        self._fam_text[fam], self._fam_ids[text] = text, fam
+            known = self._fam_ids
+            return {t: known[t] for t in texts if t in known}
+
+    def name_families(self) -> None:
+        """Every stored name in famnames (names written since, or by another version of
+        this program, are added): a family's rows are then found by name in SQLite."""
+        from .families import name_family
+        with self.lock:
+            if getattr(self, "_names_at", None) == self.version:
+                return
+            missing = [r[0] for r in self._select(
+                "SELECT DISTINCT name FROM jobs WHERE name IS NOT NULL AND name NOT IN "
+                "(SELECT name FROM famnames)")]
+            if missing:
+                ids = self.family_ids(name_family(n) for n in missing)
+
+                def work(db):
+                    db.executemany("INSERT OR REPLACE INTO famnames VALUES(?,?)",
+                                   [(n, ids[name_family(n)]) for n in missing])
+                self._write(work, quiet=True, same=True)
+            self._names_at = self.version
+
+    def match_sql(self, needle: str) -> Tuple[str, List[Any]]:
+        """A WHERE term keeping every row whose job id, name or user contains ``needle``
+        (lower case), and a few more: SQLite lowers ASCII only, so a name with any other
+        character is always kept (for the caller to check)."""
+        users = sorted({d for d, roles in self.dims().items()
+                        if needle in (roles.user or "").lower()})
+        term = ("(instr(CAST(j.job AS TEXT),?)>0 OR instr(lower(j.name),?)>0 OR "
+                "j.name GLOB '*[^ -~]*'%s)" % (
+                    " OR j.dim IN (%s)" % ",".join(str(d) for d in users) if users else ""))
+        return term, [needle, needle]
+
+    def family_sql(self, family: str, column: str = "j.name") -> str:
+        """A WHERE term keeping exactly the rows of one job-name family."""
+        from .families import NO_NAME
+        self.name_families()
+        fam = self.family_ids([family], intern=False).get(family)
+        names = ("%s IN (SELECT name FROM famnames WHERE fam=%d)" % (column, fam)
+                 if fam is not None else "0")
+        if family == NO_NAME:
+            names = "(%s IS NULL OR %s)" % (column, names)
+        return names
+
     def agg_reset(self) -> None:
         """Empty the exact aggregates, made again in the current layout."""
         def work(db):
-            db.execute("DROP TABLE IF EXISTS agg_hour")
-            db.execute("DROP TABLE IF EXISTS agg_start")
+            for table in ("agg_hour", "agg_start", "agg_fhour", "agg_fstart"):
+                db.execute("DROP TABLE IF EXISTS " + table)
             for statement in _TABLES.split(";"):
                 if "agg_" in statement:
                     db.execute(statement)
@@ -380,21 +509,34 @@ class SqliteStore(_Base):
                 column, column, column, self._dims_sql(dim_ids)), (low, high))
 
     def agg_sums(self, low: int, high: int, dim_ids: Optional[Set[int]],
-                 by_gpus: bool = False) -> Tuple[Dict[Any, tuple], Dict[Any, tuple]]:
-        """Per dim (or (dim, GPUs per allocation, None if unknown)) over hours [low, high):
+                 by_gpus: bool = False, by_family: bool = False
+                 ) -> Tuple[Dict[Any, tuple], Dict[Any, tuple]]:
+        """Per dim (or (dim, GPUs per allocation, None if unknown), or with by_family
+        (dim, job-name family)) over hours [low, high):
         (gpu, cpu, mem, secs, cpu_cov, cpu_used, mem_cov, mem_used, gpu_cov, gpu_used) of
         finished allocations, and the per-attempt counts of those that started then
         (agg_start's columns)."""
         where = self._dims_sql(dim_ids)
-        key = "dim,gpus" if by_gpus else "dim,NULL"
+        key = "dim,fam" if by_family else "dim,gpus" if by_gpus else "dim,NULL"
+        hour_table, start_table = ("agg_fhour", "agg_fstart") if by_family else (
+            "agg_hour", "agg_start")
+        families = dict(self.families()) if by_family else {}
 
         def name(r: tuple) -> Any:
+            if by_family:
+                text = families.get(r[1])
+                if text is None:  # interned by another process since: read them again
+                    self._fam_text = None
+                    families.update(self.families())
+                    text = families.get(r[1], "")
+                return r[0], text
             return (r[0], None if r[1] == -1 else r[1]) if by_gpus else r[0]
         hours = {}
         for r in self._select(
                 "SELECT " + key + ",sum(gpu),sum(cpu),sum(mem_mib),sum(mem_rest),sum(secs),sum(cpu_cov),"
                 "total(cpu_used),sum(mcov_mib),sum(mcov_rest),total(mem_used),sum(gpu_cov),"
-                "total(gpu_used) FROM agg_hour WHERE hour>=? AND hour<?%s GROUP BY 1,2" % where,
+                "total(gpu_used) FROM %s WHERE hour>=? AND hour<?%s GROUP BY 1,2" % (
+                    hour_table, where),
                 (low, high)):
             k, r = name(r), r[1:]
             hours[k] = (r[1] or 0, r[2] or 0, ((r[3] or 0) << 20) + (r[4] or 0), r[5] or 0,
@@ -404,8 +546,8 @@ class SqliteStore(_Base):
         for r in self._select(
                 "SELECT " + key + ",sum(attempts),sum(cpu_known),sum(mem_known),sum(gpu_known),sum(susp),"
                 "sum(wait_count),sum(wait_total),max(wait_max),sum(limit_count),sum(limit_used),"
-                "sum(limit_requested),sum(over100),sum(unchecked) FROM agg_start "
-                "WHERE hour>=? AND hour<?%s GROUP BY 1,2" % where, (low, high)):
+                "sum(limit_requested),sum(over100),sum(unchecked) FROM %s "
+                "WHERE hour>=? AND hour<?%s GROUP BY 1,2" % (start_table, where), (low, high)):
             starts[name(r)] = tuple(r[2:])
         return hours, starts
 
@@ -465,11 +607,13 @@ class SqliteStore(_Base):
 
     def type_medians(self, low: Optional[int], high: int, start: int, end: int, as_of: int,
                      finished: Optional[Set[int]], running: Optional[Set[int]],
-                     skip: Sequence[str], keys: Optional[Dict[int, Tuple[str, str]]]
+                     skip: Sequence[str], keys: Optional[Dict[int, Tuple[str, str]]],
+                     by_name: Any = None
                      ) -> Tuple[Dict[Any, int], Dict[Any, int], Dict[Any, str]]:
         """Lower medians per kind, and the name of the earliest row, of the run times (finished rows) and queue waits (rows
         that started in the window) of the rows a window counts, less ``skip``. Kinds are
-        GPUs per allocation (-1 unknown) or, with ``keys``, keys[dim] (finished, unfinished)."""
+        GPUs per allocation (-1 unknown) or, with ``keys``, keys[dim] (finished, unfinished),
+        or with ``by_name`` by_name(job name)."""
         with self.lock:
             if keys is not None:
                 self._db.execute("CREATE TEMP TABLE IF NOT EXISTS kinds(dim INTEGER PRIMARY KEY, "
@@ -493,8 +637,8 @@ class SqliteStore(_Base):
             if skip:
                 where.append("j.k NOT IN (%s)" % ",".join(
                     "'%s'" % k.replace("'", "''") for k in skip))
-            kind = "coalesce(j.gpus,-1)" if keys is None else \
-                "(CASE WHEN j.stop=%d THEN t.open ELSE t.kind END)" % OPEN_STOP
+            kind = "j.name" if by_name is not None else "coalesce(j.gpus,-1)" if keys is None \
+                else "(CASE WHEN j.stop=%d THEN t.open ELSE t.kind END)" % OPEN_STOP
             join = "" if keys is None else " JOIN temp.kinds t ON t.dim=j.dim"
             base = "FROM jobs j%s WHERE %s" % (join, " AND ".join(where))
 
@@ -504,6 +648,18 @@ class SqliteStore(_Base):
                     kind, OPEN_STOP, here, base))
             runs, waited = {}, {}  # type: Dict[Any, List[int]], Dict[Any, List[int]]
             first = {}  # type: Dict[Any, int]
+            names = {}  # type: Dict[Any, str]
+            if by_name is not None:
+                earliest = {}  # type: Dict[Any, int]
+                for raw, runtime, wait, begun in found:
+                    key = by_name(raw or "")
+                    if runtime is not None:
+                        runs.setdefault(key, []).append(runtime)
+                    if wait is not None:
+                        waited.setdefault(key, []).append(wait)
+                    if begun < earliest.get(key, begun + 1):
+                        earliest[key], names[key] = begun, raw or ""
+                found = []
             for key, runtime, wait, begun in found:
                 if runtime is not None:
                     runs.setdefault(key, []).append(runtime)
@@ -511,7 +667,6 @@ class SqliteStore(_Base):
                     waited.setdefault(key, []).append(wait)
                 if begun < first.get(key, begun + 1):
                     first[key] = begun
-            names = {}  # type: Dict[Any, str]
             for key, begun in first.items():
                 row = self._select("SELECT j.name %s AND j.start=? AND %s=? LIMIT 1" % (
                     base, kind), (begun, key))
@@ -525,10 +680,12 @@ class SqliteStore(_Base):
         return runtimes, waits, names
 
     def scan_edges(self, start: int, low: int, high: int, until: int,
-                   dim_ids: Optional[Set[int]] = None, usage: bool = False) -> Iterator[Row]:
+                   dim_ids: Optional[Set[int]] = None, usage: bool = False,
+                   extra: bool = False) -> Iterator[Row]:
         """The rows a window [start, until) needs besides the aggregates of [low, high):
         every allocation that overlaps [start, low) or [high, until), runs across ``high``,
-        has no end, or ends before it starts. Unordered; each row once."""
+        has no end, or ends before it starts. Unordered; each row once. extra=True
+        appends (name, exit), as scan() does."""
         if dim_ids is not None and not dim_ids:
             return
         check = None
@@ -547,11 +704,17 @@ class SqliteStore(_Base):
             ("start>=? AND start<?", (high, until)),
             ("stop < start AND start>=? AND start<?", (low, high)),
         ]
-        keys = " UNION ".join("SELECT k FROM jobs WHERE %s%s" % (sql, dims) for sql, _ in pieces)
+        # the long rows are few: through their own index (a selection's index on dim and
+        # start would read every row of it that started before the window)
+        keys = " UNION ".join("SELECT k FROM jobs%s WHERE %s%s" % (
+            " INDEXED BY jobs_long" if sql.startswith(long_) else
+            " INDEXED BY jobs_odd" if sql.startswith("stop < start") else "", sql, dims)
+            for sql, _ in pieces)
         args = [a for _, values in pieces for a in values]
-        sql = "SELECT %s%s FROM jobs j%s WHERE j.k IN (%s)" % (
+        sql = "SELECT %s%s%s FROM jobs j%s WHERE j.k IN (%s)" % (
             _COLUMNS, ",u.cpu,u.rss,u.util,u.k IS NOT NULL" if usage else ",NULL,NULL,NULL,0",
-            " LEFT JOIN usage u ON u.k=j.k" if usage else "", keys)
+            ",j.name,j.ex" if extra else "", " LEFT JOIN usage u ON u.k=j.k" if usage else "",
+            keys)
         for row in self._select(sql, args):
             if check is None or row[2] in check:
                 yield row  # type: ignore
@@ -570,44 +733,57 @@ class SqliteStore(_Base):
                 yield row  # type: ignore
 
     def event_rows(self, high: int, end: int, as_of: int, finished: Optional[Set[int]],
-                   running: Optional[Set[int]], skip: Sequence[str]) -> str:
-        """The FROM/WHERE of the rows events.py counts: started before ``high`` (and
-        before ``end`` unless they took no time), finished in ``finished`` dims or
-        unfinished in ``running`` dims (None = any), never the keys in ``skip``. Columns:
-        start, rs (the end as counted: now while running, never before the start),
-        job, dim, gpus, cpus, susp, stop."""
-        where = ["start<%d" % int(high)]
-        fin = "stop<%d" % OPEN_STOP + ("" if finished is None else self._dims_sql(finished))
-        run = "stop=%d" % OPEN_STOP + ("" if running is None else self._dims_sql(running))
-        where.append("((%s) OR (%s))" % (fin, run))
-        if skip:
-            where.append("k NOT IN (%s)" % ",".join("'%s'" % k.replace("'", "''") for k in skip))
-        rs = "(CASE WHEN stop=%d THEN max(%d,start) ELSE max(stop,start) END)" % (
-            OPEN_STOP, int(as_of))
-        where.append("(start<%d OR %s=start)" % (int(end), rs))
-        return ("(SELECT start,%s AS rs,job,dim,coalesce(gpus,0) AS gpus,coalesce(cpus,0) "
-                "AS cpus,susp,stop,ex FROM jobs WHERE %s)" % (rs, " AND ".join(where)))
+                   running: Optional[Set[int]], skip: Sequence[str]) -> Tuple[Tuple[str, str],
+                                                                             Tuple[str, str]]:
+        """The rows events.py counts: started before ``high`` (and before ``end`` unless
+        they took no time), finished in ``finished`` dims or unfinished in ``running``
+        dims (None = any), never the keys in ``skip``. Two parts, each (rs, WHERE): the
+        finished rows and those with no end, asked for apart so that each is read from
+        the (dim, start, ...) index alone. rs is the end as counted: now while running,
+        never before the start."""
+        parts = []
+        for rs, where, dims in (("max(stop,start)", "stop<%d" % OPEN_STOP, finished),
+                                ("max(%d,start)" % int(as_of), "stop=%d" % OPEN_STOP, running)):
+            where = "start<%d AND %s%s" % (int(high), where,
+                                           "" if dims is None else self._dims_sql(dims))
+            if skip and dims is running:  # only rows with no end are ever skipped
+                where += " AND k NOT IN (%s)" % ",".join(
+                    "'%s'" % k.replace("'", "''") for k in skip)
+            where += " AND (start<%d OR %s=start)" % (int(end), rs)
+            parts.append((rs, where))
+        return parts[0], parts[1]
 
-    def event_inside(self, rows: str, low: int, failed: Set[int]) -> Tuple[
+    def event_inside(self, rows: Any, low: int, failed: Set[int]) -> Tuple[
             Optional[tuple], Optional[tuple], List[tuple], List[tuple]]:
         """From event_rows(), the rows that started at ``low`` or later: the largest
         (gpus, cpus, start, job, dim), the longest finished (run time, start, stop, job,
         gpus), each dim's first (dim, start, job) and the rows in ``failed`` dims (start,
         stop, job, ex), earliest first where it matters."""
+        (fin_rs, fin), (_, opened) = rows
         with self.lock:
-            top = self._select("SELECT gpus,cpus,start,job,dim FROM %s WHERE start>=? "
-                               "ORDER BY gpus DESC,cpus DESC,start LIMIT 1" % rows, (low,))
+            tops = []
+            for where in (fin, opened):
+                tops += self._select(
+                    "SELECT coalesce(gpus,0) AS g,coalesce(cpus,0) AS c,start,job,dim FROM jobs "
+                    "WHERE %s AND start>=? ORDER BY g DESC,c DESC,start LIMIT 1" % where, (low,))
+            top = min(tops, key=lambda r: (-r[0], -r[1], r[2])) if tops else None
             longest = self._select(
-                "SELECT rs-start-susp AS run,start,stop,job,gpus FROM %s WHERE start>=? AND "
-                "stop<%d ORDER BY run DESC,start LIMIT 1" % (rows, OPEN_STOP), (low,))
-            firsts = self._select(
-                "SELECT dim,min(start),job FROM %s WHERE start>=? GROUP BY dim" % rows, (low,))
+                "SELECT %s-start-susp AS run,start,stop,job,coalesce(gpus,0) FROM jobs WHERE %s "
+                "AND start>=? ORDER BY run DESC,start LIMIT 1" % (fin_rs, fin), (low,))
+            firsts = {}  # type: Dict[int, tuple]
+            for where in (fin, opened):
+                for dim, begun, job in self._select(
+                        "SELECT dim,min(start),job FROM jobs WHERE %s AND start>=? GROUP BY dim"
+                        % where, (low,)):
+                    have = firsts.get(dim)
+                    if have is None or begun < have[1]:
+                        firsts[dim] = (dim, begun, job)
             failures = self._select(
-                "SELECT start,stop,job,ex FROM %s WHERE start>=? AND stop<%d%s ORDER BY start"
-                % (rows, OPEN_STOP, self._dims_sql(failed)), (low,)) if failed else []
-        return (top[0] if top else None, longest[0] if longest else None, firsts, failures)
+                "SELECT start,stop,job,ex FROM jobs WHERE %s AND start>=?%s ORDER BY start"
+                % (fin, self._dims_sql(failed)), (low,)) if failed else []
+        return (top, longest[0] if longest else None, list(firsts.values()), failures)
 
-    def event_prior(self, rows: str, low: int, failed: Set[int], chained: Set[int]
+    def event_prior(self, rows: Any, low: int, failed: Set[int], chained: Set[int]
                     ) -> Tuple[List[tuple], List[int], List[Tuple[int, int]], Optional[int],
                                List[tuple]]:
         """From event_rows(): per dim before ``low`` (dim, max gpus, max cpus, longest
@@ -615,42 +791,86 @@ class SqliteStore(_Base):
         the gaps in coverage (start of the next allocation, coverage before it) and the
         coverage at the end; and the rows of jobs that have a finished row in a ``chained``
         dim, by start (start, rs, job, dim, gpus, susp, stop)."""
+        (fin_rs, fin), (open_rs, opened) = rows
         with self.lock:
-            prior = self._select(
-                "SELECT dim,max(gpus),max(cpus),max(CASE WHEN stop<%d THEN rs-start-susp END) "
-                "FROM %s WHERE start<? GROUP BY dim" % (OPEN_STOP, rows), (low,))
-            ends = [r[0] for r in self._select(
-                "SELECT stop FROM %s WHERE start<? AND stop<%d%s" % (
-                    rows, OPEN_STOP, self._dims_sql(failed)), (low,))] if failed else []
-            gaps, cover = [], None  # type: List[Tuple[int, int]], Optional[int]
-            try:
-                ordered = self._db.execute("SELECT start,rs FROM %s ORDER BY start" % rows)
-                for begun, end in ordered:
-                    if cover is None:
-                        cover = end
+            per = {}  # type: Dict[int, list]
+            for rs, where, done in ((fin_rs, fin, True), (open_rs, opened, False)):
+                for dim, gpus, cpus, run in self._select(
+                        "SELECT dim,max(coalesce(gpus,0)),max(coalesce(cpus,0)),%s FROM jobs "
+                        "WHERE %s AND start<? GROUP BY dim" % (
+                            "max(%s-start-susp)" % rs if done else "NULL", where), (low,)):
+                    have = per.get(dim)
+                    if have is None:
+                        per[dim] = [dim, gpus, cpus, run]
                         continue
-                    if begun > cover:
-                        gaps.append((begun, cover))
-                    if end > cover:
-                        cover = end
-            except sqlite3.Error as error:
-                raise HistoryError("error", "history cache: %s" % error)
-            chains = self._select(
-                "SELECT start,rs,job,dim,gpus,susp,stop FROM %s WHERE job IN (SELECT job FROM %s "
-                "WHERE stop<%d%s) ORDER BY start" % (rows, rows, OPEN_STOP,
-                                                     self._dims_sql(chained))) if chained else []
-        return prior, ends, gaps, cover, chains
+                    have[1], have[2] = max(have[1], gpus), max(have[2], cpus)
+                    if run is not None and (have[3] is None or run > have[3]):
+                        have[3] = run
+            prior = [tuple(item) for item in per.values()]
+            ends = [r[0] for r in self._select(
+                "SELECT stop FROM jobs WHERE %s AND start<?%s" % (
+                    fin, self._dims_sql(failed)), (low,))] if failed else []
+            # the gaps and the chains do not depend on ``low``: every range of the same
+            # selection asks the same, so they are kept until the data changes
+            kept = self.__dict__.setdefault("_event_kept", {})
+            at = (self.version, self.get_meta("gen"))
+            key = (rows, tuple(sorted(chained)))
+            found = kept.get(key)
+            if found is None or found[0] != at:
+                found = (at,) + self._gaps_and_chains(rows, chained)
+                if len(kept) > 16:
+                    kept.clear()
+                kept[key] = found
+            _, gaps, cover, chains = found
+        return prior, ends, list(gaps), cover, chains
 
-    def repeated_rows(self, low: int, high: int, dim_ids: Optional[Set[int]]
-                      ) -> List[Tuple[int, int, int, int, Optional[int]]]:
+    def _gaps_and_chains(self, rows: Any, chained: Set[int]) -> Tuple[
+            List[Tuple[int, int]], Optional[int], List[tuple]]:
+        (fin_rs, fin), (open_rs, opened) = rows
+        gaps, cover = [], None  # type: List[Tuple[int, int]], Optional[int]
+        try:
+            ordered = self._db.execute(
+                "SELECT start,%s FROM jobs WHERE %s UNION ALL SELECT start,%s FROM jobs "
+                "WHERE %s ORDER BY 1" % (fin_rs, fin, open_rs, opened))
+            for begun, end in ordered:
+                if cover is None:
+                    cover = end
+                    continue
+                if begun > cover:
+                    gaps.append((begun, cover))
+                if end > cover:
+                    cover = end
+        except sqlite3.Error as error:
+            raise HistoryError("error", "history cache: %s" % error)
+        chains = []  # type: List[tuple]
+        if chained:
+            jobs = "SELECT job FROM jobs WHERE %s%s" % (fin, self._dims_sql(chained))
+            chains = self._select(" UNION ALL ".join(
+                "SELECT start,%s,job,dim,coalesce(gpus,0),susp,stop FROM jobs WHERE %s AND "
+                "job IN (%s)" % (rs, where, jobs) for rs, where in rows) + " ORDER BY 1")
+        return gaps, cover, chains
+
+    def repeated_rows(self, low: int, high: int, dim_ids: Optional[Set[int]],
+                      names: bool = False) -> List[tuple]:
         """(start, stop, job, dim, gpus) of the finished rows of jobs with several rows
-        that started and ended in [low, high)."""
+        that started and ended in [low, high); names: with the job name after them."""
         with self.lock:
-            self._repeated_table()
-            return self._select(
-                "SELECT start,stop,job,dim,gpus FROM jobs WHERE start>=? AND start<? AND stop<? "
-                "AND stop>=start AND job IN (SELECT job FROM temp.repeated)%s" % self._dims_sql(
-                    dim_ids), (low, high, high))
+            # every finished row of a repeated job, by start, read once per change
+            at = (self.version, self.get_meta("gen"))
+            found = getattr(self, "_repeated_rows", None)
+            if found is None or found[0] != at:
+                self._repeated_table()
+                rows = self._select(
+                    "SELECT start,stop,job,dim,gpus,name FROM jobs WHERE stop<%d AND "
+                    "stop>=start AND job IN (SELECT job FROM temp.repeated) ORDER BY start"
+                    % OPEN_STOP)
+                found = self._repeated_rows = (at, rows, [r[0] for r in rows])
+        _, rows, starts = found
+        out = []
+        for row in rows[bisect_left(starts, low):bisect_left(starts, high)]:
+            if row[1] < high and (dim_ids is None or row[3] in dim_ids):
+                out.append(row if names else row[:5])
+        return out
 
     def count_by_dim(self) -> Dict[int, int]:
         return dict(self._select("SELECT dim,count(*) FROM jobs GROUP BY dim"))
@@ -662,7 +882,15 @@ class SqliteStore(_Base):
         return before < after
 
     def dims(self) -> Dict[int, Roles]:
-        return {i: Roles(*json.loads(v)) for i, v in self._select("SELECT id,v FROM dims")}
+        """id -> Roles; read again only after a write, here or by another process
+        (callers must not change it)."""
+        with self.lock:
+            at = (self.version, self.get_meta("gen"))
+            found = getattr(self, "_dims_at", None)
+            if found is None or found[0] != at:
+                found = self._dims_at = (at, {
+                    i: Roles(*json.loads(v)) for i, v in self._select("SELECT id,v FROM dims")})
+            return found[1]
 
     def nodesets(self) -> Dict[int, str]:
         return dict(self._select("SELECT id,v FROM nodesets"))
@@ -682,11 +910,16 @@ class SqliteStore(_Base):
         return self._select("SELECT min(start) FROM jobs" + where)[0][0]
 
     def scan(self, low: Optional[int], high: int, dim_ids: Optional[Set[int]] = None,
-             usage: bool = False, ordered: bool = True, by_start: bool = False,
-             extra: bool = False) -> Iterator[Row]:
+             usage: bool = False, ordered: Any = True, by_start: bool = False,
+             extra: bool = False, gpus: Any = ANY, family: Any = ANY,
+             match: Optional[str] = None) -> Iterator[Row]:
         """Allocations that started before ``high`` and had not ended before ``low``.
 
-        extra=True appends (name, exit) to each row.
+        extra=True appends (name, exit) to each row. ordered: True by start, NEWEST by
+        start and key, newest first. ``gpus``: only rows with that many GPUs per
+        allocation (None: unknown); ``family``: only rows of that job-name family;
+        ``match`` (lower case): at least the rows whose job id, name or user contains it
+        (listing.py checks each).
         """
         if dim_ids is not None and not dim_ids:
             return
@@ -704,20 +937,51 @@ class SqliteStore(_Base):
                 where.append("j.dim IN (%s)" % ",".join(str(int(i)) for i in dim_ids))
             else:
                 check = dim_ids
-        sql = "SELECT %s%s%s FROM jobs j%s WHERE %s%s" % (
+        if gpus is not ANY:
+            where.append("j.gpus IS NULL" if gpus is None else "j.gpus=%d" % int(gpus))
+        if family is not ANY:
+            where.append(self.family_sql(family))
+        if match:
+            term, values = self.match_sql(match)
+            where.append(term)
+            args += values
+        walk = ordered is NEWEST and family is ANY and self._newest_by_start(dim_ids)
+        if walk and low is not None:  # down the start index, stopping when the reader
+            where[:2] = ["j.start<?", "j.stop>=?"]  # has enough: no "+" on start
+        sql = "SELECT %s%s%s FROM jobs j%s%s WHERE %s%s" % (
             _COLUMNS,
             ",u.cpu,u.rss,u.util,u.k IS NOT NULL" if usage else ",NULL,NULL,NULL,0",
             ",j.name,j.ex" if extra else "",
+            " INDEXED BY jobs_start" if walk else "",
             " LEFT JOIN usage u ON u.k=j.k" if usage else "",
             " AND ".join(where),
+            " ORDER BY j.start DESC" if walk else
+            " ORDER BY j.start DESC,j.k DESC" if ordered is NEWEST else
             " ORDER BY +j.start" if ordered else "")
         with self.lock:
             try:
-                for row in self._db.execute(sql, args):
+                rows = self._db.execute(sql, args)
+                if walk:
+                    rows = _newest_first(rows)
+                for row in rows:
                     if check is None or row[2] in check:
                         yield row  # type: ignore  # same layout as Row, cheaper as a tuple
             except sqlite3.Error as error:
                 raise HistoryError("error", "history cache: %s" % error)
+
+    NEWEST_PAGE = 20000  # the page a newest-first read is expected to stop at
+
+    def _newest_by_start(self, dim_ids: Optional[Set[int]]) -> bool:
+        """Whether walking the start index down (and stopping) beats sorting the
+        selection's rows: when they are a large part of all rows."""
+        with self.lock:
+            found = getattr(self, "_dim_counts", None)
+            if found is None or found[0] != self.version:
+                found = self._dim_counts = (self.version, self.count_by_dim())
+        counts = found[1]
+        total = sum(counts.values())
+        mine = total if dim_ids is None else sum(counts.get(d, 0) for d in dim_ids)
+        return mine * mine > self.NEWEST_PAGE * total * 2
 
     def idle_counts(self, low: Optional[int], high: int) -> List[Tuple[int, bool, int]]:
         """(dim, ended, rows) for records that never started."""
@@ -765,7 +1029,8 @@ class SqliteStore(_Base):
         self._rep_table = self.version
 
     def scan_special(self, low: Optional[int], high: int, dim_ids: Optional[Set[int]],
-                     extra: bool = False, repeated: bool = True) -> Iterator[Row]:
+                     extra: bool = False, repeated: bool = True, gpus: Any = ANY,
+                     family: Any = ANY) -> Iterator[Row]:
         """scan()'s rows that have no end or (``repeated``) belong to a job with several
         rows."""
         if dim_ids is not None and not dim_ids:
@@ -778,6 +1043,10 @@ class SqliteStore(_Base):
             args.append(low)
         dims = self._dims_sql(dim_ids, "j.dim") if dim_ids is not None and \
             len(dim_ids) <= _MAX_SQL_IDS else ""
+        if gpus is not ANY:
+            dims += " AND j.gpus IS NULL" if gpus is None else " AND j.gpus=%d" % int(gpus)
+        if family is not ANY:
+            dims += " AND " + self.family_sql(family)
         for row in self._select(
                 "SELECT %s,NULL,NULL,NULL,0%s FROM jobs j WHERE %s%s AND (j.stop=%d%s)" % (
                     _COLUMNS, ",j.name,j.ex" if extra else "", where, dims, OPEN_STOP,
@@ -795,7 +1064,8 @@ class SqliteStore(_Base):
 
     def top_finished(self, low: Optional[int], high: int, start: int, end: int,
                      dim_ids: Optional[Set[int]], sort: str, descending: bool, count: int,
-                     single: bool = True) -> Tuple[int, List[str]]:
+                     single: bool = True, gpus: Any = ANY, family: Any = ANY
+                     ) -> Tuple[int, List[str]]:
         """Finished rows (of jobs with one row, if ``single``), as listing.list_jobs counts
         them: how many
         have usage in the window, and the keys of the first ``count`` by ``sort``
@@ -816,17 +1086,42 @@ class SqliteStore(_Base):
         where.append("(%s>%s OR (%s=j.start AND %s))" % (q, p, rs, here))
         if single:
             where.append("j.job NOT IN (%s)" % self._REPEATED)
+        if gpus is not ANY:
+            where.append("j.gpus IS NULL" if gpus is None else "j.gpus=%d" % int(gpus))
+        if family is not ANY:
+            where.append(self.family_sql(family))
         sql = " AND ".join(where) + (self._dims_sql(dim_ids, "j.dim") if dim_ids is not None
                                      else "")
         with self.lock:
             self._repeated_table()
             total = self._select("SELECT count(*) FROM jobs j WHERE " + sql)[0][0]
             order = "DESC" if descending else "ASC"
-            # unknown amounts last either way, as list_jobs sorts them
-            keys = [r[0] for r in self._select(
-                "SELECT j.k FROM jobs j WHERE %s ORDER BY (%s) IS NULL, (%s) %s, j.start %s, "
-                "j.k %s LIMIT ?" % (sql, value, value, order, order, order), (count,))]
-        return total, keys
+            # unknown amounts last either way, as list_jobs sorts them. Ranked from the
+            # (dim, start, ...) index alone, by rowid; the key, the last tie-break, is read
+            # for the rows kept and those tied with the last one only
+            top = self._select(
+                "SELECT (%s) AS v,j.start,j.rowid FROM jobs j WHERE %s ORDER BY v IS NULL, "
+                "v %s, j.start %s LIMIT ?" % (value, sql, order, order), (count,))
+            if not top:
+                return total, []
+            last, begun = top[-1][0], top[-1][1]
+            tied = self._select(
+                "SELECT (%s) AS v,j.start,j.rowid FROM jobs j WHERE %s AND j.start=? AND v %s"
+                % (value, sql, "IS NULL" if last is None else "=?"),
+                (begun,) if last is None else (begun, last))
+            found = {r[2]: r for r in top + tied}
+            keys = {}  # type: Dict[int, str]
+            ids = sorted(found)
+            for at in range(0, len(ids), 500):
+                part = ids[at:at + 500]
+                keys.update(self._select("SELECT rowid,k FROM jobs WHERE rowid IN (%s)"
+                                         % ",".join("?" * len(part)), part))
+        # by key, then (stable) by amount and start: the order of ORDER BY v, start, k
+        sign = -1 if descending else 1
+        chosen = sorted(found.values(), key=lambda r: keys[r[2]], reverse=descending)
+        chosen.sort(key=lambda r: (r[0] is None, 0 if r[0] is None else sign * r[0],
+                                   sign * r[1]))
+        return total, [keys[r[2]] for r in chosen[:count]]
 
     def usage_of(self, keys: Sequence[str]) -> Dict[str, tuple]:
         """(cpu, rss, util, True) of the rows of ``keys`` whose steps were read."""
@@ -901,7 +1196,7 @@ class SqliteStore(_Base):
     def clear(self) -> None:
         def work(db):
             for table in ("jobs", "usage", "dims", "nodesets", "meta", "rollup", "agg_hour",
-                          "agg_start"):
+                          "agg_start", "agg_fhour", "agg_fstart", "fams", "famnames"):
                 db.execute("DELETE FROM %s" % table)
 
         self._write(work)
@@ -1047,15 +1342,18 @@ class MemoryStore(_Base):
                         and (dim_ids is None or r[2] in dim_ids)), default=None)
 
     def scan(self, low: Optional[int], high: int, dim_ids: Optional[Set[int]] = None,
-             usage: bool = False, ordered: bool = True, by_start: bool = False,
-             extra: bool = False) -> Iterator[Row]:
+             usage: bool = False, ordered: Any = True, by_start: bool = False,
+             extra: bool = False, gpus: Any = ANY) -> Iterator[Row]:
         empty = (None, None, None, False)
         with self.lock:
             picked = [r for r in self._rows.values()
                       if r[6] is not None and r[6] < high
                       and (low is None or r[7] is None or r[7] >= low)
-                      and (dim_ids is None or r[2] in dim_ids)]
-            if ordered:
+                      and (dim_ids is None or r[2] in dim_ids)
+                      and (gpus is ANY or r[10] == gpus)]
+            if ordered is NEWEST:
+                picked.sort(key=lambda r: (r[6], r[0]), reverse=True)
+            elif ordered:
                 picked.sort(key=lambda r: r[6])
             for r in picked:
                 out = r[:14] + (self._usage.get(r[0], empty) if usage else empty)

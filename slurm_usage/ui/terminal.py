@@ -123,7 +123,7 @@ def _main(screen: Any, app: App) -> None:
     except curses.error:
         pass
     app.start()
-    dirty, last_draw, waiting = True, 0.0, 250
+    dirty, last_draw, waiting, drawn = True, 0.0, 250, -1
     while True:
         app.poll()
         if app.color != colored:  # C switched colors
@@ -131,12 +131,15 @@ def _main(screen: Any, app: App) -> None:
             attrs = _attrs(colored)
             dirty = True
         now = time.time()
-        if dirty or now - last_draw > 1.0 or app.loader.busy:
+        # the last answer lands when nothing is busy any more: drawn at once, not on the
+        # next one-second tick
+        finished = getattr(app.loader, "finished", 0)
+        if dirty or now - last_draw > 1.0 or app.loader.busy or finished != drawn:
             height, width = screen.getmaxyx()
             canvas = Canvas(width, height)
             app.render(canvas)
             _blit(screen, canvas, attrs)
-            dirty, last_draw = False, now
+            dirty, last_draw, drawn = False, now, finished
         # answers land while work is in flight: look again sooner then
         wait = 100 if app.loader.busy else 250
         if wait != waiting:

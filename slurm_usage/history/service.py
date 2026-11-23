@@ -235,14 +235,15 @@ class History:
     def jobs(self, window: Optional[Window] = None, where: Optional[Filter] = None,
              by: str = "job", sort: str = "gpu", descending: bool = True, limit: int = 200,
              offset: int = 0, cancel: Any = None,
-             run_type: Optional[Any] = None, match: Optional[str] = None) -> JobPage:
+             run_type: Optional[Any] = None, match: Optional[str] = None,
+             count: bool = True) -> JobPage:
         """run_type=(by, key) drills into one run_types() row. ``match`` keeps jobs whose
-        id, name or user contains it (case-insensitive); page.total counts the matches."""
+        id, name or user contains it (case-insensitive); page.total counts the matches
+        (count=False: it may be None, and the newest attempts come quicker)."""
         window = window or Window()
         as_of = self._as_of()
         page = _listing.list_jobs(self._store, as_of, window, where, by, sort, descending,
-                                  limit, offset,
-                         cancel, run_type, match)
+                                  limit, offset, cancel, run_type, match, count)
         page.complete = self._is_complete(window)
         return page
 
