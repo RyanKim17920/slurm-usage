@@ -10,6 +10,8 @@ thread (see ``loader``).
 query raises ``HistoryError`` with a status the UI turns into a placeholder.
 """
 
+import json
+import os
 import re
 import threading
 import time
@@ -682,6 +684,7 @@ class HistoryData:
         self._preempt = threading.Event()  # stops only the load in progress
         self._loading = None  # type: Optional[str]
         self._bumped = time.time()
+        self.results = None  # type: Optional[ResultCache]  # answers kept across runs
 
     def has(self, method: str) -> bool:
         return callable(getattr(self.history, method, None))
@@ -739,6 +742,11 @@ class HistoryData:
             self.fraction = min(1.0, done / float(total)) if total else None
             self.progress = "efficiency %s" % (fmt.pct(self.fraction) if total
                                                else fmt.num(done))
+            if time.time() - self._bumped > 1.0:  # show the pieces read so far
+                self._bumped = time.time()
+                with self._lock:
+                    self.generation += 1
+            return
         else:
             low, high = self._PHASES.get(phase, (0.0, 0.85))
             if total:
@@ -765,6 +773,7 @@ class HistoryData:
         self.fraction = None
         self._preempt.clear()
         self._loading = range_name
+        before = self._data_version()
 
         def cancelled() -> bool:
             return self._cancel.is_set() or self._preempt.is_set() or self.paused
@@ -785,8 +794,17 @@ class HistoryData:
         self.failure = None
         with self._lock:
             self.loaded.add(range_name)
-            self.generation += 1
+            # what is on screen is recomputed only when the cache really changed
+            if before is None or self._data_version() != before:
+                self.generation += 1
         return True
+
+    def _data_version(self) -> Any:
+        """The history cache's own version, or None when it cannot be told."""
+        history = getattr(self.history, "_history", self.history)
+        store = getattr(history, "_store", None)
+        version = getattr(store, "version", None)
+        return None if version is None else (id(store), version)
 
     def prioritize(self, range_name: str) -> bool:
         """The viewer switched to ``range_name``: if a longer range is loading, stop it so
@@ -842,23 +860,54 @@ class HistoryData:
 
     # -- queries ---------------------------------------------------------------
 
+    MEMO_SECONDS = 60.0  # a range's answer is reused this long while the data is unchanged
+
+    def _memo(self, key: Any, compute: Callable[[], Any]) -> Any:
+        """One answer per (question, data generation) for a short while: the same query
+        asked by several panes, or again when only the live capacity changed, is not
+        computed twice. Windows move with the clock, so answers expire."""
+        memo = self.__dict__.setdefault("_memos", OrderedDict())
+        now = time.time()
+        with self._lock:
+            found = memo.get(key)
+            if found is not None and found[0] == self.generation and \
+                    now - found[1] < self.MEMO_SECONDS:
+                return found[2]
+            generation = self.generation
+        value = compute()
+        with self._lock:
+            memo[key] = (generation, now, value)
+            memo.move_to_end(key)
+            while len(memo) > 64:
+                memo.popitem(last=False)
+        return value
+
     def report(self, range_name: str, filt: Any = None, group_by: Sequence[Any] = (),
                series_by: Optional[str] = None, lanes_by: Optional[str] = None,
                lane_resolution: Optional[int] = None, efficiency: bool = True,
                win: Any = None, lanes_metric: Optional[str] = None) -> Any:
         extra = {"lanes_metric": lanes_metric} if lanes_metric else {}
-        return self.history.query(win or window(range_name, self.clock()), filt,
-                                  group_by=group_by, series_by=series_by, lanes_by=lanes_by,
-                                  lane_resolution=lane_resolution, efficiency=efficiency,
-                                  cancel=self._cancel, **extra)
+
+        def compute() -> Any:
+            return self.history.query(win or window(range_name, self.clock()), filt,
+                                      group_by=group_by, series_by=series_by,
+                                      lanes_by=lanes_by, lane_resolution=lane_resolution,
+                                      efficiency=efficiency, cancel=self._cancel, **extra)
+        if win is not None:
+            return compute()
+        return self._memo(("report", range_name, filt, tuple(group_by), series_by, lanes_by,
+                           lane_resolution, efficiency, lanes_metric), compute)
 
     def previous(self, range_name: str, filt: Any = None,
                  group_by: Sequence[Any] = ()) -> Any:
-        win = previous_window(range_name, self.clock())
-        if win is None:
+        if previous_window(range_name, self.clock()) is None:
             return None
-        return self.history.query(win, filt, group_by=group_by, efficiency=False,
-                                  cancel=self._cancel)
+
+        def compute() -> Any:
+            return self.history.query(previous_window(range_name, self.clock()), filt,
+                                      group_by=group_by, efficiency=False,
+                                      cancel=self._cancel)
+        return self._memo(("previous", range_name, filt, tuple(group_by)), compute)
 
     def trend(self, range_name: str, filt: Any = None, gpu_capacity: Optional[int] = None,
               cpu_capacity: Optional[int] = None) -> TrendRow:
@@ -884,7 +933,32 @@ class HistoryData:
         """history.Overview from the rollup (cache only), or None if this history has none."""
         if not self.has("overview"):
             return None
-        return self.history.overview(gpu_capacity=gpu_capacity, cpu_capacity=cpu_capacity)
+        try:
+            from ..history.rollup import with_capacity
+        except ImportError:  # pragma: no cover
+            return self.history.overview(gpu_capacity=gpu_capacity, cpu_capacity=cpu_capacity)
+        # computed once per data generation; the live capacity only changes percentages.
+        # The overview depends on the cache alone (not the clock): one kept by an earlier
+        # run for the same data generation is the same answer.
+        def compute() -> Any:
+            results = self.results
+            generation = None
+            if results is not None and self.has("generation"):
+                try:
+                    generation = self.history.generation()
+                except Exception:
+                    generation = None
+            key = ("h", "overview@", repr(generation)) if generation is not None else None
+            if key is not None:
+                kept = results.load(key)
+                if kept is not None:
+                    return kept
+            found = self.history.overview()
+            if key is not None:
+                results.save(key, found)
+            return found
+        found = self._memo(("overview",), compute)
+        return with_capacity(found, gpu_capacity, cpu_capacity)
 
     def overview_trend(self, summary: Any) -> TrendRow:
         """history.RangeSummary -> TrendRow, with the rollup's sparkline when it has one
@@ -1023,6 +1097,16 @@ class HistoryData:
         report = self.report(range_name, filt, efficiency=False)
         return _spark(report, range_name)
 
+    def kind_trends(self, range_name: str, filt: Any, kinds: Sequence[str]
+                    ) -> Optional[Tuple[List[int], Dict[str, Dict[str, List[int]]]]]:
+        """GPU-seconds per chart bin of the range for each kind of run ({kind: {key:
+        bins}}) with the bins' edges; None when the history layer cannot tell."""
+        if not self.has("kind_series"):
+            return None
+        return self.history.kind_series(
+            window(range_name, self.clock()), filt, kinds=kinds, cancel=self._cancel,
+            make_bins=lambda start, end: bin_edges(start, end, bin_unit(range_name, start, end)))
+
     def run_types(self, range_name: str, filt: Any, dimension: str) -> List[RunType]:
         """By the history layer when it can; else from the attempts list."""
         win = window(range_name, self.clock())
@@ -1096,6 +1180,165 @@ class HistoryData:
         with self._lock:
             self.generation += 1
         return count
+
+
+class ResultCache:
+    """What history views showed last, kept beside the history cache so that a new run
+    (or a view opened again) paints at once and then refreshes in place.
+
+    Only history answers ("h" loader keys) are kept, only while ``active()`` (never
+    anonymized), only for a history with a cache file, and only for the cache the
+    answers were computed from. Values are pickled into an owner-only file in the
+    owner-only cache directory; anything unreadable is ignored."""
+
+    VERSION = 1
+    LIMIT = 600  # answers kept; the oldest go first
+
+    def __init__(self, history: Any, active: Callable[[], bool] = lambda: True) -> None:
+        self._history, self._active = history, active
+        self._db = None  # type: Any
+        self._failed = False
+        self._lock = threading.Lock()
+        self._last = None  # type: Optional[str]  # the cache the stored answers belong to
+        self._saves = 0
+        self._pending = {}  # type: Dict[str, Any]
+
+    def _ident(self) -> Optional[str]:
+        """The history cache file in use, once it is open (never probes Slurm)."""
+        store = getattr(self._history, "_store", None)
+        path = getattr(store, "path", None)
+        if not path:
+            return None
+        from .. import __version__  # answers of another version may be shaped differently
+        return "%s %s" % (os.path.basename(path), __version__)
+
+    def _open(self) -> Any:
+        if self._db is not None or self._failed:
+            return self._db
+        try:
+            import sqlite3
+            from ..history.store import default_cache_dir, private_dir
+            if not getattr(self._history, "_persist", False):
+                raise OSError("no cache file")
+            directory = private_dir(getattr(self._history, "_cache_dir", None)
+                                    or default_cache_dir())
+            path = os.path.join(directory, "views-v%d.sqlite" % self.VERSION)
+            handle = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            try:
+                found = os.fstat(handle)
+                if found.st_uid != os.geteuid() or found.st_mode & 0o077:
+                    raise OSError("not private")
+            finally:
+                os.close(handle)
+            db = sqlite3.connect(path, timeout=2, check_same_thread=False)
+            for pragma in ("journal_mode=TRUNCATE", "synchronous=OFF"):
+                db.execute("PRAGMA " + pragma).fetchall()
+            db.execute("CREATE TABLE IF NOT EXISTS views(k TEXT PRIMARY KEY, ident TEXT, "
+                       "at REAL, v BLOB)")
+            db.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+            db.commit()
+            row = db.execute("SELECT v FROM meta WHERE k='ident'").fetchone()
+            self._last = row[0] if row else None
+            self._db = db
+        except Exception:
+            self._failed = True
+        return self._db
+
+    def get_meta(self, key: str) -> Any:
+        with self._lock:
+            db = self._open()
+            try:
+                row = db.execute("SELECT v FROM meta WHERE k=?", ("x." + key,)).fetchone() \
+                    if db is not None else None
+                return json.loads(row[0]) if row else None
+            except Exception:
+                return None
+
+    def set_meta(self, key: str, value: Any) -> None:
+        with self._lock:
+            db = self._open()
+            if db is None:
+                return
+            try:
+                db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", ("x." + key,
+                                                                       json.dumps(value)))
+                db.commit()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _text(key: Any) -> Optional[str]:
+        if not isinstance(key, tuple) or not key or key[0] != "h":
+            return None
+        text = repr(key)
+        return None if " at 0x" in text else text
+
+    def load(self, key: Any) -> Any:
+        text = self._text(key)
+        if text is None or not self._active():
+            return None
+        with self._lock:
+            db = self._open()
+            if db is None:
+                return None
+            try:
+                row = db.execute("SELECT ident,v FROM views WHERE k=?", (text,)).fetchone()
+                if row is None or row[0] != (self._ident() or self._last):
+                    return None
+                import pickle
+                import zlib
+                return pickle.loads(zlib.decompress(row[1]))
+            except Exception:
+                return None
+
+    def save(self, key: Any, value: Any) -> None:
+        """Remembered now, written by flush() (when nothing on screen is waiting)."""
+        text = self._text(key)
+        if text is None or value is None or not self._active():
+            return
+        with self._lock:
+            self._pending[text] = value
+
+    @property
+    def pending(self) -> int:
+        return len(self._pending)
+
+    def flush(self) -> None:
+        with self._lock:
+            pending, self._pending = self._pending, {}
+        for text, value in pending.items():
+            self._write(text, value)
+
+    def _write(self, text: str, value: Any) -> None:
+        ident = self._ident()
+        if ident is None or not self._active():
+            return
+        try:
+            import pickle
+            import zlib
+            blob = zlib.compress(pickle.dumps(value, protocol=4), 1)
+        except Exception:
+            return
+        with self._lock:
+            db = self._open()
+            if db is None:
+                return
+            try:
+                db.execute("INSERT OR REPLACE INTO views VALUES(?,?,?,?)",
+                           (text, ident, time.time(), blob))
+                if ident != self._last:
+                    db.execute("INSERT OR REPLACE INTO meta VALUES('ident',?)", (ident,))
+                    self._last = ident
+                self._saves += 1
+                if self._saves % 100 == 1:
+                    db.execute("DELETE FROM views WHERE k NOT IN (SELECT k FROM views ORDER BY "
+                               "at DESC LIMIT ?)", (self.LIMIT,))
+                db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
 
 
 class NoHistory:

@@ -61,7 +61,24 @@ an hour or more. A cache from before the aggregates (or of another layout,
 asking Slurm again. Events take their baselines (largest and longest before the
 window, gaps, preemption chains) from SQLite and read only the rows inside the
 window. Step usage for efficiency is read in pieces of about 3,000 attempts,
-three `sacct` at a time.
+four `sacct` at a time; views redraw as pieces land. Per-kind sparklines
+(`History.kind_series`) are summed into the chart's bins from the aggregates.
+
+## Answers kept between runs
+
+`ui/data.py`'s `ResultCache` keeps what history views showed last in
+`views-v1.sqlite` beside the history cache (owner-only, pickled, never while
+anonymized, only for the cache file and version they came from). The loader
+seeds a view's entries from it, so a new run or a view opened again paints at
+once and then refreshes in place; the overview, which depends on the cache
+alone, is reused outright while the cache's data generation (bumped by every
+change, in `meta`) is the same. `HistoryData` answers a repeated query once per
+data generation (a minute at most); a load that changes nothing does not
+recompute what is on screen. The first refresh of a run waits (up to 3 s)
+until the screen has been answered from the cache, and switching screens drops
+work queued for the old one. The probe of Slurm's configuration is kept 5
+minutes in `probe-v1.json`. `--once` takes the live snapshot while history
+loads, and skips the refresh when the cache was refreshed in the last minute.
 
 ## Settings at run time
 

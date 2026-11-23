@@ -123,7 +123,7 @@ def _main(screen: Any, app: App) -> None:
     except curses.error:
         pass
     app.start()
-    dirty, last_draw = True, 0.0
+    dirty, last_draw, waiting = True, 0.0, 250
     while True:
         app.poll()
         if app.color != colored:  # C switched colors
@@ -137,6 +137,11 @@ def _main(screen: Any, app: App) -> None:
             app.render(canvas)
             _blit(screen, canvas, attrs)
             dirty, last_draw = False, now
+        # answers land while work is in flight: look again sooner then
+        wait = 100 if app.loader.busy else 250
+        if wait != waiting:
+            screen.timeout(wait)
+            waiting = wait
         try:
             code = screen.get_wch()
         except curses.error:

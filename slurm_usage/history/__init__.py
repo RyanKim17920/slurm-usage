@@ -16,12 +16,8 @@ so that groupings and buckets sum exactly.
 """
 
 from ..model import CapacityCheck, Status, Step
-from .detail import AttemptDetail, JobDetail, Text
 from .errors import Cancelled, HistoryError, Note, Progress
-from .listing import SORTS, JobPage, JobRow
-from .paths import LogPath
 from .records import NONE, OUTCOMES
-from .events import KINDS, Event
 from .report import Lane, Report, Utilization
 from .runtypes import TYPE_ROLES, RunType, name_family
 from .rollup import RANGES, AccountSummary, Amounts, Overview, RangeSummary
@@ -37,3 +33,19 @@ __all__ = [
     "METRICS", "MISSING_END", "NONE", "Note", "OUTCOMES", "Progress", "ROLES", "RUNAWAY",
     "Report", "SORTS", "STALE", "Stats", "Status", "Step", "Text", "Utilization", "Window",
 ]
+
+
+# imported when first asked for: a summary run never needs them
+_LATER = {"AttemptDetail": "detail", "JobDetail": "detail", "Text": "detail",
+          "SORTS": "listing", "JobPage": "listing", "JobRow": "listing", "LogPath": "paths",
+          "KINDS": "events", "Event": "events"}
+
+
+def __getattr__(name: str):  # PEP 562
+    module = _LATER.get(name)
+    if module is None:
+        raise AttributeError("module %r has no attribute %r" % (__name__, name))
+    import importlib
+    value = getattr(importlib.import_module("." + module, __name__), name)
+    globals()[name] = value
+    return value

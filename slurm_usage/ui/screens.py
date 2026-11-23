@@ -150,8 +150,10 @@ def status_line(label: str, entry: Optional[Entry]) -> Line:
 
 
 def capacity(ctx: Context) -> Tuple[Optional[int], Optional[int]]:
+    """Live capacity; before the first snapshot, what it was last run (so the answers
+    kept from then match and nothing is computed twice)."""
     if ctx.snap is None:
-        return None, None
+        return getattr(ctx.app, "capacity_hint", None) or (None, None)
     return ctx.snap.totals.gpus.total, ctx.snap.totals.cpus.total
 
 
@@ -1256,7 +1258,11 @@ def accounts_pane(ctx: Context) -> Pane:
     """Accounts in the range. The figures come from the same query as Roles (so the two
     always agree); while it computes, the hourly summary stands in and says so."""
     snap = ctx.snap
-    entry = range_report(ctx, {}, (("account",), ("user", "account")), series_by="account")
+    # the same query as Roles by account (one answer for both); the sparklines come from
+    # the per-kind series, binned by the history layer
+    entry = range_report(ctx, {}, (("account",), ("user", "account")))
+    trends = kind_trends(ctx, {}, ctx.range, ("account",)) if ctx.data.has("kind_series") \
+        else None
     report = value(entry)
     names = set()
     users = {}  # type: Dict[str, set]
@@ -1304,7 +1310,10 @@ def accounts_pane(ctx: Context) -> Pane:
         if stats is not None:
             gpu_h, share, eff, complete = stats
             spark = None
-            if report is not None:
+            if trends is not None:
+                found = trends.get("account", {}).get(name)
+                spark = list(found) if found else None
+            elif report is not None and getattr(report, "series_by", None) == "account":
                 try:
                     buckets = report.buckets("gpu", "day" if ctx.range not in ("day", "week")
                                              else "hour", key=name)
@@ -1944,6 +1953,19 @@ def scope_attempts(ctx: Context, params: Dict[str, Any], name: str) -> Entry:
                     lambda r=name, f=filt: ctx.data.attempts(r, f))
 
 
+def kind_trends(ctx: Context, params: Dict[str, Any], name: str, kinds: Tuple[str, ...]
+                ) -> Optional[Dict[str, Dict[str, List[float]]]]:
+    """GPU-seconds per chart bin for each kind of run, from the history layer's series
+    (exact, every attempt); None while loading or when it cannot tell (then the scope's
+    attempts stand in)."""
+    if not ctx.data.has("kind_series"):
+        return None
+    filt = make_filter(params)
+    found = value(ctx.hist(("kind-trends", name, filt_key(params), kinds),
+                           lambda r=name, f=filt, k=kinds: ctx.data.kind_trends(r, f, k)))
+    return None if found is None else found[1]
+
+
 def previous_types(ctx: Context, params: Dict[str, Any], name: str, dim: str) -> Entry:
     """GPU-hours per kind of run in the previous equal period, for the change column."""
     filt = make_filter(params)
@@ -1953,6 +1975,11 @@ def previous_types(ctx: Context, params: Dict[str, Any], name: str, dim: str) ->
         win = hd.previous_window(r, data.clock())
         if win is None:
             return None
+        if data.has("kind_series") and d != "name_family":  # GPU-seconds only: cheaper
+            _, per = data.history.kind_series(win, f, kinds=(d,),
+                                              cancel=getattr(data, "_cancel", None),
+                                              make_bins=lambda a, b: [a, b] if b > a else [a])
+            return {key: sum(values) / 3600.0 for key, values in per.get(d, {}).items()}
         if data.has("run_types"):
             found = data.history.run_types(win, f, by=d, cancel=getattr(data, "_cancel", None))
             return {item.key: (item.stats.gpu_hours or 0.0) for item in found}
@@ -1986,12 +2013,16 @@ def gpu_breakdown_pane(ctx: Context, view: View, params: Dict[str, Any]) -> Pane
                            lambda r=name, f=filt, d=dim: ctx.data.run_types(r, f, d))
     kinds = value(types_entry)
     before = value(previous_types(ctx, params, name, dim)) if name != "all" else None
-    attempts = value(scope_attempts(ctx, params, name))
     trends = {}  # type: Dict[Optional[str], List[float]]
-    if attempts is not None:
-        rows = attempts.rows
-        trends = breakdown.held_per_bin(rows, range_bins(ctx, name, rows), int(ctx.now),
-                                        lambda row, d=dim: hd._key(row, d))
+    exact = kind_trends(ctx, params, name, (dim,)) if dim != "name_family" else None
+    if exact is not None:
+        trends = dict(exact.get(dim, {}))
+    elif dim == "name_family" or not ctx.data.has("kind_series"):
+        attempts = value(scope_attempts(ctx, params, name))
+        if attempts is not None:
+            rows = attempts.rows
+            trends = breakdown.held_per_bin(rows, range_bins(ctx, name, rows), int(ctx.now),
+                                            lambda row, d=dim: hd._key(row, d))
     table = Table(BREAKDOWN_COLUMNS, ctx.width - 2)
     lines = []
     if kinds is None:
@@ -2050,18 +2081,25 @@ def roles_breakdown_pane(ctx: Context, params: Dict[str, Any], group: Optional[s
     if name != "all":
         prev = value(ctx.hist(("previous", name, filt_key(params), groups),
                               lambda r=name, f=filt: ctx.data.previous(r, f, groups)))
-    attempts = value(scope_attempts(ctx, params, name))
-    trends = {}  # type: Dict[Optional[str], List[float]]
-    if attempts is not None:
-        rows = attempts.rows
-        trends = breakdown.held_per_bin(rows, range_bins(ctx, name, rows), int(ctx.now),
-                                        lambda row: "\0".join((row.account, row.qos,
-                                                                 row.partition)))
     by_role = {}  # type: Dict[Tuple[str, str], List[float]]
-    for joined, bins in trends.items():
-        for role, part in zip(("account", "qos", "partition"), (joined or "").split("\0")):
-            have = by_role.get((role, part))
-            by_role[(role, part)] = bins if have is None else [a + b for a, b in zip(have, bins)]
+    exact = kind_trends(ctx, params, name, ("account", "qos", "partition"))
+    if exact is not None:
+        for role, per in exact.items():
+            for key, bins in per.items():
+                by_role[(role, key)] = bins
+    elif not ctx.data.has("kind_series"):
+        attempts = value(scope_attempts(ctx, params, name))
+        trends = {}  # type: Dict[Optional[str], List[float]]
+        if attempts is not None:
+            rows = attempts.rows
+            trends = breakdown.held_per_bin(rows, range_bins(ctx, name, rows), int(ctx.now),
+                                            lambda row: "\0".join((row.account, row.qos,
+                                                                     row.partition)))
+        for joined, bins in trends.items():
+            for role, part in zip(("account", "qos", "partition"), (joined or "").split("\0")):
+                have = by_role.get((role, part))
+                by_role[(role, part)] = bins if have is None else [a + b
+                                                                   for a, b in zip(have, bins)]
     table = Table(ROLE_BREAKDOWN_COLUMNS, ctx.width - 2)
     lines = []
     if report is None:
@@ -3098,7 +3136,7 @@ def help_screen(ctx: Context, view: View) -> List[Pane]:
 def me(ctx: Context, view: View) -> List[Pane]:
     user = ctx.snap.invoker.user if ctx.snap else view.params.get("user")
     if user is None:
-        user = ctx.app.user
+        user = ctx.app.user or ctx.app.invoker_name()  # known before the first snapshot
     view.params["user"] = user
     return person(ctx, view)
 

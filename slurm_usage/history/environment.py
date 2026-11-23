@@ -205,3 +205,69 @@ def capacity(runner: Any, cluster: Optional[str]) -> List[CapacityCheck]:
     believed_cpus = believed.get("cpu")
     return [CapacityCheck("gres/gpu", gpus, believed_gpus),
             CapacityCheck("cpu", cpus, int(believed_cpus) if believed_cpus is not None else None)]
+
+
+PROBE_TTL = 300.0  # seconds a probe of this cluster is reused by later runs
+_PROBE_FILE = "probe-v1.json"
+
+
+def _probe_key() -> List[str]:
+    import socket
+    return [str(os.geteuid()), os.environ.get("SLURM_CONF", ""), socket.gethostname()]
+
+
+def _to_json(env: Environment) -> Dict[str, Any]:
+    import dataclasses
+    out = dataclasses.asdict(env)
+    out["fields"] = sorted(env.fields) if env.fields is not None else None
+    out["notes"] = [list(n) for n in env.notes]
+    out["identity"] = list(env.identity)
+    return out
+
+
+def _from_json(found: Dict[str, Any]) -> Environment:
+    values = dict(found)
+    values["invoker"] = Invoker(**values["invoker"])
+    values["fields"] = frozenset(values["fields"]) if values["fields"] is not None else None
+    values["notes"] = [Note(*n) for n in values["notes"]]
+    values["identity"] = tuple(values["identity"])
+    return Environment(**values)
+
+
+def cached_probe(runner: Any, directory: Optional[str], clock: Any = None) -> Environment:
+    """probe(), reused for PROBE_TTL seconds from an owner-only file in the private cache
+    directory (``directory`` None: do not keep it). What it found is from Slurm and a
+    few minutes old at most; accounting that was unavailable is asked again each time."""
+    import json
+    import time
+    now = (clock or time.time)()
+    path = None
+    if directory is not None:
+        try:
+            from .store import private_dir
+            path = os.path.join(private_dir(directory), _PROBE_FILE)
+            handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                found = os.fstat(handle)
+                if found.st_uid == os.geteuid() and not found.st_mode & 0o077:
+                    with os.fdopen(os.dup(handle), "r", encoding="utf-8") as stream:
+                        kept = json.load(stream)
+                    if (kept.get("key") == _probe_key()
+                            and 0 <= now - float(kept.get("at", 0)) < PROBE_TTL):
+                        return _from_json(kept["env"])
+            finally:
+                os.close(handle)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    env = probe(runner)
+    if path is not None and env.accounting != Status.UNAVAILABLE:
+        try:
+            temporary = path + ".%d" % os.getpid()
+            handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                             0o600)
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                json.dump({"key": _probe_key(), "at": now, "env": _to_json(env)}, stream)
+            os.replace(temporary, path)
+        except (OSError, TypeError, ValueError):
+            pass
+    return env

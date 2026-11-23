@@ -17,7 +17,7 @@ PENDING, OK, FAILED = "pending", "ok", "failed"
 
 
 class Entry:
-    __slots__ = ("state", "value", "status", "message", "at", "future", "generation")
+    __slots__ = ("state", "value", "status", "message", "at", "future", "generation", "key")
 
     def __init__(self) -> None:
         self.state = PENDING
@@ -27,6 +27,7 @@ class Entry:
         self.at = None  # type: Optional[float]
         self.future = None  # type: Optional[Future]
         self.generation = None  # type: Any
+        self.key = None  # type: Hashable
 
     @property
     def ready(self) -> bool:
@@ -38,7 +39,13 @@ class Entry:
 
 
 class Loader:
-    def __init__(self, workers: int = 3, on_done: Optional[Callable[[], None]] = None) -> None:
+    """``seed``: an object with load(key) and save(key, value) (data.ResultCache): a key
+    seen for the first time starts with the value it had last time (marked as needing a
+    refresh), and every new value is handed to it."""
+
+    def __init__(self, workers: int = 3, on_done: Optional[Callable[[], None]] = None,
+                 seed: Any = None) -> None:
+        self.seed = seed
         self._pool = ThreadPoolExecutor(max_workers=workers) if workers > 0 else None
         self._entries = {}  # type: Dict[Hashable, Entry]
         self._lock = threading.Lock()
@@ -74,6 +81,12 @@ class Loader:
             entry = self._entries.get(key)
             if entry is None:
                 entry = self._entries[key] = Entry()
+                entry.key = key
+                if self.seed is not None:
+                    found = self.seed.load(key)
+                    if found is not None:  # last known: shown while the new one computes
+                        entry.value, entry.state, entry.at = found, OK, time.time()
+                        entry.status = Status.OK
             stale = entry.generation != wanted or (
                 max_age is not None and entry.at is not None and time.time() - entry.at > max_age)
             if entry.future is not None or not (stale or entry.at is None):
@@ -103,11 +116,29 @@ class Loader:
                 entry.state = FAILED
             entry.at = time.time()
             entry.future = None
+        if failure is None and self.seed is not None:
+            try:
+                self.seed.save(entry.key, value)
+            except Exception:
+                pass
         if self.on_done is not None:
             try:
                 self.on_done()
             except Exception:
                 pass
+
+    def drop_queued(self) -> int:
+        """Forget work that has not started (the screen it was for is gone): what is on
+        screen next is asked for again and goes first. Returns how many were dropped."""
+        dropped = 0
+        with self._lock:
+            for entry in self._entries.values():
+                future = entry.future
+                if future is not None and future.cancel():
+                    entry.future = None
+                    entry.generation = None  # asked again when next on screen
+                    dropped += 1
+        return dropped
 
     def submit(self, fn: Callable[[], Any]) -> None:
         """Fire and forget."""

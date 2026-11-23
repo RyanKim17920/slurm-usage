@@ -66,3 +66,21 @@ class Bucket(NamedTuple):
     start: int
     end: int
     value: int
+
+
+def day_edges(start: int, end: int) -> List[int]:
+    """Edges of local calendar days covering [start, end], first and last clipped: the
+    bins of Report.buckets(unit="day")."""
+    if end <= start:
+        return [start]
+    edges = [start]
+    day = local_date(start)
+    while True:
+        day += datetime.timedelta(days=1)
+        at = local_midnight(day)
+        if at >= end:
+            break
+        if at > edges[-1]:
+            edges.append(at)
+    edges.append(end)
+    return edges

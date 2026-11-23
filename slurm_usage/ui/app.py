@@ -8,6 +8,7 @@ ESC TAB BTAB BACKSPACE RESIZE.
 """
 
 import copy
+import os
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -82,7 +83,15 @@ class App:
         self.overlay = None  # type: Optional[str]  # "settings" while the box is open
         self.confirm = None  # type: Optional[str]  # an action waiting for y
         self.background = background
-        self.loader = Loader(workers=3 if background else 0)
+        # answers shown last time paint at once (never while anonymized)
+        seed = hd.ResultCache(self._raw_history,
+                              lambda: not self.anonymized and not self.no_history) \
+            if background and hasattr(hd, "ResultCache") else None
+        self.loader = Loader(workers=3 if background else 0, seed=seed)
+        if seed is not None and hasattr(data, "results"):
+            data.results = seed
+        hint = seed.get_meta("capacity") if seed is not None else None
+        self.capacity_hint = tuple(hint) if isinstance(hint, list) and len(hint) == 2 else None
         self.snapshot = None  # type: Any
         self.snapshot_entry = None  # type: Any
         self.snap_generation = 0
@@ -135,6 +144,8 @@ class App:
             auto = self.data.auto_ranges() if hasattr(self.data, "auto_ranges") else hd.RANGE_NAMES
             pending = [n for n in [self.range] + list(auto) if n not in self.data.loaded]
             if pending:
+                if not self.data.loaded:
+                    self._let_screen_go_first()
                 try:
                     first = not self.data.loaded
                     if not self.data.load(pending[0], update=first):
@@ -161,6 +172,17 @@ class App:
                 last_update = time.time()
 
     _forced = False
+    FIRST_WAIT = 3.0  # at most this long, the screen's answers from the cache go first
+
+    def _let_screen_go_first(self) -> None:
+        """Before the first refresh: let what is on screen be answered from the cache, so
+        Slurm's answer and its parsing do not compete with it; then refresh in place."""
+        deadline = time.time() + self.FIRST_WAIT
+        time.sleep(0.05)  # the first frame asks for its answers
+        while time.time() < deadline and not self._stop.is_set():
+            if not self.loader.busy:
+                return
+            time.sleep(0.05)
 
     def poll(self) -> None:
         """Ask for whatever is due. Never blocks when running in the background."""
@@ -169,6 +191,9 @@ class App:
         entry = self.loader.get(("snap",), self._raw_collector.snapshot,
                                 max_age=self.interval(), generation=self.refreshes)
         self.snapshot_entry = entry
+        seed = self.loader.seed
+        if seed is not None and seed.pending and not self.loader.busy:
+            self.loader.submit(seed.flush)  # kept for the next run, once nothing waits
         if entry.value is not None and entry.value is not self._raw_snapshot:
             self._raw_snapshot = entry.value
             self._derive_snapshot()
@@ -182,11 +207,31 @@ class App:
         else:
             self.snapshot = raw
         self.snap_generation += 1
+        if raw is not None and raw.totals is not None:
+            found = (raw.totals.gpus.total, raw.totals.cpus.total)
+            if found != self.capacity_hint:
+                self.capacity_hint = found
+                if self.loader.seed is not None:
+                    self.loader.seed.set_meta("capacity", list(found))
         if not self.no_history:
             self.history_info = self.loader.get(("info",), self.data.info, max_age=30,
                                                 generation=self.data.generation)
 
+    def invoker_name(self) -> Optional[str]:
+        """Who runs this, before any snapshot says so (pseudonymous when anonymizing)."""
+        try:
+            import pwd
+            name = pwd.getpwuid(os.geteuid()).pw_name  # type: Optional[str]
+        except (KeyError, ImportError, OSError):
+            return None
+        return self.anon.name("user", name) if self.anonymized and name else name
+
     def stop(self) -> None:
+        if self.loader.seed is not None:
+            try:
+                self.loader.seed.flush()
+            except Exception:
+                pass
         self._stop.set()
         self._wake.set()
         self.data.stop()
@@ -199,10 +244,12 @@ class App:
         return self.stack[-1]
 
     def go_tab(self, kind: str) -> None:
+        self.loader.drop_queued()  # the old screen's waiting work goes
         title = dict((k, t) for k, t, _, _ in TABS)[kind]
         self.stack = [View(kind, {}, title)]
 
     def push(self, kind: str, params: Dict[str, Any], title: str) -> None:
+        self.loader.drop_queued()  # the old screen's waiting work goes
         if len(self.stack) > 40:
             del self.stack[1:2]
         if kind == "range" and params.get("range") in hd.RANGE_NAMES:
@@ -214,11 +261,13 @@ class App:
         self.set_range(hd.RANGE_NAMES[max(0, min(len(hd.RANGE_NAMES) - 1, index))])
 
     def back(self) -> None:
+        self.loader.drop_queued()  # the old screen's waiting work goes
         if len(self.stack) > 1:
             self.stack.pop()
 
     def set_range(self, name: str) -> None:
         if name != self.range:
+            self.loader.drop_queued()  # the old range's waiting work goes
             self.range = name
             view = self.stack[-1] if self.stack else None
             if view is not None and view.kind == "range" and " · " in view.title:

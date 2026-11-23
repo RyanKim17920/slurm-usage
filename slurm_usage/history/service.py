@@ -1,25 +1,41 @@
 """History: the object a front end talks to."""
 
+from __future__ import annotations
+
 import threading
 import time
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..model import CapacityCheck, Invoker, Status
-from . import detail as detail_module
-from .aggregate import DEFAULT_GROUPS, build_report
-from .efficiency import load_efficiency
-from .environment import capacity, probe
+from .aggregate import DEFAULT_GROUPS, build_report, kind_bins
+from .records import outcome_of
+from .environment import cached_probe, capacity, probe
 from .errors import HistoryError, Note, ProgressFn, canceller
 from .ingest import Ingestor
-from .listing import JobPage, JobRow, list_attempts, list_jobs
 from .report import Report
-from . import events as events_module
 from . import runtypes
 from . import rollup as rollup_module
 from .select import Filter
 from .store import cache_name, open_store
-from .timeline import Window
+from .timeline import Window, day_edges, hour_edges
+
+
+class _Later:
+    """A module imported when first used: a summary run never needs these."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __getattr__(self, attr: str) -> Any:
+        import importlib
+        return getattr(importlib.import_module("." + self._name, __package__), attr)
+
+
+detail_module = _Later("detail")
+events_module = _Later("events")
+_listing = _Later("listing")
+_efficiency = _Later("efficiency")
 
 _FRESH = 600  # a window reaching "now" is complete if refreshed this recently
 
@@ -64,12 +80,24 @@ class History:
     def _open(self) -> None:
         with self._opening:
             if self._env is None:
-                env = probe(self.runner)
+                env = self._probe()
                 if env.accounting != Status.UNAVAILABLE:
                     self._store = open_store(self._cache_dir, cache_name(*env.identity),
                                              self._persist)
                     self._ingest = Ingestor(self.runner, self._store, env)
                 self._env = env
+
+    def _probe(self) -> Any:
+        """Slurm's configuration and what this invoker may see, kept a few minutes in the
+        cache directory when history persists (a new run need not ask again)."""
+        if not self._persist or self.runner.__class__.__name__ != "Runner":
+            return probe(self.runner)
+        from .store import default_cache_dir
+        try:
+            directory = self._cache_dir or default_cache_dir()
+        except OSError:
+            directory = None
+        return cached_probe(self.runner, directory, self._clock)
 
     def _require(self) -> None:
         self._open()
@@ -177,6 +205,33 @@ class History:
         until = now if window.end is None else min(now, window.end)
         return covered and until - to <= _FRESH
 
+    def kind_series(self, window: Optional[Window] = None, where: Optional[Filter] = None,
+                    kinds: Sequence[str] = ("gpu_count",), cancel: Any = None,
+                    make_bins: Any = None) -> Tuple[List[int], Dict[str, Dict[str, List[int]]]]:
+        """GPU-seconds per bin for each kind of run, by gpu_count, outcome or a role:
+        (edges, {kind: {key: values}}). Bins are make_bins(start, end) (edges on whole
+        hours), else local hours. Sums to query()'s GPU series."""
+        as_of = self._as_of()
+        edges, found = kind_bins(self._store, as_of, window or Window(), where,
+                                 make_bins or hour_edges, self._gpu_tracked(), cancel)
+        dims = self._store.dims()
+        out = {kind: {} for kind in kinds}  # type: Dict[str, Dict[str, List[int]]]
+        for (dim, gpus, ended), values in found.items():
+            roles = dims.get(dim)
+            if roles is None:
+                continue
+            for kind in kinds:
+                if kind == "gpu_count":
+                    key = "unknown" if gpus is None else str(gpus)
+                elif kind == "outcome":
+                    key = outcome_of(roles.state, ended)
+                else:
+                    key = getattr(roles, kind)
+                have = out[kind].get(key)
+                out[kind][key] = list(values) if have is None else [
+                    a + b for a, b in zip(have, values)]
+        return edges, out
+
     def jobs(self, window: Optional[Window] = None, where: Optional[Filter] = None,
              by: str = "job", sort: str = "gpu", descending: bool = True, limit: int = 200,
              offset: int = 0, cancel: Any = None,
@@ -185,21 +240,22 @@ class History:
         id, name or user contains it (case-insensitive); page.total counts the matches."""
         window = window or Window()
         as_of = self._as_of()
-        page = list_jobs(self._store, as_of, window, where, by, sort, descending, limit, offset,
+        page = _listing.list_jobs(self._store, as_of, window, where, by, sort, descending,
+                                  limit, offset,
                          cancel, run_type, match)
         page.complete = self._is_complete(window)
         return page
 
     def attempts(self, job_id: object) -> List[JobRow]:
         as_of = self._as_of()
-        return list_attempts(self._store, as_of, detail_module.check_job_id(job_id))
+        return _listing.list_attempts(self._store, as_of, detail_module.check_job_id(job_id))
 
     def load_efficiency(self, window: Optional[Window] = None, where: Optional[Filter] = None,
                         progress: ProgressFn = None, cancel: Any = None) -> int:
         """Read step usage for any user or the whole cluster; then query(efficiency=True)."""
         as_of = self._as_of()
         with self._working:
-            return load_efficiency(self.runner, self._store, self._env, as_of, window,
+            return _efficiency.load_efficiency(self.runner, self._store, self._env, as_of, window,
                                    where or Filter(), progress, canceller(cancel))
 
     def detail(self, job_id: object, cancel: Any = None) -> detail_module.JobDetail:
@@ -245,13 +301,21 @@ class History:
         # baselines only from fully loaded history, never from ingest's overlap
         prior = (window.start is not None and report.start > 0 and length > 0
                  and events_module.prior_loaded(covered_from, report.start, length))
-        prior_best = None
-        if prior:
+        prior_best = previous = None
+        if prior and self._gpu_tracked():
+            # GPU-seconds per local day only: the aggregates answer these without the
+            # counts a full query makes
+            edges, daily = kind_bins(self._store, as_of, Window(None, report.start), where,
+                                     day_edges, True, cancel)
+            if len(edges) > 1 and edges[-1] > edges[0]:
+                prior_best = max([sum(values) for values in zip(*daily.values())] or [0])
+            _, before = kind_bins(self._store, as_of, Window(report.start - length, report.start),
+                                 where, lambda a, b: [a, b] if b > a else [a], True, cancel)
+            previous = sum(sum(values) for values in before.values())
+        elif prior:
             before = self.query(Window(None, report.start), where, group_by=(), cancel=cancel)
             if before.end > before.start:
                 prior_best = max([b.value for b in before.buckets("gpu", "day") or ()] or [0])
-        previous = None
-        if prior:
             previous = self.query(Window(report.start - length, report.start), where,
                                   group_by=(), cancel=cancel).total.amount("gpu")
         return events_module.add_period_events(found, days, prior_best,
@@ -277,6 +341,14 @@ class History:
                                         gpu_capacity, cpu_capacity, ranges, metric)
         result.notes = self._notes()
         return result
+
+    def generation(self) -> Optional[Tuple[str, int]]:
+        """(cache file, its data generation), or None: equal values give equal overviews."""
+        self._open()
+        if self._store is None or not self._store.path:
+            return None
+        found = self._store.generation()
+        return None if found is None else (self._store.path, found)
 
     def capacity(self) -> List[CapacityCheck]:
         self._open()

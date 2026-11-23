@@ -109,11 +109,11 @@ def _history(args: argparse.Namespace) -> Any:
 def build(args: argparse.Namespace) -> Any:
     from .live import LiveCollector
     from .ui import data as hd
-    from .ui.anonymize import AnonCollector, AnonHistory, Anonymizer
-    collector = LiveCollector()  # type: Any
+    collector = getattr(args, "collector", None) or LiveCollector()  # type: Any
     data = _history(args)
     anon = None
     if args.anonymize:
+        from .ui.anonymize import AnonCollector, AnonHistory, Anonymizer
         anon = Anonymizer()
         collector = AnonCollector(collector, anon)
         if not isinstance(data.history, hd.NoHistory):
@@ -121,15 +121,38 @@ def build(args: argparse.Namespace) -> Any:
     return collector, data, anon
 
 
+_BUILD = build
+
+
 def run_once(args: argparse.Namespace, out: Any = None) -> int:
+    # the live snapshot is mostly waiting for Slurm: start it first, then import and
+    # load history while it runs
+    import threading
+    live = {}  # type: dict
+    raw = None  # type: Any
+    if not args.anonymize and build is _BUILD:  # (tests put in their own build())
+        from .live import LiveCollector
+        raw = LiveCollector()
+
+    def take(collector: Any) -> None:
+        try:
+            live["snap"] = collector.snapshot()
+        except Exception as error:
+            live["error"] = error
+    taking = None  # type: Any
+    if raw is not None:
+        taking = threading.Thread(target=take, args=(raw,), name="snapshot", daemon=True)
+        taking.start()
     from .ui import text
     out = out or sys.stdout
+    args.collector = raw  # the one already taking a snapshot
     collector, data, anon = build(args)
-    try:
-        snap = collector.snapshot()
-    except Exception as error:
-        snap = None
-        print("live: %s" % error, file=sys.stderr)
+    if taking is None:
+        taking = threading.Thread(target=take, args=(collector,), name="snapshot", daemon=True)
+        taking.start()
+    if anon is None and hasattr(hd_module(), "ResultCache"):
+        # an overview kept by an earlier run (the app's, say) of the same data is reused
+        data.results = hd_module().ResultCache(data.history)
     user, account = args.user, args.account
     if anon is not None:  # flags name real people; outputs use pseudonyms
         user = anon.name("user", user) if user else None
@@ -145,7 +168,8 @@ def run_once(args: argparse.Namespace, out: Any = None) -> int:
                 sys.stderr.flush()
         data._progress = progress  # type: ignore
         try:
-            data.load(args.range)
+            if not _fresh(data, args.range):
+                data.load(args.range)
         except Exception:
             pass
         if not quiet:
@@ -154,6 +178,14 @@ def run_once(args: argparse.Namespace, out: Any = None) -> int:
             info = data.info()
         except Exception:
             info = None
+        try:
+            data.overview(None, None)  # the slow part of the summary, while live is taken
+        except Exception:
+            pass
+    taking.join()
+    snap = live.get("snap")
+    if "error" in live:
+        print("live: %s" % live["error"], file=sys.stderr)
     summary = text.collect(snap, None if no_history else data, args.range, user, account, info)
     if anon is not None:
         summary["anonymized"] = True
@@ -161,7 +193,33 @@ def run_once(args: argparse.Namespace, out: Any = None) -> int:
         write(out, text.to_json(summary) + "\n")
     else:
         write(out, text.render(summary), ascii_only=wants_ascii(out))
+    if getattr(data, "results", None) is not None:
+        out.flush()
+        data.results.flush()  # after the output: kept for the next run
     return 0
+
+
+def hd_module() -> Any:
+    from .ui import data as hd
+    return hd
+
+
+FRESH = 60.0  # history refreshed this recently (by the app, say) is used as it is
+
+
+def _fresh(data: Any, range_name: str) -> bool:
+    """Whether the cache already holds ``range_name`` up to a minute ago."""
+    import time
+    from .ui import data as hd
+    try:
+        info = data.history.info()
+    except Exception:
+        return False
+    covered, as_of = getattr(info, "covered_from", None), getattr(info, "as_of", None)
+    if covered is None or as_of is None or time.time() - as_of > FRESH:
+        return False
+    start = hd.window(range_name).start
+    return covered == 0 or (start is not None and covered <= start)
 
 
 def write(out: Any, body: str, ascii_only: bool = False) -> None:

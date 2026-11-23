@@ -178,7 +178,7 @@ class SqliteStore(_Base):
             except sqlite3.Error as error:
                 raise HistoryError("error", "history cache: %s" % error)
 
-    def _write(self, work) -> None:
+    def _write(self, work, quiet: bool = False) -> None:
         with self.lock:
             try:
                 # One transaction from the first read on: otherwise each SELECT takes and
@@ -186,6 +186,9 @@ class SqliteStore(_Base):
                 if not self._db.in_transaction:
                     self._db.execute("BEGIN IMMEDIATE")
                 work(self._db)
+                if not quiet:  # a generation that later runs can compare with
+                    self._db.execute("INSERT OR REPLACE INTO meta VALUES('gen', COALESCE("
+                                     "(SELECT v FROM meta WHERE k='gen'), 0) + 1)")
                 self._db.commit()
             except sqlite3.Error as error:
                 self._db.rollback()
@@ -201,9 +204,26 @@ class SqliteStore(_Base):
         found = self._select("SELECT v FROM meta WHERE k=?", (key,))
         return json.loads(found[0][0]) if found else default
 
+    def generation(self) -> Optional[int]:
+        """Bumped by every change to the data, by any process: equal generations, equal
+        answers (for a fixed window)."""
+        return self.get_meta("gen", 0)
+
+    # bookkeeping that never changes an answer: writing it does not change ``version``
+    QUIET_META = frozenset(("lookback_at",))
+
     def set_meta(self, key: str, value: Any) -> None:
-        self._write(lambda db: db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)",
-                                          (key, json.dumps(value))))
+        text = json.dumps(value)
+        with self.lock:
+            found = self._select("SELECT v FROM meta WHERE k=?", (key,))
+            if found and found[0][0] == text:
+                return  # unchanged: nothing to write, nothing to recompute
+            version = self.version
+            quiet = key in self.QUIET_META
+            self._write(lambda db: db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)",
+                                              (key, text)), quiet)
+            if quiet:
+                self.version = version
 
     def _intern(self, db, table: str, cache: dict, value: Any, text: str) -> int:
         found = cache.get(value)
@@ -304,7 +324,8 @@ class SqliteStore(_Base):
         return [r[:3] + (((r[3] or 0) << 20) + (r[4] or 0),) + tuple(r[5:]) for r in found]
 
     def rollup_segments(self, bounds: Sequence[int], high: int) -> List[tuple]:
-        """rollup_sum()'s columns and a row count per (dim, segment) for hours before
+        """rollup_sum()'s columns, a row count and the first and last hour per (dim,
+        segment) for hours before
         ``high``: segment i
         holds the hours from bounds[i] (descending) up to the previous bound, or ``high``;
         segment len(bounds) holds everything older."""
@@ -313,7 +334,8 @@ class SqliteStore(_Base):
         found = self._select(
             "SELECT dim,%s,sum(gpu),sum(cpu),sum(mem_mib),sum(mem_rest),sum(attempts),"
             "sum(cpu_cov),sum(cpu_used),total(mem_cov),total(mem_used),sum(gpu_cov),"
-            "sum(gpu_used),count(*) FROM rollup WHERE hour<? GROUP BY 1,2" % case, (high,))
+            "sum(gpu_used),count(*),min(hour),max(hour) FROM rollup WHERE hour<? GROUP BY 1,2"
+            % case, (high,))
         return [r[:4] + (((r[4] or 0) << 20) + (r[5] or 0),) + tuple(r[6:]) for r in found]
 
     def rollup_series(self, low: int, high: int, step: int) -> List[Tuple[int, int, int]]:
@@ -387,11 +409,18 @@ class SqliteStore(_Base):
             starts[name(r)] = tuple(r[2:])
         return hours, starts
 
-    def agg_series(self, low: int, high: int, dim_ids: Optional[Set[int]], by_dim: bool
-                   ) -> List[tuple]:
-        """(hour, dim or None, gpu, cpu, mem) per hour in [low, high)."""
+    def agg_series(self, low: int, high: int, dim_ids: Optional[Set[int]],
+                   mode: Optional[str]) -> List[tuple]:
+        """(hour, key, gpu, cpu, mem) per hour in [low, high); key is None, the dim
+        (mode "dim") or (dim, GPUs per allocation or None) (mode "dimgpus")."""
         where = self._dims_sql(dim_ids)
-        if by_dim:
+        if mode == "dimgpus":
+            return [(r[0], (r[1], None if r[2] == -1 else r[2]), r[3], r[4], (r[5] << 20) + r[6])
+                    for r in self._select(
+                        "SELECT hour,dim,gpus,sum(gpu),sum(cpu),sum(mem_mib),sum(mem_rest) FROM "
+                        "agg_hour WHERE hour>=? AND hour<?%s GROUP BY hour,dim,gpus" % where,
+                        (low, high))]
+        if mode == "dim":
             return [(r[0], r[1], r[2], r[3], (r[4] << 20) + r[5]) for r in self._select(
                 "SELECT hour,dim,sum(gpu),sum(cpu),sum(mem_mib),sum(mem_rest) FROM agg_hour "
                 "WHERE hour>=? AND hour<?%s GROUP BY hour,dim" % where, (low, high))]
@@ -399,6 +428,18 @@ class SqliteStore(_Base):
                 for r in self._select(
                     "SELECT hour,sum(gpu),sum(cpu),sum(mem_mib),sum(mem_rest) FROM agg_hour "
                     "WHERE hour>=? AND hour<?%s GROUP BY hour" % where, (low, high))]
+
+    def agg_binned(self, low: int, high: int, dim_ids: Optional[Set[int]],
+                   bounds: Sequence[int]) -> List[tuple]:
+        """(bin, dim, gpus or None, GPU-seconds) of finished allocations over hours [low,
+        high), bin i holding the hours from low (or bounds[i]) to the next bound."""
+        cuts = sorted(set(b for b in bounds if low < b < high))
+        case = "CASE %s ELSE 0 END" % " ".join(
+            "WHEN hour>=%d THEN %d" % (b, len(cuts) - at) for at, b in
+            enumerate(reversed(cuts))) if cuts else "0"
+        return [(r[0], r[1], None if r[2] == -1 else r[2], r[3]) for r in self._select(
+            "SELECT %s,dim,gpus,sum(gpu) FROM agg_hour WHERE hour>=? AND hour<?%s "
+            "GROUP BY 1,2,3" % (case, self._dims_sql(dim_ids)), (low, high))]
 
     def agg_waits(self, low: int, high: int, dim_ids: Optional[Set[int]],
                   keyed: bool = False) -> List[Any]:
@@ -956,10 +997,17 @@ class MemoryStore(_Base):
         with self.lock:
             return self._meta.get(key, default)
 
+    def generation(self) -> Optional[int]:
+        return None  # nothing outlives the process
+
     def set_meta(self, key: str, value: Any) -> None:
         with self.lock:
-            self._meta[key] = json.loads(json.dumps(value))
-            self.version += 1
+            value = json.loads(json.dumps(value))
+            if self._meta.get(key, object()) == value:
+                return
+            self._meta[key] = value
+            if key not in SqliteStore.QUIET_META:
+                self.version += 1
 
     def put(self, records: Sequence[Record], generation: int) -> None:
         with self.lock:

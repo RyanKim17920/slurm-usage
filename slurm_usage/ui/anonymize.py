@@ -434,6 +434,13 @@ class AnonHistory:
             item.example = ""
         return found
 
+    def kind_series(self, window: Any = None, where: Any = None, kinds: Any = ("gpu_count",),
+                    **kwargs: Any) -> Any:
+        edges, found = self._history.kind_series(window, _translate(self._anon, where),
+                                                 kinds=kinds, **kwargs)
+        return edges, {kind: {self._pseudo_type(kind, key): values
+                              for key, values in per.items()} for kind, per in found.items()}
+
     def events(self, window: Any = None, where: Any = None, **kwargs: Any) -> Any:
         found = self._history.events(window, _translate(self._anon, where), **kwargs)
         anon = self._anon

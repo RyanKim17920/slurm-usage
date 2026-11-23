@@ -15,6 +15,9 @@ from .store import AGG_VERSION, OPEN_STOP
 from .timeline import HOUR, Window, hour_edges
 
 DEFAULT_GROUPS = (("user",), ("account",), ("qos",), ("partition",))
+# series_by=KIND_SERIES keys usage by (dim, GPUs per allocation, finished): the parts of
+# any kind of run (see History.kind_series)
+KIND_SERIES = "_kind"
 _PROGRESS_EVERY = 25000
 
 
@@ -78,6 +81,18 @@ class LazyStats(Stats):
         self._resolver = None  # type: Any
         Stats.__init__(self, gpu_tracked)
 
+    def __reduce__(self) -> Any:
+        """Pickled as plain Stats, without the pending full pass (its fields as known)."""
+        return (_plain_stats, ({name: Stats.__dict__[name].__get__(self, Stats)
+                                for name in Stats.__slots__},))
+
+
+def _plain_stats(values: Dict[str, Any]) -> Stats:
+    stats = Stats.__new__(Stats)
+    for name, value in values.items():
+        setattr(stats, name, value)
+    return stats
+
 
 def _lazy(name: str) -> property:
     slot = Stats.__dict__[name]
@@ -121,6 +136,9 @@ class _Waits(_SequenceABC):
 
     def __repr__(self) -> str:
         return repr(self._get())
+
+    def __reduce__(self) -> Any:
+        return (list, (list(self._get()),))
 
 
 class _Pass:
@@ -244,6 +262,8 @@ class _Pass:
         if by is not None:
             if by == "node":
                 keyed = [(s[0], (s[2], s[1], s[3])[self.metric_at]) for s in part.shares or ()]
+            elif by == KIND_SERIES:
+                keyed = [((row[2], row[10], row[7] is not None), amounts[self.metric_at])]
             else:
                 keyed = [(_value(by, part.roles, part.outcome, NONE), amounts[self.metric_at])]
             for key, rate in keyed:
@@ -446,17 +466,21 @@ def _fast_pass(store: Any, chosen: Selection, span: Any, state: _Pass, hours: Tu
 
     edges, by = state.edges, state.series_by
     metric_at = state.metric_at
-    for hour, dim, gpu, cpu, mem in store.agg_series(low, high, finished_dims, by is not None):
+    mode = None if by is None else "dimgpus" if by == KIND_SERIES else "dim"
+    for hour, dim, gpu, cpu, mem in store.agg_series(low, high, finished_dims, mode):
         i = bisect_right(edges, hour) - 1
         for series, amount in zip(state.series, (gpu, cpu, mem)):
             if amount:
                 series.partial[i] += amount
         if by is not None:
+            if by == KIND_SERIES:
+                dim, size = dim
             roles = dims.get(dim)
             amount = (gpu, cpu, mem)[metric_at]
             if roles is None or not amount:
                 continue
-            key = _value(by, roles, outcome_of(roles.state, True), NONE)
+            key = (dim, size, True) if by == KIND_SERIES else \
+                _value(by, roles, outcome_of(roles.state, True), NONE)
             if key not in state.keyed:
                 state.keyed[key] = Series(edges)
             state.keyed[key].partial[i] += amount
@@ -501,7 +525,7 @@ def build_report(store: Any, as_of: int, window: Optional[Window] = None,
     specs = _group_specs(group_by)
     if lanes_metric is not None and lanes_metric not in METRICS:
         raise ValueError("unknown metric: %s" % lanes_metric)
-    for role in (series_by, lanes_by):
+    for role in (series_by if series_by != KIND_SERIES else None, lanes_by):
         if role is not None and role not in ROLES:
             raise ValueError("unknown role: %s" % role)
     if series_metric not in METRICS:
@@ -615,3 +639,67 @@ def _defer(state: _Pass, exact: Any) -> None:
 
     for _, _, stats in members:
         stats._resolver = resolve_all
+
+
+def kind_bins(store: Any, as_of: int, window: Optional[Window], where: Optional[Filter],
+              make_bins: Any, gpu_tracked: Optional[bool] = None, cancel: Any = None
+              ) -> Tuple[List[int], Dict[tuple, List[int]]]:
+    """GPU-seconds per bin of make_bins(start, end) (edges on whole hours inside the
+    window), keyed (dim, GPUs per allocation, finished): build_report(series_by=
+    KIND_SERIES) summed into those bins, read from the aggregates where it can be."""
+    window, where, cancelled = window or Window(), where or Filter(), canceller(cancel)
+    with store.lock:
+        chosen = Selection(store.dims(), {}, where)
+        first = store.first_start(chosen.dim_ids) if window.start is None else None
+        span = resolve(window, as_of, first)
+        bins = list(make_bins(span.start, span.end))
+        hours = None if len(bins) < 2 or bins[0] != span.start or bins[-1] != span.end \
+            else _fast_span(store, span, bins)
+        if hours is None:
+            report = build_report(store, as_of, window, where, (), series_by=KIND_SERIES,
+                                  gpu_tracked=gpu_tracked, cancel=cancel)
+            out = {}  # type: Dict[tuple, List[int]]
+            for key, values in report.keyed_values.items():
+                summed = [0] * max(0, len(bins) - 1)
+                for at, value in enumerate(values):
+                    if value:
+                        index = bisect_right(bins, report.edges[at]) - 1
+                        summed[min(len(summed) - 1, max(0, index))] += value
+                out[key] = summed
+            return bins, out
+        low, high = hours
+        state = _Pass([("outcome",)], gpu_tracked, bins, KIND_SERIES, "gpu", None, 1)
+        rows = store.scan_edges(span.start, low, high, span.high, chosen.dim_ids)
+        for number, part in enumerate(chosen.parts(rows, span)):
+            if not number % 1024 and cancelled():
+                raise Cancelled()
+            row, p, q = part.row, part.start, part.stop
+            if row[7] is not None and span.low is not None and row[7] < span.low:
+                continue
+            if q <= p or part.problem:
+                continue
+            if row[7] is None or row[7] < row[6]:
+                state.draw(part)
+                continue
+            for a, b in ((p, min(q, low)), (max(p, high), q)):
+                if b > a:
+                    state.draw(part._replace(start=a, stop=b))
+        dims, outcomes = chosen.dims, where.outcome
+        finished = None  # type: Optional[Set[int]]
+        if chosen.dim_ids is not None or outcomes is not None:
+            finished = {d for d in (chosen.dim_ids if chosen.dim_ids is not None else dims)
+                        if d in dims and (outcomes is None
+                                          or outcome_of(dims[d].state, True) in outcomes)}
+        inside = [b for b in bins if low <= b <= high]
+        found = store.agg_binned(low, high, finished, inside)
+    out = {key: series.values() for key, series in state.keyed.items()}
+    first_bin = bisect_right(bins, low) - 1
+    for at, dim, gpus, amount in found:
+        if not amount or dim not in dims:
+            continue
+        key = (dim, gpus, True)
+        values = out.get(key)
+        if values is None:
+            values = out[key] = [0] * (len(bins) - 1)
+        values[first_bin + at] += amount
+    return bins, out

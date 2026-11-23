@@ -8,7 +8,7 @@ from tests.test_history_support import H, T0, FakeSlurm, job, make_history, step
 
 from slurm_usage.history import Filter, Window
 from slurm_usage.history import events as events_module
-from slurm_usage.history.aggregate import LAZY_FIELDS, build_report
+from slurm_usage.history.aggregate import KIND_SERIES, LAZY_FIELDS, build_report
 from slurm_usage.history.stats import Stats
 from slurm_usage.history.store import AGG_VERSION, LONG
 
@@ -119,7 +119,7 @@ class FastEqualsExact(unittest.TestCase):
             for where in filters:
                 efficiency = rnd.random() < 0.5
                 group = rnd.choice(groups)
-                series = rnd.choice([None, "account", "user"])
+                series = rnd.choice([None, "account", "user", KIND_SERIES])
                 kwargs = dict(series_by=series, efficiency=efficiency, gpu_tracked=True)
                 if lanes:
                     kwargs.update(lanes_by=rnd.choice(["user", "account"]),

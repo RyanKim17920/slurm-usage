@@ -123,6 +123,9 @@ class RangeSummary:
     series_step: int = HOUR
     gpu_series: List[int] = field(default_factory=list)
     cpu_series: List[int] = field(default_factory=list)
+    # the seconds utilization is measured over, this range's and the previous period's
+    span: int = 0
+    previous_span: int = 0
 
     def spark(self) -> List[int]:
         """GPU usage per bin, or CPU usage on a cluster without GPU usage."""
@@ -290,56 +293,73 @@ def _sum(store: Any, low: int, high: int, dims: Dict[int, Any]
     return total, accounts, users
 
 
-def _segments(store: Any, end: int, earliest: Optional[int], ranges: Any,
-              dims: Dict[int, Any]) -> Any:
-    """_sum() for the spans the ranges need, from one grouped read of the rollup."""
+def _segments(store: Any, end: int, ranges: Any, dims: Dict[int, Any]) -> Tuple[Any, list]:
+    """(_sum() for the spans the ranges need, (dim, first hour, last hour) with usage),
+    from one grouped read of the rollup."""
     if not hasattr(store, "rollup_segments"):
-        return lambda low, high: _sum(store, low, high, dims)
+        return (lambda low, high: _sum(store, low, high, dims)), store.rollup_activity()
     bounds = {end - length for _, length in ranges if length is not None}
     bounds |= {end - 2 * length for _, length in ranges if length is not None}
-    if earliest is not None:
-        bounds.add(earliest)
     bounds.add(end)
     order = sorted(bounds, reverse=True)  # order[0] == end: segment 0 is empty
     width = 11
     per_dim = {}  # type: Dict[int, List[list]]
+    spans = {}  # type: Dict[int, List[int]]
     for row in store.rollup_segments(order, end):
         dim, segment = row[0], row[1]
         found = per_dim.get(dim)
         if found is None:
             found = per_dim[dim] = [[0] * width for _ in range(len(order) + 1)]
-        found[segment] = [value or 0 for value in row[2:]]
+        found[segment] = [value or 0 for value in row[2:13]]
+        pair = spans.setdefault(dim, [row[13], row[14]])
+        pair[0], pair[1] = min(pair[0], row[13]), max(pair[1], row[14])
+    oldest = min((pair[0] for pair in spans.values()), default=None)
     position = {bound: at for at, bound in enumerate(order)}
-    # cumulative[dim][k]: hours from order[k] up to end, i.e. segments 1..k
-    cumulative = {}  # type: Dict[int, List[tuple]]
+    # usage by (account, user): what overview() reports; cumulative[k] holds the hours
+    # from order[k] up to end, i.e. segments 1..k
+    by_role = {}  # type: Dict[Tuple[str, str], List[list]]
     for dim, parts in per_dim.items():
+        roles = dims.get(dim)
+        if roles is None:
+            continue
+        key = (roles.account, roles.user)
+        have = by_role.get(key)
+        if have is None:
+            by_role[key] = [list(part) for part in parts]
+        else:
+            for into, part in zip(have, parts):
+                for at, value in enumerate(part):
+                    into[at] += value
+    cumulative = {}  # type: Dict[Tuple[str, str], List[tuple]]
+    for key, parts in by_role.items():
         running, out = [0] * width, []
         for at, part in enumerate(parts):
             if at:
                 running = [a + b for a, b in zip(running, part)]
             out.append(tuple(running))
-        cumulative[dim] = out
+        cumulative[key] = out
 
     def summed(low: int, high: int) -> Tuple[Amounts, Dict[str, Amounts],
                                               Dict[Tuple[str, str], Amounts]]:
         a, b = position.get(low), position.get(high)
+        if a is None and oldest is not None and low <= oldest:
+            a = len(order)  # everything there is
+        if a is None and oldest is None:
+            a = len(order)
         if a is None or b is None or a < b:
             return _sum(store, low, high, dims)
         total, accounts, users = Amounts(), {}, {}  # type: Amounts, Dict[str, Amounts], Dict
-        for dim, values in cumulative.items():
-            roles = dims.get(dim)
-            if roles is None:
-                continue
+        for (account, user), values in cumulative.items():
             upper, lower = values[a], values[b]
             if upper[10] == lower[10]:
                 continue  # no rollup row in the span
             amounts = Amounts(tuple(x - y for x, y in zip(upper[:10], lower[:10])))
             total.add(amounts)
-            accounts.setdefault(roles.account, Amounts()).add(amounts)
-            users.setdefault((roles.account, roles.user), Amounts()).add(amounts)
+            accounts.setdefault(account, Amounts()).add(amounts)
+            users.setdefault((account, user), Amounts()).add(amounts)
         return total, accounts, users
 
-    return summed
+    return summed, [(dim, pair[0], pair[1]) for dim, pair in spans.items()]
 
 
 def overview(store: Any, as_of: int, covered_from: Optional[int], visibility: str,
@@ -351,7 +371,8 @@ def overview(store: Any, as_of: int, covered_from: Optional[int], visibility: st
     dirty = store.get_meta("dirty")
     built = store.get_meta("rollup_until")
     activity = {}  # type: Dict[str, List[int]]
-    for dim, first, last in store.rollup_activity():
+    summed, spans = _segments(store, end, ranges, dims)
+    for dim, first, last in spans:
         roles = dims.get(dim)
         if roles is not None:
             pair = activity.setdefault(roles.account, [first, last])
@@ -390,13 +411,13 @@ def overview(store: Any, as_of: int, covered_from: Optional[int], visibility: st
 
     lengths = [length for _, length in ranges]
     if any(length is None or length > 7 * DAY for length in lengths):
-        longest = (earliest if earliest is not None else end) if None in lengths else \
-            end - max(length for length in lengths if length)
-        binned(min(longest, end), DAY)  # the widest daily query first, so others slice it
+        starts = [end - length for length in lengths if length and length > 7 * DAY]
+        if None in lengths:
+            starts.append(earliest if earliest is not None else end)
+        binned(min(min(starts), end), DAY)  # the widest daily query first, so others slice it
     if any(length is not None and length <= 7 * DAY for length in lengths):
         binned(end - max(length for length in lengths if length and length <= 7 * DAY), HOUR)
 
-    summed = _segments(store, end, earliest, ranges, dims)
     for name, length in ranges:
         start = (earliest if earliest is not None else end) if length is None else end - length
         total, accounts, users = summed(start, end)
@@ -420,6 +441,7 @@ def overview(store: Any, as_of: int, covered_from: Optional[int], visibility: st
             share(total.cpu_seconds, cpu_capacity, span),
             share(previous.gpu_seconds, gpu_capacity, before) if previous else None, {},
             complete)
+        summary.span, summary.previous_span = span, before
         summary.series_step = HOUR if length is not None and length <= 7 * DAY else DAY
         summary.gpu_series, summary.cpu_series = binned(start, summary.series_step)
         grand = total.amount(metric)
@@ -433,6 +455,28 @@ def overview(store: Any, as_of: int, covered_from: Optional[int], visibility: st
                 counts.get(account, 0))
         result.ranges.append(summary)
     return result
+
+
+def with_capacity(found: Overview, gpu_capacity: Optional[int],
+                  cpu_capacity: Optional[int]) -> Overview:
+    """``found`` (computed for any capacity) with its utilizations for these capacities,
+    as overview() would give them; ``found`` itself is not changed."""
+    import copy
+
+    def share(seconds: int, capacity: Optional[int], width: int) -> Optional[float]:
+        return seconds / (capacity * width) if capacity and width > 0 else None
+
+    out = copy.copy(found)
+    out.ranges = []
+    for summary in found.ranges:
+        summary = copy.copy(summary)
+        summary.gpu_utilization = share(summary.total.gpu_seconds, gpu_capacity, summary.span)
+        summary.cpu_utilization = share(summary.total.cpu_seconds, cpu_capacity, summary.span)
+        summary.previous_gpu_utilization = share(
+            summary.previous.gpu_seconds, gpu_capacity, summary.previous_span) \
+            if summary.previous else None
+        out.ranges.append(summary)
+    return out
 
 
 def describe_span(start: int, end: int) -> str:
