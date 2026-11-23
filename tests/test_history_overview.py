@@ -22,6 +22,7 @@ class RollupTest(unittest.TestCase):
         ]
         self.fake = FakeSlurm(jobs, now=self.now, live=[3])
         self.h = make_history(self.fake)
+        self.h.ROLLUP_BETWEEN = False  # these tests build the rollup themselves
         self.h.refresh()
 
     def ranges(self):

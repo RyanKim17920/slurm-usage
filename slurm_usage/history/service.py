@@ -11,7 +11,7 @@ from ..model import CapacityCheck, Invoker, Status
 from .aggregate import DEFAULT_GROUPS, build_report, kind_bins
 from .records import outcome_of
 from .environment import cached_probe, capacity, probe
-from .errors import HistoryError, Note, ProgressFn, canceller
+from .errors import Cancelled, HistoryError, Note, ProgressFn, canceller
 from .ingest import Ingestor
 from .report import Report
 from . import runtypes
@@ -162,14 +162,29 @@ class History:
         """
         self._require()
         low = None if window is None else window.start
-        with self._working:
+        cancelled = canceller(cancel)
+
+        def between() -> None:  # on the ingest's writer thread, between pieces
+            known = self._ingest.coverage()
+            if known is None or cancelled():
+                return
             try:
-                self._ingest.update(low, int(self._clock()), update, progress, canceller(cancel))
+                rollup_module.build(self._store, known[1], None, cancelled, floor=known[0])
+            except (HistoryError, Cancelled):
+                pass  # build_rollup() does it afterwards
+        with self._working:
+            self._ingest.between = between if self.ROLLUP_BETWEEN else None
+            try:
+                self._ingest.update(low, int(self._clock()), update, progress, cancelled)
             except HistoryError as error:
                 self._failure = error
                 raise
+            finally:
+                self._ingest.between = None
             self._failure = None
         return self.info()
+
+    ROLLUP_BETWEEN = True  # build the rollup of what a first load has read, as it goes
 
     def query(self, window: Optional[Window] = None, where: Optional[Filter] = None,
               group_by: Sequence[Any] = DEFAULT_GROUPS, series_by: Optional[str] = None,
@@ -207,13 +222,22 @@ class History:
 
     def kind_series(self, window: Optional[Window] = None, where: Optional[Filter] = None,
                     kinds: Sequence[str] = ("gpu_count",), cancel: Any = None,
-                    make_bins: Any = None) -> Tuple[List[int], Dict[str, Dict[str, List[int]]]]:
+                    make_bins: Any = None
+                    ) -> Optional[Tuple[List[int], Dict[str, Dict[str, List[int]]]]]:
         """GPU-seconds per bin for each kind of run, by gpu_count, outcome or a role:
         (edges, {kind: {key: values}}). Bins are make_bins(start, end) (edges on whole
-        hours), else local hours. Sums to query()'s GPU series."""
+        hours), else local hours. Sums to query()'s GPU series. By name_family (asked
+        alone): from the family aggregates, None when they cannot answer."""
         as_of = self._as_of()
-        edges, found = kind_bins(self._store, as_of, window or Window(), where,
-                                 make_bins or hour_edges, self._gpu_tracked(), cancel)
+        family = "name_family" in kinds
+        if family and len(kinds) > 1:
+            raise ValueError("name_family goes alone")
+        got = kind_bins(self._store, as_of, window or Window(), where,
+                        make_bins or hour_edges, self._gpu_tracked(), cancel,
+                        **({"by_family": True} if family else {}))
+        if got is None:  # by job-name family, and the family aggregates cannot tell
+            return None
+        edges, found = got
         dims = self._store.dims()
         out = {kind: {} for kind in kinds}  # type: Dict[str, Dict[str, List[int]]]
         for (dim, gpus, ended), values in found.items():
@@ -223,6 +247,8 @@ class History:
             for kind in kinds:
                 if kind == "gpu_count":
                     key = "unknown" if gpus is None else str(gpus)
+                elif kind == "name_family":
+                    key = gpus  # the family, in that place
                 elif kind == "outcome":
                     key = outcome_of(roles.state, ended)
                 else:

@@ -78,7 +78,7 @@ def find_events_scan(store: Any, as_of: int, window: Optional[Window], where: Op
     """find_events() by reading every row up to the window's end, in Python."""
     window, where, cancelled = window or Window(), where or Filter(), canceller(cancel)
     events = []  # type: List[Event]
-    with store.lock:
+    with store.reading():
         dims = store.dims()
         chosen = Selection(dims, {}, where)
         first = store.first_start(chosen.dim_ids)
@@ -255,7 +255,7 @@ def _find_events_sql(store: Any, as_of: int, window: Optional[Window], where: Op
     """find_events_scan()'s results with the baselines from before the window computed by
     SQLite: only the rows that started inside the window are read here."""
     window, where, cancelled = window or Window(), where or Filter(), canceller(cancel)
-    with store.lock:
+    with store.reading():
         dims = store.dims()
         chosen = Selection(dims, {}, where)
         first = store.first_start(chosen.dim_ids)

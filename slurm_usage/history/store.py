@@ -7,12 +7,14 @@ Python objects if this Python has no sqlite3.
 Every public method is safe to call from any thread.
 """
 
+import contextlib
 import hashlib
 from bisect import bisect_left
 import json
 import os
 import stat
 import threading
+import time
 from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 from .errors import HistoryError, Note
@@ -146,11 +148,26 @@ class _Base:
         self._fam_text = None  # type: Optional[Dict[int, str]]
         self._names_at = None  # type: Optional[int]  # version famnames was completed at
 
+    def _guard(self) -> Any:
+        """Held around a read: the lock, unless every thread reads on a connection of its
+        own (SqliteStore on a file)."""
+        return self.lock
+
+    def reading(self) -> Any:
+        """Around a computation of several reads: one consistent view of the data."""
+        return self.lock
+
+    def _once(self, cache: str) -> Any:
+        """Held while the cache kept on the store named ``cache`` is filled: a second
+        thread that wants it waits for it rather than reading the same rows again."""
+        return self.lock
+
     def repeated_jobs(self) -> Set[int]:
         """Job ids with more than one row: the only ones a distinct count must remember."""
-        with self.lock:
-            if self._repeated[0] != self.version:
-                self._repeated = (self.version, self._find_repeated())
+        with self._once("repeated"):
+            at = (self.version, self.generation())  # read before the rows
+            if self._repeated[0] != at:
+                self._repeated = (at, self._find_repeated())
             return self._repeated[1]
 
     def _find_repeated(self) -> Set[int]:
@@ -178,12 +195,30 @@ def _newest_first(rows: Iterable[tuple]) -> Iterator[tuple]:
         yield held
 
 
+class _Busy(Exception):
+    """A write found the file held by a read of this same process."""
+
+
 class SqliteStore(_Base):
+    parallel_reads = False  # see __init__
     def __init__(self, path: str = ":memory:") -> None:
         super().__init__()
         self.path = None if path == ":memory:" else path
         self.persistent = self.path is not None
         self._db = sqlite3.connect(path, timeout=15, check_same_thread=False)
+        # With parallel_reads (or SLURM_USAGE_PARALLEL=1), reads go to a connection per
+        # thread (on a file), so that answers worked out on different threads run at
+        # once: SQLite releases the GIL while it works, and a rollback journal lets
+        # readers share the file. Writes stay on self._db, one at a time under
+        # self.lock. Off by default: the app's answers are mostly Python, so side by
+        # side they only delayed the one on screen; --once turns it on.
+        self._parallel = self.persistent and bool(
+            self.parallel_reads or os.environ.get("SLURM_USAGE_PARALLEL"))
+        self._local = threading.local()
+        self._readers = {}  # type: Dict[int, Any]  # thread ident -> its connection
+        self._readers_lock = threading.Lock()
+        self._fills = {}  # type: Dict[str, Any]  # cache name -> lock held to fill it
+        self._reads_open = 0  # read transactions under way on this process's threads
         try:
             self._tune()
             self._db.executescript(_TABLES)
@@ -215,17 +250,113 @@ class SqliteStore(_Base):
     def close(self) -> None:
         with self.lock:
             self._db.close()
+            with self._readers_lock:
+                readers, self._readers = list(self._readers.values()), {}
+            for db in readers:
+                try:
+                    db.close()
+                except sqlite3.Error:
+                    pass
+
+    def _conn(self) -> Any:
+        """This thread's connection for reading (made on first use, closed with the
+        store or when its thread is gone)."""
+        if not self._parallel:
+            return self._db
+        db = getattr(self._local, "db", None)
+        if db is None:
+            db = sqlite3.connect(self.path, timeout=15, check_same_thread=False,
+                                 isolation_level=None)  # transactions only as asked
+            try:
+                db.execute("PRAGMA cache_size=-%d" % CACHE_KIB).fetchall()
+            except sqlite3.Error:
+                pass
+            self._local.db = db
+            alive = {t.ident for t in threading.enumerate()}
+            me = threading.get_ident()
+            with self._readers_lock:
+                # a finished thread's (its id may be this thread's now)
+                gone = [i for i in self._readers if i not in alive or i == me]
+                stale = [self._readers.pop(i) for i in gone]
+                self._readers[me] = db
+            for old in stale:
+                try:
+                    old.close()
+                except sqlite3.Error:
+                    pass
+        return db
+
+    def _guard(self) -> Any:
+        return contextlib.nullcontext() if self._parallel else self.lock
+
+    def _once(self, cache: str) -> Any:
+        if not self._parallel:
+            return self.lock
+        with self._readers_lock:
+            return self._fills.setdefault(cache, threading.RLock())
+
+    @contextlib.contextmanager
+    def reading(self) -> Iterator[None]:
+        """One read transaction on this thread's connection: every read inside sees the
+        same data, while other threads read too. A writer's commit waits for it (reads
+        here take a second at most) and a write from inside ends it first (_write)."""
+        if not self._parallel:
+            with self.lock:
+                yield
+            return
+        db = self._conn()
+        depth = getattr(self._local, "depth", 0)
+        began = depth == 0 and not db.in_transaction
+        if began:
+            db.execute("BEGIN")
+            with self._readers_lock:
+                self._reads_open += 1
+        self._local.depth = depth + 1
+        try:
+            yield
+        finally:
+            self._local.depth = depth
+            if began:
+                with self._readers_lock:
+                    self._reads_open -= 1
+                if db.in_transaction:
+                    try:
+                        db.execute("COMMIT")
+                    except sqlite3.Error:
+                        pass
 
     def _select(self, sql: str, args: Sequence[Any] = ()) -> List[tuple]:
-        with self.lock:
+        with self._guard():
             try:
-                return self._db.execute(sql, args).fetchall()
+                return self._conn().execute(sql, args).fetchall()
             except sqlite3.Error as error:
                 raise HistoryError("error", "history cache: %s" % error)
 
+    WRITE_PATIENCE = 600.0  # seconds a write waits for this process's own reads
+
     def _write(self, work, quiet: bool = False, same: bool = False) -> None:
+        """Retried while a read of this process (on another thread) keeps the commit
+        waiting longer than the connection's timeout: one store, one writer, as before
+        reads had their own connections."""
+        give_up = time.monotonic() + self.WRITE_PATIENCE
+        while True:
+            try:
+                return self._write_once(work, quiet, same)
+            except _Busy:
+                if time.monotonic() > give_up:
+                    raise HistoryError("error", "history cache: database is locked")
+                time.sleep(0.05)
+
+    def _write_once(self, work, quiet: bool, same: bool) -> None:
         """``same``: what is written changes no answer (an index of names), so the
         version that answers depend on stays."""
+        reader = getattr(self._local, "db", None) if self._parallel else None
+        if reader is not None and reader.in_transaction:
+            # this thread's own read would keep the commit waiting: let it go first
+            try:
+                reader.execute("COMMIT")
+            except sqlite3.Error:
+                pass
         with self.lock:
             try:
                 # One transaction from the first read on: otherwise each SELECT takes and
@@ -240,6 +371,9 @@ class SqliteStore(_Base):
             except sqlite3.Error as error:
                 self._db.rollback()
                 self._forget()
+                if (isinstance(error, sqlite3.OperationalError) and "locked" in str(error)
+                        and self._reads_open):
+                    raise _Busy()
                 raise HistoryError("error", "history cache: %s" % error)
             except BaseException:
                 self._db.rollback()
@@ -305,8 +439,10 @@ class SqliteStore(_Base):
             changed = []
             for row in rows:
                 old = stored.get(row[0])
-                if (old is not None and row[9] != OPEN_STOP and old[:16] == row[:16]
-                        and old[18] == row[18]):
+                # an unfinished row is rewritten (and unflagged) unless this same pass
+                # already wrote it as it is: pieces going back all read what still runs
+                if (old is not None and old[:16] == row[:16] and old[18] == row[18]
+                        and (row[9] != OPEN_STOP or old[17] == row[17])):
                     continue
                 changed.append(row)
             db.executemany("INSERT OR REPLACE INTO jobs VALUES(%s)" % ",".join("?" * 19),
@@ -420,7 +556,7 @@ class SqliteStore(_Base):
 
     def families(self) -> Dict[int, str]:
         """fams.id -> family, as interned so far."""
-        with self.lock:
+        with self._once("families"):
             found = getattr(self, "_fam_text", None)
             if found is None:
                 found = self._fam_text = dict(self._select("SELECT id,v FROM fams"))
@@ -428,21 +564,26 @@ class SqliteStore(_Base):
             return found
 
     def family_ids(self, texts: Iterable[str], intern: bool = True) -> Dict[str, int]:
-        """Each family's id; new ones interned (unless not ``intern``: left out)."""
+        """Each family's id; new ones interned (unless not ``intern``: left out). The
+        write is made holding no lock a read may wait on (a read holds the file)."""
         texts = set(texts)
-        with self.lock:
+        with self._once("families"):
             self.families()
             new = sorted(t for t in texts if t not in self._fam_ids)
-            if new and intern:
-                def work(db):
-                    db.executemany("INSERT OR IGNORE INTO fams(v) VALUES(?)",
-                                   [(t,) for t in new])
-                self._write(work, quiet=True, same=True)
-                for at in range(0, len(new), 500):  # only the new ones are read back
-                    part = new[at:at + 500]
-                    for fam, text in self._select("SELECT id,v FROM fams WHERE v IN (%s)"
-                                                  % ",".join("?" * len(part)), part):
-                        self._fam_text[fam], self._fam_ids[text] = text, fam
+        if new and intern:
+            def work(db):
+                db.executemany("INSERT OR IGNORE INTO fams(v) VALUES(?)", [(t,) for t in new])
+            self._write(work, quiet=True, same=True)
+            found = []
+            for at in range(0, len(new), 500):  # only the new ones are read back
+                part = new[at:at + 500]
+                found += self._select("SELECT id,v FROM fams WHERE v IN (%s)"
+                                      % ",".join("?" * len(part)), part)
+            with self._once("families"):
+                self.families()
+                for fam, text in found:
+                    self._fam_text[fam], self._fam_ids[text] = text, fam
+        with self._once("families"):
             known = self._fam_ids
             return {t: known[t] for t in texts if t in known}
 
@@ -479,7 +620,8 @@ class SqliteStore(_Base):
     def family_sql(self, family: str, column: str = "j.name") -> str:
         """A WHERE term keeping exactly the rows of one job-name family."""
         from .families import NO_NAME
-        self.name_families()
+        if not getattr(self._local, "depth", 0):  # inside a read: done by the caller first
+            self.name_families()
         fam = self.family_ids([family], intern=False).get(family)
         names = ("%s IN (SELECT name FROM famnames WHERE fam=%d)" % (column, fam)
                  if fam is not None else "0")
@@ -572,16 +714,25 @@ class SqliteStore(_Base):
                     "WHERE hour>=? AND hour<?%s GROUP BY hour" % where, (low, high))]
 
     def agg_binned(self, low: int, high: int, dim_ids: Optional[Set[int]],
-                   bounds: Sequence[int]) -> List[tuple]:
+                   bounds: Sequence[int], by_family: bool = False) -> List[tuple]:
         """(bin, dim, gpus or None, GPU-seconds) of finished allocations over hours [low,
-        high), bin i holding the hours from low (or bounds[i]) to the next bound."""
+        high), bin i holding the hours from low (or bounds[i]) to the next bound;
+        by_family: (bin, dim, job-name family, GPU-seconds)."""
         cuts = sorted(set(b for b in bounds if low < b < high))
         case = "CASE %s ELSE 0 END" % " ".join(
             "WHEN hour>=%d THEN %d" % (b, len(cuts) - at) for at, b in
             enumerate(reversed(cuts))) if cuts else "0"
-        return [(r[0], r[1], None if r[2] == -1 else r[2], r[3]) for r in self._select(
-            "SELECT %s,dim,gpus,sum(gpu) FROM agg_hour WHERE hour>=? AND hour<?%s "
-            "GROUP BY 1,2,3" % (case, self._dims_sql(dim_ids)), (low, high))]
+        rows = self._select(
+            "SELECT %s,dim,%s,sum(gpu) FROM %s WHERE hour>=? AND hour<?%s GROUP BY 1,2,3"
+            % (case, "fam" if by_family else "gpus", "agg_fhour" if by_family else "agg_hour",
+               self._dims_sql(dim_ids)), (low, high))
+        if not by_family:
+            return [(r[0], r[1], None if r[2] == -1 else r[2], r[3]) for r in rows]
+        families = self.families()
+        if any(r[2] not in families for r in rows):  # interned by another process since
+            self._fam_text = None
+            families = self.families()
+        return [(r[0], r[1], families.get(r[2], ""), r[3]) for r in rows]
 
     def agg_waits(self, low: int, high: int, dim_ids: Optional[Set[int]],
                   keyed: bool = False) -> List[Any]:
@@ -610,67 +761,58 @@ class SqliteStore(_Base):
                      skip: Sequence[str], keys: Optional[Dict[int, Tuple[str, str]]],
                      by_name: Any = None
                      ) -> Tuple[Dict[Any, int], Dict[Any, int], Dict[Any, str]]:
-        """Lower medians per kind, and the name of the earliest row, of the run times (finished rows) and queue waits (rows
-        that started in the window) of the rows a window counts, less ``skip``. Kinds are
-        GPUs per allocation (-1 unknown) or, with ``keys``, keys[dim] (finished, unfinished),
-        or with ``by_name`` by_name(job name)."""
-        with self.lock:
-            if keys is not None:
-                self._db.execute("CREATE TEMP TABLE IF NOT EXISTS kinds(dim INTEGER PRIMARY KEY, "
-                                 "kind TEXT, open TEXT)")
-                self._db.execute("DELETE FROM temp.kinds")
-                self._db.executemany("INSERT INTO temp.kinds VALUES(?,?,?)",
-                                     [(d,) + tuple(k) for d, k in keys.items()])
-                self._db.commit()
-            rs = "(CASE WHEN j.stop=%d THEN max(%d,j.start) ELSE max(j.stop,j.start) END)" % (
-                OPEN_STOP, int(as_of))
-            p, q = "max(j.start,%d)" % int(start), "min(%s,%d)" % (rs, int(end))
-            here = "j.start<%d" % int(high) + ("" if low is None else " AND j.start>=%d" % int(low))
-            fin = "j.stop<%d" % OPEN_STOP + ("" if finished is None else
-                                            self._dims_sql(finished, "j.dim"))
-            run = "j.stop=%d" % OPEN_STOP + ("" if running is None else
-                                            self._dims_sql(running, "j.dim"))
-            where = ["j.start<%d" % int(high), "((%s) OR (%s))" % (fin, run),
-                     "(%s>%s OR (%s=j.start AND %s))" % (q, p, rs, here)]
-            if low is not None:
-                where.append("j.stop>=%d" % int(low))
-            if skip:
-                where.append("j.k NOT IN (%s)" % ",".join(
-                    "'%s'" % k.replace("'", "''") for k in skip))
-            kind = "j.name" if by_name is not None else "coalesce(j.gpus,-1)" if keys is None \
-                else "(CASE WHEN j.stop=%d THEN t.open ELSE t.kind END)" % OPEN_STOP
-            join = "" if keys is None else " JOIN temp.kinds t ON t.dim=j.dim"
-            base = "FROM jobs j%s WHERE %s" % (join, " AND ".join(where))
+        """Lower medians per kind, and the name of the earliest row, of the run times
+        (finished rows) and queue waits (rows that started in the window) of the rows a
+        window counts, less ``skip``. Kinds are GPUs per allocation (-1 unknown) or, with
+        ``keys``, keys[dim] (finished, unfinished), or with ``by_name`` by_name(job name).
 
-            found = self._select(
-                "SELECT %s,CASE WHEN j.stop<%d THEN max(0,j.stop-j.start-j.susp) END,"
-                "CASE WHEN %s AND j.eligible<=j.start THEN j.start-j.eligible END,j.start %s" % (
-                    kind, OPEN_STOP, here, base))
-            runs, waited = {}, {}  # type: Dict[Any, List[int]], Dict[Any, List[int]]
-            first = {}  # type: Dict[Any, int]
-            names = {}  # type: Dict[Any, str]
+        The rows are read once per window (and change) for every kind of kind: grouped
+        by (dim, GPUs, name, unfinished), each grouping then only merges those groups."""
+        atoms, where = self._median_atoms(low, high, start, end, as_of, finished, running,
+                                          skip)
+        runs, waited = {}, {}  # type: Dict[Any, List[int]], Dict[Any, List[int]]
+        first = {}  # type: Dict[Any, Tuple[int, str]]
+        family = {}  # type: Dict[str, Any]
+        for (dim, gpus, name, opened), (atom_runs, atom_waits, begun, raw) in atoms.items():
             if by_name is not None:
-                earliest = {}  # type: Dict[Any, int]
-                for raw, runtime, wait, begun in found:
-                    key = by_name(raw or "")
-                    if runtime is not None:
-                        runs.setdefault(key, []).append(runtime)
-                    if wait is not None:
-                        waited.setdefault(key, []).append(wait)
-                    if begun < earliest.get(key, begun + 1):
-                        earliest[key], names[key] = begun, raw or ""
-                found = []
-            for key, runtime, wait, begun in found:
-                if runtime is not None:
-                    runs.setdefault(key, []).append(runtime)
-                if wait is not None:
-                    waited.setdefault(key, []).append(wait)
-                if begun < first.get(key, begun + 1):
-                    first[key] = begun
-            for key, begun in first.items():
-                row = self._select("SELECT j.name %s AND j.start=? AND %s=? LIMIT 1" % (
-                    base, kind), (begun, key))
-                names[key] = (row[0][0] if row else "") or ""
+                key = family.get(name)
+                if key is None:
+                    key = family[name] = by_name(name or "")
+            elif keys is not None:
+                kinds = keys.get(dim)
+                if kinds is None:
+                    continue
+                key = kinds[1] if opened else kinds[0]
+            else:
+                key = gpus
+            if atom_runs:
+                runs.setdefault(key, []).extend(atom_runs)
+            if atom_waits:
+                waited.setdefault(key, []).extend(atom_waits)
+            if key not in first or begun < first[key][0]:
+                first[key] = (begun, raw)
+        names = {}  # type: Dict[Any, str]
+        if by_name is not None:
+            names = {key: raw or "" for key, (_, raw) in first.items()}
+        else:
+            kind = "coalesce(j.gpus,-1)" if keys is None else \
+                "(CASE WHEN j.stop=%d THEN t.open ELSE t.kind END)" % OPEN_STOP
+            with self._guard():
+                join = ""
+                if keys is not None:  # a table of this connection's own
+                    db = self._conn()
+                    db.execute("CREATE TEMP TABLE IF NOT EXISTS kinds(dim INTEGER PRIMARY KEY, "
+                               "kind TEXT, open TEXT)")
+                    db.execute("DELETE FROM temp.kinds")
+                    db.executemany("INSERT INTO temp.kinds VALUES(?,?,?)",
+                                   [(d,) + tuple(k) for d, k in keys.items()])
+                    if db is self._db:
+                        db.commit()
+                    join = " JOIN temp.kinds t ON t.dim=j.dim"
+                for key, (begun, _) in first.items():
+                    row = self._select("SELECT j.name FROM jobs j%s WHERE %s AND j.start=? AND "
+                                       "%s=? LIMIT 1" % (join, where, kind), (begun, key))
+                    names[key] = (row[0][0] if row else "") or ""
 
         def lower_median(values: List[int]) -> int:
             values.sort()
@@ -678,6 +820,65 @@ class SqliteStore(_Base):
         runtimes = {key: lower_median(values) for key, values in runs.items()}
         waits = {key: lower_median(values) for key, values in waited.items()}
         return runtimes, waits, names
+
+    def _median_atoms(self, low: Optional[int], high: int, start: int, end: int, as_of: int,
+                      finished: Optional[Set[int]], running: Optional[Set[int]],
+                      skip: Sequence[str]) -> Tuple[Dict[tuple, list], str]:
+        """type_medians' rows grouped by (dim, GPUs or -1, name, unfinished): [run
+        times, waits, earliest start, its name], and the WHERE they were read with. The
+        last window's are kept until the data changes."""
+        with self._once("atoms"):
+            return self._median_atoms_filled(low, high, start, end, as_of, finished, running,
+                                             skip)
+
+    def _median_atoms_filled(self, low: Optional[int], high: int, start: int, end: int,
+                             as_of: int, finished: Optional[Set[int]],
+                             running: Optional[Set[int]], skip: Sequence[str]
+                             ) -> Tuple[Dict[tuple, list], str]:
+        at = (self.version, self.generation(), low, high, start, end, as_of,
+              None if finished is None else frozenset(finished),
+              None if running is None else frozenset(running), tuple(skip))
+        found = getattr(self, "_atoms_at", None)
+        if found is not None and found[0] == at:
+            return found[1], found[2]
+        rs = "(CASE WHEN j.stop=%d THEN max(%d,j.start) ELSE max(j.stop,j.start) END)" % (
+            OPEN_STOP, int(as_of))
+        p, q = "max(j.start,%d)" % int(start), "min(%s,%d)" % (rs, int(end))
+        here = "j.start<%d" % int(high) + ("" if low is None else " AND j.start>=%d" % int(low))
+        fin = "j.stop<%d" % OPEN_STOP + ("" if finished is None else
+                                        self._dims_sql(finished, "j.dim"))
+        run = "j.stop=%d" % OPEN_STOP + ("" if running is None else
+                                        self._dims_sql(running, "j.dim"))
+        where = ["j.start<%d" % int(high), "((%s) OR (%s))" % (fin, run),
+                 "(%s>%s OR (%s=j.start AND %s))" % (q, p, rs, here)]
+        if low is not None:
+            where.append("j.stop>=%d" % int(low))
+        if skip:
+            where.append("j.k NOT IN (%s)" % ",".join(
+                "'%s'" % k.replace("'", "''") for k in skip))
+        clause = " AND ".join(where)
+        atoms = {}  # type: Dict[tuple, list]
+        rows = self._select(
+                "SELECT j.dim,coalesce(j.gpus,-1),j.name,j.stop=%d,CASE WHEN j.stop<%d THEN "
+                "max(0,j.stop-j.start-j.susp) END,CASE WHEN %s AND j.eligible<=j.start THEN "
+                "j.start-j.eligible END,j.start FROM jobs j WHERE %s" % (
+                    OPEN_STOP, OPEN_STOP, here, clause))
+        for dim, gpus, name, opened, runtime, wait, begun in rows:
+            atom = atoms.get((dim, gpus, name, opened))
+            if atom is None:
+                atom = atoms[(dim, gpus, name, opened)] = [[], [], begun, name]
+            elif begun < atom[2]:
+                atom[2], atom[3] = begun, name
+            if runtime is not None:
+                atom[0].append(runtime)
+            if wait is not None:
+                atom[1].append(wait)
+        # kept for the next kind of the same window (a summary asks for each), unless
+        # that would hold too much
+        self._atoms_at = (at, atoms, clause) if len(rows) <= self.MEDIAN_ROWS_KEPT else None
+        return atoms, clause
+
+    MEDIAN_ROWS_KEPT = 600000  # about 40 MB of run times and waits at most
 
     def scan_edges(self, start: int, low: int, high: int, until: int,
                    dim_ids: Optional[Set[int]] = None, usage: bool = False,
@@ -760,7 +961,7 @@ class SqliteStore(_Base):
         gpus), each dim's first (dim, start, job) and the rows in ``failed`` dims (start,
         stop, job, ex), earliest first where it matters."""
         (fin_rs, fin), (_, opened) = rows
-        with self.lock:
+        with self._guard():
             tops = []
             for where in (fin, opened):
                 tops += self._select(
@@ -792,7 +993,7 @@ class SqliteStore(_Base):
         coverage at the end; and the rows of jobs that have a finished row in a ``chained``
         dim, by start (start, rs, job, dim, gpus, susp, stop)."""
         (fin_rs, fin), (open_rs, opened) = rows
-        with self.lock:
+        with self._once("events"):  # the gaps and chains below are kept for every range
             per = {}  # type: Dict[int, list]
             for rs, where, done in ((fin_rs, fin, True), (open_rs, opened, False)):
                 for dim, gpus, cpus, run in self._select(
@@ -829,7 +1030,7 @@ class SqliteStore(_Base):
         (fin_rs, fin), (open_rs, opened) = rows
         gaps, cover = [], None  # type: List[Tuple[int, int]], Optional[int]
         try:
-            ordered = self._db.execute(
+            ordered = self._conn().execute(
                 "SELECT start,%s FROM jobs WHERE %s UNION ALL SELECT start,%s FROM jobs "
                 "WHERE %s ORDER BY 1" % (fin_rs, fin, open_rs, opened))
             for begun, end in ordered:
@@ -854,7 +1055,7 @@ class SqliteStore(_Base):
                       names: bool = False) -> List[tuple]:
         """(start, stop, job, dim, gpus) of the finished rows of jobs with several rows
         that started and ended in [low, high); names: with the job name after them."""
-        with self.lock:
+        with self._once("repeated_rows"):
             # every finished row of a repeated job, by start, read once per change
             at = (self.version, self.get_meta("gen"))
             found = getattr(self, "_repeated_rows", None)
@@ -884,7 +1085,7 @@ class SqliteStore(_Base):
     def dims(self) -> Dict[int, Roles]:
         """id -> Roles; read again only after a write, here or by another process
         (callers must not change it)."""
-        with self.lock:
+        with self._once("dims"):
             at = (self.version, self.get_meta("gen"))
             found = getattr(self, "_dims_at", None)
             if found is None or found[0] != at:
@@ -958,9 +1159,9 @@ class SqliteStore(_Base):
             " ORDER BY j.start DESC" if walk else
             " ORDER BY j.start DESC,j.k DESC" if ordered is NEWEST else
             " ORDER BY +j.start" if ordered else "")
-        with self.lock:
+        with self._guard():
             try:
-                rows = self._db.execute(sql, args)
+                rows = self._conn().execute(sql, args)
                 if walk:
                     rows = _newest_first(rows)
                 for row in rows:
@@ -974,7 +1175,7 @@ class SqliteStore(_Base):
     def _newest_by_start(self, dim_ids: Optional[Set[int]]) -> bool:
         """Whether walking the start index down (and stopping) beats sorting the
         selection's rows: when they are a large part of all rows."""
-        with self.lock:
+        with self._once("dim_counts"):
             found = getattr(self, "_dim_counts", None)
             if found is None or found[0] != self.version:
                 found = self._dim_counts = (self.version, self.count_by_dim())
@@ -1018,15 +1219,20 @@ class SqliteStore(_Base):
     _REPEATED = "SELECT job FROM temp.repeated"
 
     def _repeated_table(self) -> None:
-        """temp.repeated: repeated_jobs() as a table, for the queries that exclude them."""
-        if getattr(self, "_rep_table", None) == self.version:
+        """temp.repeated: repeated_jobs() as a table, for the queries that exclude them
+        (a table of each connection's own)."""
+        db = self._conn()
+        holder = self._local if db is not self._db else self
+        at = (self.version, self.generation())
+        if getattr(holder, "_rep_table", None) == at:
             return
         jobs = self.repeated_jobs()
-        self._db.execute("CREATE TEMP TABLE IF NOT EXISTS repeated(job INTEGER PRIMARY KEY)")
-        self._db.execute("DELETE FROM temp.repeated")
-        self._db.executemany("INSERT INTO temp.repeated VALUES(?)", [(j,) for j in jobs])
-        self._db.commit()  # never leave a transaction open between calls
-        self._rep_table = self.version
+        db.execute("CREATE TEMP TABLE IF NOT EXISTS repeated(job INTEGER PRIMARY KEY)")
+        db.execute("DELETE FROM temp.repeated")
+        db.executemany("INSERT INTO temp.repeated VALUES(?)", [(j,) for j in jobs])
+        if db is self._db:
+            db.commit()  # never leave a transaction open between calls
+        holder._rep_table = at
 
     def scan_special(self, low: Optional[int], high: int, dim_ids: Optional[Set[int]],
                      extra: bool = False, repeated: bool = True, gpus: Any = ANY,
@@ -1035,7 +1241,7 @@ class SqliteStore(_Base):
         rows."""
         if dim_ids is not None and not dim_ids:
             return
-        with self.lock:
+        with self._guard():
             self._repeated_table()
         where, args = "j.start<?", [high]  # type: str, List[Any]
         if low is not None:
@@ -1092,7 +1298,7 @@ class SqliteStore(_Base):
             where.append(self.family_sql(family))
         sql = " AND ".join(where) + (self._dims_sql(dim_ids, "j.dim") if dim_ids is not None
                                      else "")
-        with self.lock:
+        with self._guard():
             self._repeated_table()
             total = self._select("SELECT count(*) FROM jobs j WHERE " + sql)[0][0]
             order = "DESC" if descending else "ASC"

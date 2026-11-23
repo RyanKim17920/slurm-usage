@@ -1994,6 +1994,15 @@ def kind_trends(ctx: Context, params: Dict[str, Any], name: str, kinds: Tuple[st
     return None if found is None else found[1]
 
 
+def family_exact_unknown(ctx: Context, params: Dict[str, Any], name: str) -> bool:
+    """Whether the exact trends by job-name family (kind_trends) came back without an
+    answer (the family aggregates cannot tell yet), or are not offered at all."""
+    if not ctx.data.has("kind_series"):
+        return True
+    entry = ctx.app.loader.peek(("h", "kind-trends", name, filt_key(params), ("name_family",)))
+    return entry is not None and not busy(entry) and entry.value is None
+
+
 def previous_types(ctx: Context, params: Dict[str, Any], name: str, dim: str) -> Entry:
     """GPU-hours per kind of run in the previous equal period, for the change column."""
     filt = make_filter(params)
@@ -2071,11 +2080,13 @@ def gpu_breakdown_pane(ctx: Context, view: View, params: Dict[str, Any]) -> Pane
     kinds = value(types_entry)
     before = value(previous_types(ctx, params, name, dim)) if name != "all" else None
     trends = {}  # type: Dict[Optional[str], List[float]]
-    exact = kind_trends(ctx, params, name, (dim,)) if dim != "name_family" else None
+    exact = kind_trends(ctx, params, name, (dim,))
     source = exact  # type: Any  # the answer the trends come from
     if exact is not None:
         trends = dict(exact.get(dim, {}))
-    elif dim == "name_family":
+    elif dim == "name_family" and not family_exact_unknown(ctx, params, name):
+        pass  # the exact trends are on their way
+    elif dim == "name_family":  # the family aggregates cannot tell: the newest attempts
         source = value(ctx.hist(("family-trends", name, filt_key(params)),
                                 lambda r=name, f=filt: family_trends(ctx.data, r, f)))
         trends = source or {}

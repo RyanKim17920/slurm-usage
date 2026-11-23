@@ -155,7 +155,10 @@ def list_jobs(store: Any, as_of: int, window: Optional[Window] = None,
     page = JobPage()
     needle = (match or "").strip().lower()
 
-    with store.lock:
+    if run_type is not None and run_type[0] == "name_family" and \
+            callable(getattr(store, "name_families", None)):
+        store.name_families()  # a write when names are new: not inside the read below
+    with store.reading():
         nodesets = store.nodesets()
         chosen = Selection(store.dims(), nodesets, where or Filter())
         first = store.first_start(chosen.dim_ids) if window.start is None else None
@@ -289,7 +292,7 @@ def list_jobs(store: Any, as_of: int, window: Optional[Window] = None,
 
 def list_attempts(store: Any, as_of: int, job_id: str) -> List[JobRow]:
     """Every cached attempt of one job, oldest first, with whole-attempt usage."""
-    with store.lock:
+    with store.reading():
         found = store.by_job(job_id)
         if not found:
             return []

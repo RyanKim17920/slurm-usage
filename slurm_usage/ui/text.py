@@ -50,6 +50,16 @@ def _safe(fn: Any) -> Any:
                       "message": clean(getattr(error, "message", None) or error)}
 
 
+def start_events(data: Any, range_name: str, user: str) -> Any:
+    """The person's events, worked out on a thread of their own (the history cache reads
+    on several threads at once): for collect(events=), started while other parts load."""
+    import concurrent.futures
+    pool = concurrent.futures.ThreadPoolExecutor(1)
+    found = pool.submit(_safe, lambda: data.events(range_name, hd.where(user=user)))
+    pool.shutdown(wait=False)
+    return found
+
+
 def trend_dict(row: Any) -> Dict[str, Any]:
     return {"range": row.range, "gpu_hours_allocated": _round(row.gpu_hours),
             "cpu_hours_allocated": _round(row.cpu_hours),
@@ -65,7 +75,11 @@ def trend_dict(row: Any) -> Dict[str, Any]:
 
 def collect(snap: Any, data: Optional[hd.HistoryData], range_name: str,
             user: Optional[str] = None, account: Optional[str] = None,
-            history_info: Any = None) -> Dict[str, Any]:
+            history_info: Any = None, printed: bool = False, events: Any = None
+            ) -> Dict[str, Any]:
+    """The summary --json prints. ``printed``: only what render() prints (run types by
+    GPUs, without medians), which is much quicker for someone with many jobs.
+    ``events``: start_events() for ``user``, already under way."""
     out = {"generated_at": int(time.time()), "range": range_name}  # type: Dict[str, Any]
     if snap is not None:
         t, h = snap.totals, snap.health
@@ -189,6 +203,8 @@ def collect(snap: Any, data: Optional[hd.HistoryData], range_name: str,
     if user and history_ok:
         filt = hd.where(user=user)
         person = {"user": user}  # type: Dict[str, Any]
+        if events is None:
+            events = start_events(data, range_name, user)
         trends = []
         for name in hd.RANGE_NAMES:
             row, _ = _safe(lambda name=name: data.trend(name, filt, gpus, cpus))
@@ -196,8 +212,17 @@ def collect(snap: Any, data: Optional[hd.HistoryData], range_name: str,
                 trends.append(trend_dict(row))
         person["trend"] = trends
         types = {}
-        for dim, _ in hd.DIMENSIONS:
-            found, error = _safe(lambda dim=dim: data.run_types(range_name, filt, dim))
+        dimensions = ["gpu_count"] if printed else [dim for dim, _ in hd.DIMENSIONS]
+        clock = data.clock
+        now = clock()
+        data.clock = lambda: now  # one window for every kind: the rows they read are shared
+        try:
+            answers = [(dim, _safe(lambda dim=dim: data.run_types(range_name, filt, dim,
+                                                                  medians=not printed)))
+                       for dim in dimensions]
+        finally:
+            data.clock = clock
+        for dim, (found, error) in answers:
             if found is None:
                 person["error"] = error
                 break
@@ -212,7 +237,7 @@ def collect(snap: Any, data: Optional[hd.HistoryData], range_name: str,
                            "failure_rate": _round(k.failure, 3), "complete": k.complete}
                           for k in found]
         person["run_types"] = types
-        found, error = _safe(lambda: data.events(range_name, filt))
+        found, error = events.result()
         if found is not None:
             person["events"] = [{"at": e.at, "kind": e.kind, "text": e.text} for e in found]
         elif error:

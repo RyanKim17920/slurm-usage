@@ -43,7 +43,11 @@ windows sized to about 30,000 rows from the density of recent ones; a `sacct`
 past 512 MB is stopped and its window split, and background windows pause for
 half of slurmdbd's last answer time. Rows are written on a second thread while
 the next window is fetched. It records which time span is covered; coverage only
-grows, and pieces already committed stay valid if a load is cancelled.
+grows, and pieces already committed stay valid if a load is cancelled. Going back,
+the writer builds the rollup and aggregates of the hours covered so far between
+pieces (while `sacct` answers the next one), so little is left to build when the
+load ends; unfinished rows that a later piece reads again unchanged in the same
+load are not rewritten, so that work is not undone.
 `history/rollup.py` maintains hourly totals per role combination (user, account,
 QOS, partition, state) for the hours whose data changed, and serves the
 overview's per-range totals and trend series from them without touching Slurm.
@@ -72,7 +76,25 @@ than the page (down the start index when the selection is a large part of all
 rows); a search is prefiltered with `instr()` and checked row by row. Step usage
 for efficiency is read in pieces of about 3,000 attempts, four `sacct` at a time;
 views redraw as pieces land. Per-kind sparklines (`History.kind_series`) are
-summed into the chart's bins from the aggregates.
+summed into the chart's bins from the aggregates, by job-name family too. The
+medians of `--json`'s run types read the window's rows once for every kind
+(grouped by dim, GPUs, name and finished), and `--once` works out only the run
+types it prints, without medians.
+
+Reads and writes: one connection writes (ingest, rollup, interning), one at a
+time under the store's lock. In the app the reads share that connection too: its
+answers are mostly Python work, and side by side (with the GIL) they only delayed
+the answer on screen behind ones for hidden tabs (measured over every screen).
+`--once` / `--json` read on a connection per thread (`SqliteStore.parallel_reads`,
+or `SLURM_USAGE_PARALLEL=1` anywhere), so the summary's events, trends and run
+types overlap where SQLite does the work; a computation of several reads then runs
+in one read transaction (`store.reading()`) and sees one state of the data. The
+journal stays a rollback journal (`TRUNCATE`), not WAL: WAL's shared memory is
+unsafe on the network filesystems a cache may be shared over, and readers on
+separate connections work with a rollback journal too. A commit waits for this
+process's reads to end rather than failing on the connection's 15 s timeout.
+Caches kept on the store (dims, repeated jobs, family names, event gaps, median
+rows) are filled by one thread while the others wait for it.
 
 ## Answers kept between runs
 

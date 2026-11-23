@@ -141,6 +141,10 @@ class _Waits(_SequenceABC):
         return (list, (list(self._get()),))
 
 
+def _gpus_of(row: tuple) -> Any:
+    return row[10]
+
+
 class _Pass:
     """The state of one aggregation."""
 
@@ -160,6 +164,7 @@ class _Pass:
         self.series = [Series(edges) for _ in METRICS]
         self.series_by, self.metric_at = series_by, METRICS.index(series_metric)
         self.keyed = {}  # type: Dict[str, Series]
+        self.kind_of = _gpus_of  # KIND_SERIES: the key's second part, of a row
         self.lanes_by, self.resolution = lanes_by, resolution
         self.segments = {}  # type: Dict[str, List[List[int]]]
         self.raw_lanes = False
@@ -263,7 +268,8 @@ class _Pass:
             if by == "node":
                 keyed = [(s[0], (s[2], s[1], s[3])[self.metric_at]) for s in part.shares or ()]
             elif by == KIND_SERIES:
-                keyed = [((row[2], row[10], row[7] is not None), amounts[self.metric_at])]
+                keyed = [((row[2], self.kind_of(row), row[7] is not None),
+                          amounts[self.metric_at])]
             else:
                 keyed = [(_value(by, part.roles, part.outcome, NONE), amounts[self.metric_at])]
             for key, rate in keyed:
@@ -547,7 +553,7 @@ def build_report(store: Any, as_of: int, window: Optional[Window] = None,
         raise ValueError("unknown metric: %s" % series_metric)
     window, where, cancelled = window or Window(), where or Filter(), canceller(cancel)
 
-    with store.lock:
+    with store.reading():
         need_nodes = any("node" in spec for spec in specs) or "node" in (series_by, lanes_by)
         chosen = Selection(store.dims(), store.nodesets(), where, need_nodes)
         first = store.first_start(chosen.dim_ids) if window.start is None else None
@@ -657,19 +663,28 @@ def _defer(state: _Pass, exact: Any) -> None:
 
 
 def kind_bins(store: Any, as_of: int, window: Optional[Window], where: Optional[Filter],
-              make_bins: Any, gpu_tracked: Optional[bool] = None, cancel: Any = None
-              ) -> Tuple[List[int], Dict[tuple, List[int]]]:
+              make_bins: Any, gpu_tracked: Optional[bool] = None, cancel: Any = None,
+              by_family: bool = False) -> Optional[Tuple[List[int], Dict[tuple, List[int]]]]:
     """GPU-seconds per bin of make_bins(start, end) (edges on whole hours inside the
     window), keyed (dim, GPUs per allocation, finished): build_report(series_by=
-    KIND_SERIES) summed into those bins, read from the aggregates where it can be."""
+    KIND_SERIES) summed into those bins, read from the aggregates where it can be.
+    by_family: keyed (dim, job-name family, finished) instead, from the family
+    aggregates only (None when they cannot answer)."""
     window, where, cancelled = window or Window(), where or Filter(), canceller(cancel)
-    with store.lock:
+    if by_family:
+        from .store import FAMILY_VERSION
+        if not getattr(store, "has_families", False) or \
+                store.get_meta("agg_fam") != FAMILY_VERSION:
+            return None
+    with store.reading():
         chosen = Selection(store.dims(), {}, where)
         first = store.first_start(chosen.dim_ids) if window.start is None else None
         span = resolve(window, as_of, first)
         bins = list(make_bins(span.start, span.end))
         hours = None if len(bins) < 2 or bins[0] != span.start or bins[-1] != span.end \
             else _fast_span(store, span, bins)
+        if hours is None and by_family:
+            return None
         if hours is None:
             report = build_report(store, as_of, window, where, (), series_by=KIND_SERIES,
                                   gpu_tracked=gpu_tracked, cancel=cancel)
@@ -684,7 +699,11 @@ def kind_bins(store: Any, as_of: int, window: Optional[Window], where: Optional[
             return bins, out
         low, high = hours
         state = _Pass([("outcome",)], gpu_tracked, bins, KIND_SERIES, "gpu", None, 1)
-        rows = store.scan_edges(span.start, low, high, span.high, chosen.dim_ids)
+        if by_family:
+            from .families import name_family
+            state.kind_of = lambda row: name_family(row[18] or "")
+        rows = store.scan_edges(span.start, low, high, span.high, chosen.dim_ids,
+                                **({"extra": True} if by_family else {}))
         for number, part in enumerate(chosen.parts(rows, span)):
             if not number % 1024 and cancelled():
                 raise Cancelled()
@@ -706,7 +725,8 @@ def kind_bins(store: Any, as_of: int, window: Optional[Window], where: Optional[
                         if d in dims and (outcomes is None
                                           or outcome_of(dims[d].state, True) in outcomes)}
         inside = [b for b in bins if low <= b <= high]
-        found = store.agg_binned(low, high, finished, inside)
+        found = store.agg_binned(low, high, finished, inside,
+                                 **({"by_family": True} if by_family else {}))
     out = {key: series.values() for key, series in state.keyed.items()}
     first_bin = bisect_right(bins, low) - 1
     for at, dim, gpus, amount in found:

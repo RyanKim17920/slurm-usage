@@ -144,6 +144,10 @@ def run_once(args: argparse.Namespace, out: Any = None) -> int:
         taking = threading.Thread(target=take, args=(raw,), name="snapshot", daemon=True)
         taking.start()
     from .ui import text
+    from .history import store as store_module
+    # a summary's parts are read side by side (in the app, reads on one connection
+    # keep the answer on screen first)
+    store_module.SqliteStore.parallel_reads = True
     out = out or sys.stdout
     args.collector = raw  # the one already taking a snapshot
     collector, data, anon = build(args)
@@ -158,6 +162,7 @@ def run_once(args: argparse.Namespace, out: Any = None) -> int:
         user = anon.name("user", user) if user else None
         account = anon.name("account", account) if account else None
     info = None
+    events = None  # type: Any
     no_history = args.history == "off"
     if not no_history:
         quiet = not sys.stderr.isatty()
@@ -178,6 +183,8 @@ def run_once(args: argparse.Namespace, out: Any = None) -> int:
             info = data.info()
         except Exception:
             info = None
+        if user:  # under way while the rest loads
+            events = text.start_events(data, args.range, user)
         try:
             data.overview(None, None)  # the slow part of the summary, while live is taken
         except Exception:
@@ -186,7 +193,8 @@ def run_once(args: argparse.Namespace, out: Any = None) -> int:
     snap = live.get("snap")
     if "error" in live:
         print("live: %s" % live["error"], file=sys.stderr)
-    summary = text.collect(snap, None if no_history else data, args.range, user, account, info)
+    summary = text.collect(snap, None if no_history else data, args.range, user, account, info,
+                           printed=not args.json, events=events)
     if anon is not None:
         summary["anonymized"] = True
     if args.json:

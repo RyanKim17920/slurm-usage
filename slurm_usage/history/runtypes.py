@@ -152,7 +152,7 @@ def _fast_types(store: Any, as_of: int, window: Window, where: Filter, by: str, 
     if family and (not getattr(store, "has_families", False)
                    or store.get_meta("agg_fam") != FAMILY_VERSION):
         return None
-    with store.lock:
+    with store.reading():
         chosen = Selection(store.dims(), {}, where)
         first = store.first_start(chosen.dim_ids) if window.start is None else None
         span = resolve(window, as_of, first)
@@ -259,7 +259,7 @@ def run_types(store: Any, as_of: int, window: Optional[Window], where: Optional[
                             cancel)
         if found is not None:
             return found
-    with store.lock:
+    with store.reading():
         nodesets = store.nodesets()
         chosen = Selection(store.dims(), nodesets, where)
         first = store.first_start(chosen.dim_ids) if window.start is None else None

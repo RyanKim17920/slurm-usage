@@ -21,6 +21,12 @@ All notable changes to this project are documented here. The format follows
   instead of partial sums), and the chosen range's chart when there is room.
   An account's people page starts with the account's own Trend.
 - The ranges in the header are clickable.
+- Quicker again: job-name-family trends come from the family
+  aggregates (exact, every attempt, not only the newest page); `--once --user`
+  works out only what it prints (several times quicker for someone with many
+  jobs) and reads its parts side by side, `--json`'s medians read the rows once
+  for every kind; a
+  first load builds the rollup between `sacct` pieces instead of after them.
 
 ### Fixed
 

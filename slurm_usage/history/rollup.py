@@ -144,8 +144,11 @@ class Overview:
     notes: List[Any] = field(default_factory=list)
 
 
-def build(store: Any, as_of: int, progress: ProgressFn = None, cancel: Any = None) -> int:
-    """Bring the rollup up to date, newest first. Returns hours rebuilt."""
+def build(store: Any, as_of: int, progress: ProgressFn = None, cancel: Any = None,
+          floor: Optional[int] = None) -> int:
+    """Bring the rollup up to date, newest first. Returns hours rebuilt. ``floor``: only
+    the hours from there on (all their rows are in: a first load going back builds what
+    it has read between pieces); what is older stays to be built."""
     cancelled = canceller(cancel)
     settled = floor_hour(as_of)
     agg = getattr(store, "has_agg", False)
@@ -178,10 +181,11 @@ def build(store: Any, as_of: int, progress: ProgressFn = None, cancel: Any = Non
 
     dims, done, top = store.dims(), 0, high
     chosen = Selection(dims, {}, Filter())
-    while high > low:
+    stop = low if floor is None else max(low, -(-floor // HOUR) * HOUR)
+    while high > stop:
         if cancelled():
             raise Cancelled()
-        begin = max(low, high - CHUNK)
+        begin = max(stop, high - CHUNK)
         rows, extra = _chunk(store, chosen, begin, high, as_of, agg)
         store.rollup_replace(begin, high, rows, None if begin <= low else [low, begin], extra)
         done += (high - begin) // HOUR

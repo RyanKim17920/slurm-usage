@@ -369,7 +369,7 @@ class Ingestor:
             except HistoryError as error:
                 self._shrink(error)
                 continue
-            self._writer.submit(self._settle(since, at))
+            self._writer.submit(self._settle(since, at, between=True))
             self._resize(rows, at - since)
             self._owed(rows, since)
             empty = empty + (at - since) if not rows else 0
@@ -397,12 +397,18 @@ class Ingestor:
         self._piece = max(SMALLEST_PIECE, min(self._piece, int(TARGET_ROWS * (
             since - start + 2 * OVERLAP) / left) - 2 * OVERLAP))
 
-    def _settle(self, start: int, end: int) -> Callable[[], None]:
+    # called on the writer thread once a piece going back is in (History builds the
+    # rollup of what is covered then, while sacct is still answering the next piece)
+    between = None  # type: Optional[Callable[[], None]]
+
+    def _settle(self, start: int, end: int, between: bool = False) -> Callable[[], None]:
         """After a piece's rows are written: count it as covered, and flag its open rows
         (re-read rows come back unflagged)."""
         def task() -> None:
             self._widen(start, end)
             self.flag_open_rows()
+            if between and self.between is not None:
+                self.between()
         return task
 
     def _refresh_open(self) -> None:
